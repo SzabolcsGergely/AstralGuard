@@ -10,7 +10,7 @@ repository = "https://github.com/SzabolcsGergely/AstralGuard"
 [features]
 default = ["ui"]
 # The tray and dashboard. Off builds a headless service only (e.g. a Linux server).
-ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:gtk"]
+ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:gtk", "dep:ureq", "dep:native-tls"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +23,10 @@ tray-icon = { version = "0.19", optional = true }
 # the dashboard's PNG screenshots (--screenshot) and the window handle for the tray
 png = { version = "0.18", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+# the dashboard's update check (GitHub releases API). The OS TLS stack: SChannel on
+# Windows, OpenSSL on Linux; no bundled crypto to build.
+ureq = { version = "2.12", optional = true, default-features = false, features = ["native-tls"] }
+native-tls = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Not tauri-winrt-notification: linking it made every binary crash at startup on the
