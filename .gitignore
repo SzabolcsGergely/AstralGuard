@@ -1,0 +1,19 @@
+# Runtime/generated
+*.log
+config.ini
+logs/
+mitigation.active
+last_shutdown.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Design mockups
+mockups/
+
+# Rust build
+rust/target/
+/astralguard.exe

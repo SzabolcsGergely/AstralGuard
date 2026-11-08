@@ -1,0 +1,10 @@
+# Windows GNU toolchain: link with rustup's rust-lld instead of MinGW's GNU ld.
+#
+# Newer `windows` crates import DLLs via raw-dylib. rustup's toolchain has no GNU
+# assembler, so those import libraries come from LLVM's dlltool (llvm-ar), and GNU ld
+# mislinks them next to the classic MinGW import libraries: an import such as
+# GetProcessHeap is left unbound and the program crashes before main. rust-lld links the
+# same objects correctly. build.ps1 puts an llvm dlltool on PATH.
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld"]

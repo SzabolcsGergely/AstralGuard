@@ -1,0 +1,362 @@
+//! Everything the service and the UI say to each other.
+//!
+//! One JSON object per line over a local socket: the UI sends a [`Request`], the service
+//! answers with one [`Response`]. The UI polls; the service never pushes. Notifications
+//! the UI should show (Linux, where a root service cannot reach the desktop) come back
+//! through [`Request::Events`].
+
+use serde::{Deserialize, Serialize};
+
+pub const APP_NAME: &str = "AstralGuard";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Status {
+    Ok,
+    #[default]
+    Missing,
+    Over,
+    Mitigated,
+    Paused,
+    Error,
+    Shutdown,
+}
+
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
+impl Status {
+    /// Tray and dashboard colour, RGB. Red only ever means "we shut the machine down".
+    pub fn color(self) -> [u8; 3] {
+        match self {
+            Status::Ok => [0, 200, 0],
+            Status::Missing => [160, 160, 160],
+            Status::Over => [255, 170, 0],
+            Status::Mitigated => [255, 100, 0],
+            Status::Paused => [70, 140, 255],
+            Status::Error => [150, 70, 220],
+            Status::Shutdown => [230, 0, 0],
+        }
+    }
+
+    /// How safe the connector is, in one word: the label that goes with the colour.
+    pub fn text(self) -> &'static str {
+        match self {
+            Status::Ok => "Safe",
+            Status::Over => "Warning",
+            Status::Mitigated => "Protecting",
+            Status::Shutdown => "Danger",
+            Status::Paused => "Unprotected",
+            // No readings: whether it is safe cannot be told.
+            Status::Error | Status::Missing => "Unknown",
+        }
+    }
+
+    /// Why, in a few words.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Status::Ok => "all pins within limits",
+            Status::Over => "over threshold",
+            Status::Mitigated => "GPU limited",
+            Status::Shutdown => "shutting down",
+            Status::Paused => "monitoring paused",
+            Status::Error => "waiting for pin sensors",
+            Status::Missing => "no pin readings",
+        }
+    }
+}
+
+/// tiered: slow the GPU down first, shut down only if that does not fix it.
+/// shutdown_only: no GPU limiting, the tier timings still apply.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseMode {
+    #[default]
+    Tiered,
+    ShutdownOnly,
+}
+
+impl ResponseMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            ResponseMode::Tiered => "tiered",
+            ResponseMode::ShutdownOnly => "shutdown_only",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tiered" => Some(ResponseMode::Tiered),
+            "shutdown_only" => Some(ResponseMode::ShutdownOnly),
+            _ => None,
+        }
+    }
+}
+
+/// warn: notify and log only. act: a tripped imbalance enters the response ladder as a
+/// tier 1 crossing and gets exactly what sustained overcurrent gets.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImbalanceResponse {
+    #[default]
+    Warn,
+    Act,
+}
+
+impl ImbalanceResponse {
+    pub fn key(self) -> &'static str {
+        match self {
+            ImbalanceResponse::Warn => "warn",
+            ImbalanceResponse::Act => "act",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "warn" => Some(ImbalanceResponse::Warn),
+            "act" => Some(ImbalanceResponse::Act),
+            _ => None,
+        }
+    }
+}
+
+/// Every protection value. Lives in the service; the UI gets a copy in [`Live`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Settings {
+    // tier 1: elevated current, ridden out for a while before acting
+    pub threshold_amps: f64,
+    pub sustained_seconds_required: f64,
+    pub response_mode: ResponseMode,
+    // tiers 2 and 3: currents too high to sit through the tier 1 window
+    pub critical_amps: f64,
+    pub critical_seconds: f64,
+    pub catastrophic_amps: f64,
+    pub mitigation_grace_seconds: f64,
+    pub mitigation_clear_seconds: f64,
+    pub mitigation_min_hold_seconds: f64,
+    pub retrigger_window_seconds: f64,
+    // GPU sag (warn-only)
+    pub sag_enabled: bool,
+    pub sag_warn_degrees: f64,
+    pub sag_serious_degrees: f64,
+    pub sag_sustained_seconds: f64,
+    /// 0 = from the detected card's ASUS spec.
+    pub sag_card_length_mm: f64,
+    // pin imbalance
+    pub imbalance_enabled: bool,
+    pub imbalance_min_amps: f64,
+    pub imbalance_percent: f64,
+    pub imbalance_delta_amps: f64,
+    pub imbalance_sustained_seconds: f64,
+    pub imbalance_response: ImbalanceResponse,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            threshold_amps: 9.5,
+            sustained_seconds_required: 15.0,
+            response_mode: ResponseMode::Tiered,
+            // Spec load at 600 W is ~8.3 A per pin and ASUS warns at 9.2 A; documented
+            // slow-cook failures run 11-15 A, the famous melted plug measured over 22 A.
+            critical_amps: 13.0,
+            critical_seconds: 3.0,
+            catastrophic_amps: 16.0,
+            mitigation_grace_seconds: 10.0,
+            mitigation_clear_seconds: 60.0,
+            mitigation_min_hold_seconds: 120.0,
+            retrigger_window_seconds: 600.0,
+            sag_enabled: true,
+            sag_warn_degrees: 1.0,
+            sag_serious_degrees: 2.0,
+            sag_sustained_seconds: 60.0,
+            sag_card_length_mm: 0.0,
+            // Modelled on the Thermal Grizzly WireView Pro II: compare highest and lowest
+            // pin once one carries 6 A, alarm above 40%.
+            imbalance_enabled: true,
+            imbalance_min_amps: 6.0,
+            imbalance_percent: 40.0,
+            imbalance_delta_amps: 4.0,
+            imbalance_sustained_seconds: 5.0,
+            imbalance_response: ImbalanceResponse::Warn,
+        }
+    }
+}
+
+/// A partial change from the dashboard. Only the fields that are set are checked/applied.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SettingsPatch {
+    pub threshold_amps: Option<f64>,
+    pub sustained_seconds_required: Option<f64>,
+    pub response_mode: Option<ResponseMode>,
+    pub critical_amps: Option<f64>,
+    pub critical_seconds: Option<f64>,
+    pub catastrophic_amps: Option<f64>,
+    pub sag_enabled: Option<bool>,
+    pub sag_warn_degrees: Option<f64>,
+    pub sag_serious_degrees: Option<f64>,
+    pub sag_sustained_seconds: Option<f64>,
+    pub sag_card_length_mm: Option<f64>,
+    pub imbalance_enabled: Option<bool>,
+    pub imbalance_min_amps: Option<f64>,
+    pub imbalance_percent: Option<f64>,
+    pub imbalance_delta_amps: Option<f64>,
+    pub imbalance_sustained_seconds: Option<f64>,
+    pub imbalance_response: Option<ImbalanceResponse>,
+}
+
+#[cfg_attr(not(feature = "ui"), allow(dead_code))]
+impl SettingsPatch {
+    pub fn is_empty(&self) -> bool {
+        *self == SettingsPatch::default()
+    }
+}
+
+/// Sag detection state as shown to the user.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SagStatus {
+    /// Not known yet.
+    #[default]
+    Starting,
+    Ok,
+    Warning,
+    Serious,
+    Uncalibrated,
+    Unavailable,
+    Disabled,
+}
+
+/// The service's state, polled by the UI a few times a second.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Live {
+    pub version: String,
+    pub status: Status,
+    pub paused: bool,
+    pub last_message: String,
+    /// Model name of the monitored card, "" while none is connected.
+    pub card: String,
+    pub card_subsystem: Option<u32>,
+    /// Every pin as (short name "Pin1", amps), in the order the card reports them.
+    pub pins: Vec<(String, f64)>,
+    pub volts: Option<Vec<f64>>,
+    pub max_label: String,
+    pub max_val: f64,
+    pub min_label: String,
+    pub min_val: Option<f64>,
+    /// "" until known, then "ready" or why the GPU cannot be limited.
+    pub mitigation: String,
+    pub effective_shutdown_only: bool,
+    pub engaged: bool,
+    pub engaged_tier: Option<u8>,
+    /// Unix seconds.
+    pub engaged_at: Option<f64>,
+    pub imbalance_active: bool,
+    pub imbalance_delta: Option<f64>,
+    pub imbalance_pct: Option<f64>,
+    pub sag_status: SagStatus,
+    /// Sag since calibration, degrees.
+    pub sag_deg: Option<f64>,
+    /// Absolute tilt from level (or plumb), degrees; needs no calibration.
+    pub sag_offaxis: Option<f64>,
+    /// Latest raw accelerometer sample in g.
+    pub sag_xyz: Option<[f64; 3]>,
+    /// Calibrated gravity direction, unit vector.
+    pub sag_baseline: Option<[f64; 3]>,
+    pub sag_fast: bool,
+    /// Unix seconds; fast IMU polling was requested until then.
+    pub sag_fast_until: f64,
+    /// Card length used to turn sag degrees into mm at the far end.
+    pub card_length_mm: f64,
+    /// (unix seconds, amps per pin), last 5 minutes.
+    pub history: Vec<(f64, Vec<f64>)>,
+    /// (unix seconds, x, y, z in g).
+    pub imu_history: Vec<(f64, f64, f64, f64)>,
+    pub settings: Settings,
+    /// Running under the watchdog: a crash is restarted.
+    pub watchdog: bool,
+    pub log_path: String,
+}
+
+/// Something the user should be told about (desktop notification).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Notice {
+    pub seq: u64,
+    pub time: f64,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    Live,
+    Defaults,
+    /// Validate without applying: errors block, warnings need the user's confirmation.
+    Check {
+        changes: SettingsPatch,
+    },
+    Apply {
+        changes: SettingsPatch,
+    },
+    ResetDefaults,
+    SetPaused {
+        paused: bool,
+    },
+    CalibrateSag,
+    /// Fast accelerometer polling for the IMU view; 0 stops it. Capped at 5 minutes.
+    ImuFast {
+        seconds: f64,
+    },
+    /// Stop the guard. The UI asks for confirmation first.
+    Exit,
+    Autostart,
+    SetAutostart {
+        enable: bool,
+    },
+    FlightDumps,
+    /// The last `max_bytes` of the log file.
+    LogTail {
+        max_bytes: u64,
+    },
+    /// A flight dump's content, by file name (no paths).
+    ReadFlight {
+        name: String,
+    },
+    /// Notices with seq > since.
+    Events {
+        since: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Response {
+    Live { live: Box<Live> },
+    Settings { settings: Settings },
+    Check { errors: Vec<String>, warnings: Vec<String> },
+    Applied { failures: Vec<String> },
+    Ok,
+    Autostart { state: Option<bool> },
+    Bool { value: bool },
+    Names { names: Vec<String> },
+    Text { text: String },
+    Events { notices: Vec<Notice> },
+    Error { message: String },
+}
+
+/// Local socket name: a named pipe on Windows, a socket file on Linux.
+pub fn socket_name() -> &'static str {
+    if cfg!(windows) {
+        "astralguard.sock"
+    } else {
+        "/run/astralguard/astralguard.sock"
+    }
+}
+
+/// "1.0° / 6.2 mm": every angle shown to the user, plus what it means at the far end.
+pub fn fmt_tilt(deg: f64, card_length_mm: f64) -> String {
+    format!("{:.1}° / {:.1} mm", deg, sag_mm(deg, card_length_mm))
+}
+
+/// Droop at the far end of the card for a given angle, treating it as rigid.
+pub fn sag_mm(deg: f64, card_length_mm: f64) -> f64 {
+    card_length_mm * deg.to_radians().sin()
+}
