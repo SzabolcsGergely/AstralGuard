@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install AstralGuard on Linux: the protection service as a root systemd unit, the tray/
-# dashboard as an autostart entry for the desktop user. Run from the rust/ folder after
-# `cargo build --release`, as root:  sudo packaging/linux/install.sh <desktop-user>
+# dashboard as an autostart entry for the desktop user. From the release tarball, or from
+# the source tree after `cargo build --release`, as root:  sudo ./install.sh <desktop-user>
 #
 # UNVERIFIED ON LINUX HARDWARE: the I2C port mapping (NVAPI port 1 = NVIDIA i2c adapter 1)
 # has not been confirmed yet. Check `astralguard probe` reads sensible pins before relying
@@ -10,7 +10,9 @@ set -eu
 
 USER_NAME="${1:-${SUDO_USER:-}}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BIN="$HERE/../../target/release/astralguard"
+# Release tarball: the binary sits next to this script. Source tree: the cargo build.
+BIN="$HERE/astralguard"
+[ -x "$BIN" ] || BIN="$HERE/../../target/release/astralguard"
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 [ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 1; }
