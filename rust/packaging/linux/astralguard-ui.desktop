@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AstralGuard
+Comment=Tray icon and dashboard for the AstralGuard service
+Exec=/usr/local/bin/astralguard ui
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+X-GNOME-Autostart-enabled=true

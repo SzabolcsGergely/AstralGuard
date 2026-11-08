@@ -1,0 +1,64 @@
+[package]
+name = "astralguard"
+version = "2.0.0"
+edition = "2021"
+description = "Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs"
+license = "MIT"
+publish = false
+repository = "https://github.com/SzabolcsGergely/AstralGuard"
+
+[features]
+default = ["ui"]
+# The tray and dashboard. Off builds a headless service only (e.g. a Linux server).
+ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:gtk"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+chrono = "0.4"
+interprocess = "2.2"
+eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = { version = "0.19", optional = true }
+# the dashboard's PNG screenshots (--screenshot) and the window handle for the tray
+png = { version = "0.18", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Not tauri-winrt-notification: linking it made every binary crash at startup on the
+# GNU toolchain. Toasts go through the windows crate's WinRT bindings instead.
+windows = { version = "0.58", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_EventLog",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# UI on Linux: the service there cannot reach the desktop, so the UI shows its notices
+# (on Windows notify-rust would pull in tauri-winrt-notification, which crashes the GNU
+# build; the service raises toasts itself there). The tray needs GTK, eframe X11/Wayland.
+[target.'cfg(not(windows))'.dependencies]
+notify-rust = { version = "4", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = true

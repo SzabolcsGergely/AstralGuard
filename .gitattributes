@@ -1,0 +1,6 @@
+# LF in the repository and in the working copy, whatever core.autocrlf says on this
+# machine. Batch files are the exception: cmd.exe expects CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
