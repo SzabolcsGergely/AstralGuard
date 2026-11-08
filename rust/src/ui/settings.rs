@@ -293,7 +293,14 @@ impl SettingsView {
         ask
     }
 
-    pub fn show(&mut self, ui: &mut Ui, t: &Theme, prefs: &mut Prefs, card_mm: f64) -> (Option<Ask>, bool) {
+    pub fn show(
+        &mut self,
+        ui: &mut Ui,
+        t: &Theme,
+        prefs: &mut Prefs,
+        card_mm: f64,
+        updates: Option<&super::update::Updates>,
+    ) -> (Option<Ask>, bool) {
         let mut ask = None;
         let mut prefs_changed = false;
         let base = self.base.clone().unwrap_or_default();
@@ -426,6 +433,29 @@ impl SettingsView {
                         }
                     });
                     ui.label(RichText::new("Applies at once · needs admin").color(t.muted()).size(12.0));
+                    ui.add_space(6.0);
+                    if ui.checkbox(&mut prefs.check_updates, "Check for updates daily").changed() {
+                        prefs_changed = true;
+                    }
+                    if let Some(u) = updates {
+                        use super::update::UpdateState;
+                        ui.horizontal(|ui| {
+                            if w::button(ui, "Check now").clicked() {
+                                u.check_now();
+                            }
+                            let current = crate::protocol::APP_VERSION;
+                            let (text, color) = match u.state() {
+                                UpdateState::Idle => (format!("v{current}"), t.muted()),
+                                UpdateState::Checking => ("checking…".into(), t.muted()),
+                                UpdateState::UpToDate { checked } => {
+                                    (format!("v{current} is the latest · {}", checked.format("%H:%M")), t.muted())
+                                }
+                                UpdateState::Available { version, .. } => (format!("v{version} available"), t.accent),
+                                UpdateState::Failed { error } => (format!("check failed: {error}"), t.pending),
+                            };
+                            ui.label(RichText::new(text).color(color).size(12.0));
+                        });
+                    }
                 });
             });
         });

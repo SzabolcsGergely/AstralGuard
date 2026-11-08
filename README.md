@@ -1,5 +1,7 @@
 # AstralGuard
 
+[![CI](https://github.com/SzabolcsGergely/AstralGuard/actions/workflows/ci.yml/badge.svg)](https://github.com/SzabolcsGergely/AstralGuard/actions/workflows/ci.yml)
+
 *Named for the only cards it can protect: ASUS ROG Astral cards are the ones with per-pin
 current sensing. Not affiliated with or endorsed by ASUS.*
 **Standalone GPU 12VHPWR Pin Safety Monitor for Windows (Linux experimental)**
@@ -299,18 +301,26 @@ The easiest way to install AstralGuard is using the included installer.
 
 ### Upgrading
 
-1. Get the new version: download the new release and extract it over your existing folder,
-   or `git pull` and run `rust\build.ps1` (stop the guard first; the exe is locked while it
-   runs).
+1. Get the new version: download `AstralGuard-<version>-windows-x64.zip` from the
+   [releases page](https://github.com/SzabolcsGergely/AstralGuard/releases) and extract it
+   over your existing folder, or `git pull` and run `rust\build.ps1`.
 2. Re-run the installer (`install.bat` as administrator).
 
-That is the whole process. The installer stops the running guard, re-registers the scheduled task, and leaves `config.ini` and your logs untouched, so your
-thresholds and settings survive. If you started the guard by hand instead of through the
-scheduled task, exit it from the tray menu first.
+That is the whole process. The installer stops the running guard first (the exe is locked
+while it runs), re-registers the scheduled task, and leaves `config.ini` and your logs
+untouched, so your thresholds and settings survive. If you started the guard by hand
+instead of through the scheduled task, exit it from the tray menu first.
+
+**Update check.** The dashboard asks GitHub's releases API once shortly after it starts
+and then once a day whether a newer release exists. If one does, you get a notification
+and an **Update available** banner with **Download** (opens the release page) and **Skip**
+(no banner for that version again). It never downloads or installs anything itself. Turn it
+off in Settings → System → **Check for updates daily**; **Check now** checks on demand. Only
+the dashboard process does this: the protection service makes no network connections at
+all, so a failed check can never affect monitoring.
 
 The version you are running is shown at the top of the tray menu and in the first log line
-at startup. The guard makes no network connections at all, so it will never check for
-updates itself; watch the GitHub releases page for new versions.
+at startup.
 
 ---
 
@@ -737,7 +747,26 @@ The GNU toolchain needs two workarounds, both handled by the build script and
 `rust\.cargo\config.toml`: rustup ships no GNU assembler, so LLVM's `dlltool` (a copy of
 `llvm-ar` from the `llvm-tools` component) makes the raw-dylib import libraries, and linking
 uses `rust-lld`, because GNU ld mislinks those libraries and the program crashes before
-`main`.
+`main`. The standard MSVC toolchain works too (that is what CI uses).
+
+### CI and releases
+
+Every push to `master` and every pull request runs [CI](.github/workflows/ci.yml) on
+Windows and Linux: `cargo fmt --check`, clippy with warnings as errors, the tests, and a
+release build (plus a service-only build on Linux).
+
+To release: bump `version` in `rust/Cargo.toml`, commit, then tag and push:
+
+```
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+The [release workflow](.github/workflows/release.yml) checks that the tag matches the crate
+version, runs the tests, builds `AstralGuard-<version>-windows-x64.zip` (program plus
+installer scripts) and `AstralGuard-<version>-linux-x64.tar.gz` (binary plus systemd unit and
+install script), and publishes them with a `SHA256SUMS.txt` as a GitHub release. Installed
+dashboards pick it up within a day through the [update check](#upgrading).
 
 ### Reading the card directly
 

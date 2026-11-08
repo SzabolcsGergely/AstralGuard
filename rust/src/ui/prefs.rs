@@ -18,6 +18,10 @@ pub struct Prefs {
     /// Outer position and inner size in points: [x, y, w, h].
     pub window: Option<[f32; 4]>,
     pub last_tab: String,
+    /// Ask GitHub once a day whether a newer release exists.
+    pub check_updates: bool,
+    /// A release the user chose to skip: no banner for it.
+    pub skipped_update: String,
 }
 
 impl Default for Prefs {
@@ -31,6 +35,8 @@ impl Default for Prefs {
             connector_mirror: false,
             window: None,
             last_tab: "live".into(),
+            check_updates: true,
+            skipped_update: String::new(),
         }
     }
 }

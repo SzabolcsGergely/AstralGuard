@@ -24,6 +24,7 @@ mod settings;
 mod theme;
 mod thermal;
 mod tray;
+mod update;
 mod widgets;
 #[cfg(windows)]
 mod win;
@@ -216,7 +217,11 @@ pub fn run(args: &[String]) -> i32 {
             if !shot {
                 *th.lock().unwrap() = Some(tray::spawn(link2.clone(), actions.clone(), hwnd.clone()));
             }
-            Ok(Box::new(App::new(ctx, link2, actions, hwnd, prefs, opts, visible, saved_pos)))
+            let check = prefs.check_updates && !opts.demo && !shot;
+            let updates = update::Updates::spawn(ctx.clone(), check, notify_update);
+            let mut app = App::new(ctx, link2, actions, hwnd, prefs, opts, visible, saved_pos);
+            app.updates = Some(updates);
+            Ok(Box::new(app))
         }),
     );
     link.quit.store(true, Ordering::Relaxed);
@@ -229,6 +234,18 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("astralguard ui: {e}");
             1
         }
+    }
+}
+
+/// A desktop notification for a newly found release.
+fn notify_update(version: &str) {
+    let title = format!("{APP_NAME} update");
+    let msg = format!("Version {version} is available. Open the dashboard to download it.");
+    #[cfg(windows)]
+    crate::platform::toast(&title, &msg);
+    #[cfg(not(windows))]
+    {
+        let _ = notify_rust::Notification::new().summary(&title).body(&msg).show();
     }
 }
 
@@ -271,6 +288,7 @@ struct App {
     live: Option<Arc<Live>>,
     connected: bool,
     started: Instant,
+    updates: Option<update::Updates>,
 }
 
 impl App {
@@ -327,6 +345,7 @@ impl App {
             live: None,
             connected: false,
             started: Instant::now(),
+            updates: None,
         };
         app.apply_theme(ctx);
         app
@@ -584,6 +603,7 @@ impl App {
             .show(ctx, |ui| {
                 self.header(ui, &t, l);
                 self.banners(ui, &t, l);
+                self.update_banner(ui, &t);
                 self.tab_bar(ui, &t);
             });
 
@@ -638,7 +658,7 @@ impl App {
                     let (ask, changed) = egui::ScrollArea::vertical()
                         .id_salt("settings")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.settings.show(ui, &t, &mut self.prefs, card_mm))
+                        .show(ui, |ui| self.settings.show(ui, &t, &mut self.prefs, card_mm, self.updates.as_ref()))
                         .inner;
                     if let Some(ask) = ask {
                         self.handle_ask(ask);
@@ -651,6 +671,9 @@ impl App {
                         }));
                         self.apply_theme(ctx);
                         self.save_prefs();
+                        if let Some(u) = &self.updates {
+                            u.set_enabled(self.prefs.check_updates);
+                        }
                     }
                 }
                 Tab::Log => {
@@ -717,6 +740,45 @@ impl App {
             });
         });
         ui.add_space(8.0);
+    }
+
+    /// "Update available" with Download / Skip, unless the user skipped that version.
+    fn update_banner(&mut self, ui: &mut egui::Ui, t: &Theme) {
+        let Some(update::UpdateState::Available { version, url }) = self.updates.as_ref().map(|u| u.state()) else {
+            return;
+        };
+        if version == self.prefs.skipped_update {
+            return;
+        }
+        let c = t.accent;
+        egui::Frame::new()
+            .fill(t.tint_bg(c))
+            .stroke(Stroke::new(1.0_f32, c.gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin { left: 10, right: 10, top: 4, bottom: 4 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                    ui.painter().rect_filled(r, 1.5, c);
+                    ui.label(RichText::new("Update available").font(theme::semibold(13.0)).color(t.text));
+                    ui.label(
+                        RichText::new(format!("· v{version} (running v{})", crate::protocol::APP_VERSION))
+                            .size(13.0)
+                            .color(t.muted()),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Skip").clicked() {
+                            self.prefs.skipped_update = version.clone();
+                            self.save_prefs();
+                        }
+                        if ui.small_button("Download").clicked() {
+                            update::open_url(&url);
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
     }
 
     fn banners(&self, ui: &mut egui::Ui, t: &Theme, l: Option<&Live>) {
