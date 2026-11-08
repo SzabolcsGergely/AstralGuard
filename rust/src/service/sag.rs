@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn median_vector_ignores_one_outlier() {
         let a = [0.0, 0.0, 1.0];
-        let samples = vec![a, a, a, [0.5, 0.0, 0.8]];
+        let samples = [a, a, a, [0.5, 0.0, 0.8]];
         let m = median_vector(samples.iter());
         assert!(angle_deg(m, a) < 1e-9);
     }

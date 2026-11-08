@@ -33,8 +33,6 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
-      - name: Build (release)
-        run: cargo build --release
 
   linux:
     name: Linux
@@ -59,8 +57,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (service only)
-        run: cargo clippy --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Test
         run: cargo test
-      - name: Build (release)
-        run: cargo build --release
+
+  packages:
+    name: Packages
+    needs: [windows, linux]
+    uses: ./.github/workflows/packages.yml

@@ -6,8 +6,8 @@ Wants=systemd-modules-load.service
 
 [Service]
 Type=simple
-ExecStartPre=/sbin/modprobe i2c-dev
-ExecStart=/usr/local/bin/astralguard service
+ExecStartPre=-/sbin/modprobe i2c-dev
+ExecStart=/usr/bin/astralguard service
 # 0 is a deliberate stop (exit from the dashboard, or the guard shut the machine down);
 # anything else is a crash and gets restarted, the job the Windows watchdog does.
 Restart=on-failure

@@ -66,3 +66,28 @@ lto = "thin"
 codegen-units = 1
 panic = "unwind"
 strip = true
+
+# `cargo deb` (cargo-deb) builds the Debian/Ubuntu package; the release workflow runs it.
+[package.metadata.deb]
+maintainer = "Szabolcs Gergely <szabi@noreply.com>"
+copyright = "2026, Szabolcs Gergely"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Watches the per-pin current of the 12V-2x6 connector on ASUS ROG Astral graphics cards \
+and steps in before a melting connector does: it lowers the GPU clocks and power limit, \
+and shuts the machine down as a last resort. Runs as a root systemd service with a tray \
+icon and dashboard for the desktop user."""
+section = "admin"
+priority = "optional"
+# libayatana-appindicator3 is loaded at runtime by the tray, so dpkg-shlibdeps cannot see it.
+depends = "$auto, libayatana-appindicator3-1"
+recommends = "kmod"
+maintainer-scripts = "packaging/linux/debian/"
+systemd-units = { unit-name = "astralguard", unit-scripts = "packaging/linux/", enable = true, start = true }
+assets = [
+    ["target/release/astralguard", "usr/bin/", "755"],
+    ["packaging/linux/sysusers.conf", "usr/lib/sysusers.d/astralguard.conf", "644"],
+    ["packaging/linux/modules-load.conf", "usr/lib/modules-load.d/astralguard.conf", "644"],
+    ["packaging/linux/astralguard-ui.desktop", "etc/xdg/autostart/astralguard-ui.desktop", "644"],
+    ["../README.md", "usr/share/doc/astralguard/README.md", "644"],
+]

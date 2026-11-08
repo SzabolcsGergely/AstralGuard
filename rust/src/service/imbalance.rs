@@ -171,8 +171,7 @@ mod tests {
     #[test]
     fn trips_after_sustain_and_clears() {
         let shared = Shared::new(Settings::default(), None, true);
-        let mut s = Settings::default();
-        s.imbalance_response = ImbalanceResponse::Act;
+        let s = Settings { imbalance_response: ImbalanceResponse::Act, ..Default::default() };
         let mut m = ImbalanceMonitor::new(shared);
         let bad = pins(&[8.0, 8.0, 8.0, 8.0, 8.0, 3.0]);
         m.evaluate(&bad, 0.0, &s);

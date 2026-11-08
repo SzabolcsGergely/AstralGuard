@@ -30,12 +30,32 @@ fn main() {
         "" | "watchdog" => watchdog::run(rest),
         "probe" => probe(),
         "status" => status(rest),
+        #[cfg(windows)]
+        "register" => setup_step("register", platform::register()),
+        #[cfg(windows)]
+        "unregister" => setup_step("unregister", platform::unregister()),
         _ => {
-            eprintln!("usage: astralguard [watchdog [--no-ui] | service | ui [--demo] | probe]");
+            eprintln!("usage: astralguard [watchdog [--no-ui] | service | ui [--demo] | probe | status]");
             2
         }
     };
     std::process::exit(code);
+}
+
+/// The installer's steps. No console (windows_subsystem), so the outcome goes to the log.
+#[cfg(windows)]
+fn setup_step(name: &str, result: Result<(), String>) -> i32 {
+    logger::init(&config::log_dir().join("setup.log"), logger::Level::Info);
+    match result {
+        Ok(()) => {
+            logger::info(format!("{name}: done ({})", std::env::current_exe().unwrap_or_default().display()));
+            0
+        }
+        Err(e) => {
+            logger::error(format!("{name}: {e}"));
+            1
+        }
+    }
 }
 
 /// `astralguard status [--exit]`: ask the running service for its state (or to stop).

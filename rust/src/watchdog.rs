@@ -69,6 +69,15 @@ pub fn run(args: &[String]) -> i32 {
     logger::init(&crate::config::log_dir().join("watchdog.log"), logger::Level::Info);
     crate::crash::install(&crate::config::log_dir());
     let with_ui = cfg!(feature = "ui") && !args.iter().any(|a| a == "--no-ui");
+    // Started again (Start menu, desktop shortcut) while the guard runs: open the dashboard
+    // instead. The UI shows the running window, or starts one if it was closed.
+    #[cfg(windows)]
+    if crate::platform::guard_running() {
+        if with_ui {
+            let _ = Command::new(exe()).args(["ui", "--show"]).spawn();
+        }
+        return 0;
+    }
     let job = job::create();
     logger::info(format!(
         "Watchdog started (pid {}); supervising the service{}.",

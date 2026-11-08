@@ -1,0 +1,15 @@
+post_install() {
+    modprobe i2c-dev 2>/dev/null || true
+    echo ":: Start the guard now and at every boot:"
+    echo "     sudo systemctl enable --now astralguard"
+    echo ":: Let your user open the tray icon and dashboard (applies at the next login):"
+    echo "     sudo usermod -aG astralguard \$USER"
+}
+
+post_upgrade() {
+    systemctl try-restart astralguard.service 2>/dev/null || true
+}
+
+pre_remove() {
+    systemctl disable --now astralguard.service 2>/dev/null || true
+}
