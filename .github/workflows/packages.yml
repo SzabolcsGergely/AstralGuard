@@ -1,0 +1,118 @@
+name: Packages
+
+# Builds the installable packages: the Windows setup .exe, the Debian/Ubuntu .deb and the
+# Arch Linux .pkg.tar.zst. Called by CI (every push: the packages are kept as run
+# artifacts) and by Release (a v* tag: they are published).
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows setup
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build
+        working-directory: rust
+        run: cargo build --release
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path rust\Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress | Out-Null
+          }
+          & $iscc /Qp "/DAppVersion=$version" "/DRepoRoot=$PWD" "/DSourceExe=$PWD\rust\target\release\astralguard.exe" "/O$PWD\dist" rust\packaging\windows\astralguard.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libgtk-3-dev \
+            libxdo-dev libayatana-appindicator3-dev libxkbcommon-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build
+        working-directory: rust
+        run: |
+          mkdir -p ../dist
+          cargo deb --output ../dist/
+      - name: Inspect
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+      - name: Install test
+        run: |
+          # Install and remove without starting the service: no Astral card on a CI runner.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+          sudo apt-get install -y ./dist/*.deb
+          getent group astralguard
+          astralguard status || true
+          sudo apt-get remove -y astralguard
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Build tools and libraries
+        run: pacman -Syu --noconfirm --needed git rust gtk3 libayatana-appindicator xdotool openssl pkgconf
+      - uses: actions/checkout@v4
+      - name: makepkg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -n1)
+          build=/tmp/pkg
+          mkdir -p "$build" dist
+          cp rust/packaging/linux/arch/* "$build/"
+          sed -i "s/^pkgver=.*/pkgver=$version/" "$build/PKGBUILD"
+          # The checked-out tree stands in for the tag's source tarball.
+          git archive --format=tar.gz --prefix="AstralGuard-$version/" -o "$build/AstralGuard-$version.tar.gz" HEAD
+          useradd -m builder
+          chown -R builder "$build"
+          su builder -c "cd $build && makepkg --noconfirm --nodeps"
+          cp "$build"/*.pkg.tar.zst dist/
+      - name: Install test
+        run: |
+          pacman -U --noconfirm dist/*.pkg.tar.zst
+          pacman -Qi astralguard
+          pacman -Ql astralguard
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error

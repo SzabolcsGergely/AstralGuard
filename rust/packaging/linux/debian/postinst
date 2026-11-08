@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # The dashboard talks to the root service through a socket owned by this group.
+    getent group astralguard >/dev/null || addgroup --system astralguard >/dev/null
+    # Installed with sudo: let that user use the dashboard (applies at the next login).
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/dev/null 2>&1; then
+        usermod -aG astralguard "$SUDO_USER" || true
+    fi
+    modprobe i2c-dev 2>/dev/null || true
+fi
+
+#DEBHELPER#
+
+if [ "$1" = "configure" ]; then
+    echo "AstralGuard: the guard service is running (systemctl status astralguard)."
+    echo "AstralGuard: members of the 'astralguard' group get the tray icon and dashboard after their next login."
+    echo "AstralGuard: add others with: sudo usermod -aG astralguard <user>"
+fi
+exit 0

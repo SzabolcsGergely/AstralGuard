@@ -266,6 +266,8 @@ struct Shot {
 struct App {
     link: Arc<Link>,
     actions: tray::Actions,
+    // The native window: titlebar theme and show/hide go through it on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: Arc<AtomicIsize>,
     prefs: Prefs,
     theme: Theme,
@@ -351,6 +353,7 @@ impl App {
         app
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn hwnd(&self) -> isize {
         self.hwnd.load(Ordering::Relaxed)
     }

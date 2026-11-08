@@ -11,16 +11,20 @@ use std::path::{Path, PathBuf};
 use crate::protocol::{ImbalanceResponse, ResponseMode, Settings, SettingsPatch};
 
 /// Where config.ini, logs/ and the state files live. ASTRALGUARD_HOME overrides it.
-/// Windows: next to the executable (portable install). Linux: /var/lib/astralguard.
+/// Windows: %ProgramData%\AstralGuard, or next to the executable when a config.ini is
+/// already there (a portable copy, and installs from before the installer existed).
+/// Linux: /var/lib/astralguard (the unit's StateDirectory).
 pub fn data_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("ASTRALGUARD_HOME") {
         return PathBuf::from(home);
     }
     if cfg!(windows) {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."))
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+        if let Some(dir) = exe_dir.filter(|d| d.join("config.ini").is_file()) {
+            return dir;
+        }
+        let root = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
+        PathBuf::from(root).join(crate::protocol::APP_NAME)
     } else {
         PathBuf::from("/var/lib/astralguard")
     }
@@ -112,6 +116,9 @@ impl Ini {
     /// leave a half-written config behind.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
         let tmp = path.with_extension("ini.tmp");
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
         fs::write(&tmp, self.to_text())?;
         fs::rename(&tmp, path)
     }

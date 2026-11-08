@@ -1,0 +1,49 @@
+# Maintainer: Szabolcs Gergely <szabi@noreply.com>
+#
+# Builds AstralGuard from a release tag. The release workflow builds the published
+# .pkg.tar.zst with this file; to build it yourself: makepkg -si
+pkgname=astralguard
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs (service, tray icon, dashboard)"
+arch=('x86_64')
+url="https://github.com/SzabolcsGergely/AstralGuard"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'gtk3' 'libayatana-appindicator' 'openssl' 'xdotool')
+makedepends=('cargo' 'pkgconf')
+optdepends=('nvidia-utils: NVML clock and power limits (mitigation)')
+install=astralguard.install
+options=('!lto')
+source=("AstralGuard-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "AstralGuard-$pkgver/rust"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "AstralGuard-$pkgver/rust"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+check() {
+    cd "AstralGuard-$pkgver/rust"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd "AstralGuard-$pkgver"
+    local lin=rust/packaging/linux
+    install -Dm755 rust/target/release/astralguard "$pkgdir/usr/bin/astralguard"
+    install -Dm644 "$lin/astralguard.service" "$pkgdir/usr/lib/systemd/system/astralguard.service"
+    install -Dm644 "$lin/sysusers.conf" "$pkgdir/usr/lib/sysusers.d/astralguard.conf"
+    install -Dm644 "$lin/modules-load.conf" "$pkgdir/usr/lib/modules-load.d/astralguard.conf"
+    install -Dm644 "$lin/astralguard-ui.desktop" "$pkgdir/etc/xdg/autostart/astralguard-ui.desktop"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

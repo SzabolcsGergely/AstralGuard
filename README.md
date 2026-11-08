@@ -86,14 +86,15 @@ It runs as separate processes, so a dashboard problem can never reach the protec
 | `astralguard probe` | Reads the card a few times and prints pins, volts and the accelerometer. Read-only. |
 | `astralguard status` | Asks the running service for its state (run elevated). `--exit` stops it. |
 
-**Linux (experimental):** `cargo build --release`, then
-`sudo rust/packaging/linux/install.sh <user>`. That installs the service as a root systemd
-unit (restart-on-failure does the watchdog's job), and the tray and dashboard as an autostart
-entry in the user's session, talking to the service through a socket in `/run/astralguard` open
-to the `astralguard` group. Settings and logs live in `/var/lib/astralguard`. Pins are read through
-the NVIDIA driver's I2C adapters (`/dev/i2c-*`), the GPU is limited through `libnvidia-ml`.
-**Not yet verified on Linux hardware:** the sensor bus is assumed to be "NVIDIA i2c adapter 1";
-check `sudo astralguard probe` first. `ASTRALGUARD_I2C_BUS=<n>` selects one explicitly.
+**Linux (experimental):** install the `.deb` or Arch package (see
+[Installation](#installation)). The service runs as a root systemd unit (restart-on-failure
+does the watchdog's job), the tray and dashboard start in the desktop session and talk to the
+service through a socket in `/run/astralguard` open to the `astralguard` group. Settings and
+logs live in `/var/lib/astralguard`. Pins are read through the NVIDIA driver's I2C adapters
+(`/dev/i2c-*`), the GPU is limited through `libnvidia-ml`. **Not yet verified on Linux
+hardware:** the sensor bus is assumed to be "NVIDIA i2c adapter 1"; check
+`sudo astralguard probe` first. `ASTRALGUARD_I2C_BUS=<n>` (in a systemd drop-in for the unit)
+selects one explicitly.
 
 ## Requirements
 
@@ -256,65 +257,80 @@ silently pretends to have a capability it does not have.
 
 ## Installation
 
-### Option A: Automated Installer (Recommended)
+Download the package for your system from the
+[releases page](https://github.com/SzabolcsGergely/AstralGuard/releases):
 
-The easiest way to install AstralGuard is using the included installer.
+| System | File |
+|---|---|
+| Windows 10/11 (x64) | `AstralGuard-<version>-setup.exe` |
+| Debian, Ubuntu and derivatives | `astralguard_<version>-1_amd64.deb` |
+| Arch Linux and derivatives | `astralguard-<version>-1-x86_64.pkg.tar.zst` |
 
-**Prerequisites:**
-- Windows 10 or 11
-- `astralguard.exe` next to `install.bat`: from a release, or built with `rust\build.ps1`
-  (see [Building from source](#building-from-source); the installer builds it itself if
-  it is missing and Rust is installed)
-- Administrator rights (required for Task Scheduler and Event Viewer registration)
+`SHA256SUMS.txt` on the same page lists every file's checksum.
 
-**Steps:**
+### Windows
 
-1. **Extract or clone** the project to a folder (e.g. `C:\AstralGuard`).
+Run **`AstralGuard-<version>-setup.exe`** and follow the wizard (it asks for administrator
+rights). It installs `astralguard.exe` to `C:\Program Files\AstralGuard`, adds a Start menu
+entry and, unless you untick **Start AstralGuard when I sign in**, creates the
+**"AstralGuard"** scheduled task that:
 
-2. **Run the installer:**
-   - Double-click **`install.bat`**, or
-   - From PowerShell/Command Prompt in the project folder, run:
-     ```
-     .\install.bat
-     ```
-   - If you use PowerShell directly:  
-     `.\install.ps1`  
-     (You may need to allow script execution:  
-     `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`)
+- starts the guard at sign-in, elevated (needed to limit the GPU; see [Elevation](#elevation)),
+  with no console window
+- restarts it if it fails to start (up to 999 times, 1-minute interval); crashes after that
+  are the [watchdog's](#crash-recovery-the-watchdog) job
+- runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled, and
+  battery-power settings will not stop it
 
-3. **Follow the prompts.** The installer will:
-   - Create a default `config.ini` if none exists
-   - Create a `logs` folder
-   - Register the **"AstralGuard"** Event Viewer source (if permitted)
-   - Create a **scheduled task** named **"AstralGuard"** that:
-     - Runs at user logon
-     - Starts `astralguard.exe`, the watchdog, which runs the protection service and the
-       tray (no console window)
-     - Restarts automatically on failure (up to 999 times, 1-minute interval)
-     - Runs indefinitely: the default 72-hour Task Scheduler execution limit is disabled,
-       and battery-power settings will not stop it
-   - Upgrading from an earlier name (**PinGuard**, before that **12VHPWR Guard**): stop and
-     remove that scheduled task, delete the old `pinguard.exe`, and rename the old log to
-     `logs\astralguard.log` so the history carries over (the dashboard's window preferences
-     carry over too). Earlier Event Viewer entries stay under the old source name.
+The last page offers to start it right away. Settings and logs live in
+`C:\ProgramData\AstralGuard` (Start menu → **AstralGuard settings and logs**). Opening
+**AstralGuard** from the Start menu while it runs brings up the dashboard.
 
-4. When asked **"Start AstralGuard now? (y/N)"**, type `y` and Enter to start immediately, or `N` to have it start at next logon.
+Silent install, e.g. for scripted setups: `AstralGuard-<version>-setup.exe /SILENT`
+(`/VERYSILENT` shows nothing at all; `/TASKS=""` skips the logon task).
 
-**After installation:** The guard runs from the system tray. You'll see the AstralGuard icon when it's active. On a supported card nothing else is needed; hover the icon and the tooltip should read `AstralGuard: Safe | Max ...`. If it says `Unknown (waiting for pin sensors)`, the card could not be read; the log says why.
+**After installation:** the guard runs from the system tray. On a supported card nothing else
+is needed; hover the icon and the tooltip should read `AstralGuard: Safe | Max ...`. If it
+says `Unknown (waiting for pin sensors)`, the card could not be read; the log says why.
 
----
+**Coming from 12VHPWR Guard or PinGuard** (the app's earlier names): the setup stops and
+replaces their scheduled tasks. A copy that kept `config.ini` next to the program keeps using
+it from there when run from that folder; for the installed copy, move `config.ini` to
+`C:\ProgramData\AstralGuard` to keep your thresholds.
+
+### Linux
+
+**Debian / Ubuntu:**
+
+```
+sudo apt install ./astralguard_<version>-1_amd64.deb
+```
+
+The service is enabled and started right away. Whoever installed it with `sudo` is added to
+the `astralguard` group, which may use the tray icon and dashboard; they appear at the next
+login. Add other users with `sudo usermod -aG astralguard <user>`.
+
+**Arch:**
+
+```
+sudo pacman -U astralguard-<version>-1-x86_64.pkg.tar.zst
+sudo systemctl enable --now astralguard
+sudo usermod -aG astralguard $USER
+```
+
+Following Arch practice, the package does not start the service by itself. To build it from
+source instead, use [`rust/packaging/linux/arch/PKGBUILD`](rust/packaging/linux/arch/PKGBUILD)
+(`makepkg -si`).
+
+Both packages install the binary to `/usr/bin/astralguard`, the `astralguard.service` unit,
+the `i2c-dev` module load, the `astralguard` group (systemd-sysusers) and the tray's
+autostart entry (`/etc/xdg/autostart`).
 
 ### Upgrading
 
-1. Get the new version: download `AstralGuard-<version>-windows-x64.zip` from the
-   [releases page](https://github.com/SzabolcsGergely/AstralGuard/releases) and extract it
-   over your existing folder, or `git pull` and run `rust\build.ps1`.
-2. Re-run the installer (`install.bat` as administrator).
-
-That is the whole process. The installer stops the running guard first (the exe is locked
-while it runs), re-registers the scheduled task, and leaves `config.ini` and your logs
-untouched, so your thresholds and settings survive. If you started the guard by hand
-instead of through the scheduled task, exit it from the tray menu first.
+Install the new version over the old one: run the new setup on Windows (it stops the running
+guard first, since the program file is locked while it runs), or install the new package on
+Linux (the service is restarted). Settings, the sag baseline and logs are kept.
 
 **Update check.** The dashboard asks GitHub's releases API once shortly after it starts
 and then once a day whether a newer release exists. If one does, you get a notification
@@ -327,65 +343,38 @@ all, so a failed check can never affect monitoring.
 The version you are running is shown at the top of the tray menu and in the first log line
 at startup.
 
----
+### Uninstalling
 
-### Uninstalling (Automated)
+- **Windows:** Settings → Apps → **AstralGuard** → Uninstall (or "Add or remove programs").
+  It stops the guard and removes the program, the scheduled task and the Event Viewer source.
+  `C:\ProgramData\AstralGuard` (settings and logs) stays; delete it for a clean slate.
+- **Debian / Ubuntu:** `sudo apt remove astralguard` (`purge` also drops the package's config).
+- **Arch:** `sudo pacman -R astralguard`.
 
-To stop and remove the scheduled task (the guard will no longer start at logon):
+On Linux, `/var/lib/astralguard` (settings and logs) stays until you delete it.
 
-1. **Run the uninstaller:**
-   - Double-click **`uninstall.bat`**, or
-   - From the project folder:  
-     `.\uninstall.bat`  
-     or in PowerShell:  
-     `.\uninstall.ps1`
+### Portable use (Windows)
 
-2. The **"AstralGuard"** scheduled task is removed. `astralguard.exe`, `config.ini` and the logs are left in place so you can run manually or reinstall later.
-
-To fully remove the software, delete the entire project folder after running the uninstaller.
-
----
-
-### Option B: Manual Installation
-
-1. **Place** `astralguard.exe` in a folder (e.g. `C:\AstralGuard`). It keeps `config.ini` and
-   `logs\` next to itself (`ASTRALGUARD_HOME` overrides the folder).
-2. **Run it elevated** (right-click, Run as administrator). Without elevation it monitors and
-   can shut down, but cannot limit the GPU; see [Elevation](#elevation).
-3. **Run at logon (optional):** create a task in Task Scheduler:
-   - **Program:** `C:\AstralGuard\astralguard.exe`, no arguments
-   - **Start in:** the same folder
-   - **Trigger:** At log on; **Run with highest privileges**
-   - **Settings:** set **"Stop the task if it runs longer than"** to **disabled**; the Task
-     Scheduler default silently kills the guard after 72 hours of uptime. Task Scheduler's
-     "restart on failure" only covers a task that fails to start, not one that crashes
-     later; that is the watchdog's job.
+`astralguard.exe` also runs without installing: copy it out of `C:\Program Files\AstralGuard`
+or build it (see [Building from source](#building-from-source)). Run it elevated (right-click,
+Run as administrator); without elevation it monitors and can shut down, but cannot limit the
+GPU. A copy with a `config.ini` next to it keeps its settings and `logs\` in that folder;
+otherwise it uses `C:\ProgramData\AstralGuard` (`ASTRALGUARD_HOME` overrides either).
+`astralguard register` (elevated) creates the logon task for that copy, and
+`astralguard unregister` removes it again.
 
 ### Crash recovery (the watchdog)
 
 `astralguard.exe` without arguments is the watchdog: it runs `astralguard service` and
 `astralguard ui` and starts either one again if it dies. A clean service exit (Exit from the tray
-or dashboard, the guard shutting the machine down, or a second copy finding one already
-running) ends everything; anything else counts as a crash, and it is restarted after 5 s (10,
-30, then 60 s if it keeps failing; a run of 10 minutes resets that). The restarted service
-logs why, writes an Event Log warning (ID 1005) and shows a "Restarted after a crash"
-notification. A dashboard that crashes is restarted the same way and never affects the
-service. The watchdog's own log is `logs\watchdog.log`; a panic leaves a backtrace in
-`logs\crash_trace.log`. Both children run in a job object, so stopping the scheduled task
-stops them too.
-
----
-
-### Installer Files Reference
-
-| File | Description |
-|------|-------------|
-| `install.bat` | Launches the PowerShell installer; double-click or run from Command Prompt. |
-| `install.ps1` | Registers the Event Viewer source and the scheduled task, creates `config.ini` and `logs\`. `-StartNow` starts it without asking. |
-| `uninstall.bat` | Launches the PowerShell uninstaller. |
-| `uninstall.ps1` | Stops the guard and removes the "AstralGuard" scheduled task. |
-| `astralguard.exe` | The program. |
-| `rust\build.ps1` | Builds `astralguard.exe` from source and copies it here. |
+or dashboard, or the guard shutting the machine down) ends everything; anything else counts as
+a crash, and it is restarted after 5 s (10, 30, then 60 s if it keeps failing; a run of 10
+minutes resets that). The restarted service logs why, writes an Event Log warning (ID 1005)
+and shows a "Restarted after a crash" notification. A dashboard that crashes is restarted the
+same way and never affects the service. Starting `astralguard.exe` again while the guard runs
+just opens the dashboard. The watchdog's own log is `logs\watchdog.log`; a panic leaves a
+backtrace in `logs\crash_trace.log`. Both children run in a job object, so stopping the
+scheduled task stops them too.
 
 ---
 
@@ -497,9 +486,10 @@ All settings are in the dashboard's **Settings** tab.
 
 The **Start with Windows** switch in the Settings tab reflects the real state of the
 **"AstralGuard"** scheduled task, so it stays accurate even if the task is changed from Task
-Scheduler directly. It enables and disables the existing task rather than creating one, so
-`install.bat` still has to be run once first. Keeping task creation in the installer means the
-trigger, principal and restart settings are defined in exactly one place.
+Scheduler directly. It enables and disables the existing task rather than creating one; the
+setup creates the task (or `astralguard register` for a portable copy), so its trigger,
+principal and restart settings are defined in exactly one place. On Linux the same switch
+enables or disables `astralguard.service`.
 
 ---
 
@@ -637,7 +627,7 @@ Source: AstralGuard
 
 ### Config File
 
-Settings are saved to `config.ini` next to `astralguard.exe` (`/var/lib/astralguard` on Linux). The installer creates it; the dashboard writes only the keys it changes and keeps everything else, including comments.
+Settings are saved to `config.ini` in `C:\ProgramData\AstralGuard` (next to `astralguard.exe` for a [portable copy](#portable-use-windows); `/var/lib/astralguard` on Linux). It is created with the defaults on first save; the dashboard writes only the keys it changes and keeps everything else, including comments.
 
 **File format:**
 ```ini
@@ -757,10 +747,16 @@ uses `rust-lld`, because GNU ld mislinks those libraries and the program crashes
 ### CI and releases
 
 Every push to `master` and every pull request runs [CI](.github/workflows/ci.yml) on
-Windows and Linux: `cargo fmt --check`, clippy with warnings as errors, the tests, and a
-release build (plus a service-only build on Linux).
+Windows and Linux: `cargo fmt --check`, clippy with warnings as errors (plus a service-only
+build on Linux) and the tests. When those pass it builds the three packages
+([packages workflow](.github/workflows/packages.yml)): the Windows setup with
+[Inno Setup](rust/packaging/windows/astralguard.iss), the `.deb` with
+[cargo-deb](https://github.com/kornelski/cargo-deb) (metadata in `rust/Cargo.toml`), and the
+Arch package with `makepkg` in an Arch container. Both Linux packages are installed on the
+runner as a test. Each run keeps the packages as downloadable artifacts.
 
-To release: bump `version` in `rust/Cargo.toml`, commit, then tag and push:
+To release: bump `version` in `rust/Cargo.toml` (and `pkgver` in the PKGBUILD), commit,
+then tag and push:
 
 ```
 git tag v2.1.0
@@ -768,10 +764,8 @@ git push origin v2.1.0
 ```
 
 The [release workflow](.github/workflows/release.yml) checks that the tag matches the crate
-version, runs the tests, builds `AstralGuard-<version>-windows-x64.zip` (program plus
-installer scripts) and `AstralGuard-<version>-linux-x64.tar.gz` (binary plus systemd unit and
-install script), and publishes them with a `SHA256SUMS.txt` as a GitHub release. Installed
-dashboards pick it up within a day through the [update check](#upgrading).
+version, builds the same packages and publishes them with a `SHA256SUMS.txt` as a GitHub
+release. Installed dashboards pick it up within a day through the [update check](#upgrading).
 
 ### Reading the card directly
 
