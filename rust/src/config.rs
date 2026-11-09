@@ -6,6 +6,7 @@
 //! default, as before.
 
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{ImbalanceResponse, ResponseMode, Settings, SettingsPatch};
@@ -138,6 +139,13 @@ impl Ini {
 
 const S: &str = "Settings";
 
+// Allowed overclock values, shared by loading and by `check`.
+const OC_MV: RangeInclusive<f64> = 400.0..=1300.0;
+const OC_TARGET_MHZ: RangeInclusive<f64> = 200.0..=4000.0;
+const OC_POWER_W: RangeInclusive<f64> = 1.0..=2000.0;
+const OC_MEM_MHZ: RangeInclusive<f64> = -10000.0..=10000.0;
+const OC_DELAY_S: RangeInclusive<f64> = 0.0..=600.0;
+
 /// The sag reference: gravity's direction when calibrated, and the card it was taken on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SagBaseline {
@@ -201,6 +209,32 @@ pub fn from_ini(ini: &Ini) -> (Settings, Option<SagBaseline>) {
     s.sensor_auto_scan = ini.boolean("sensor_auto_scan").unwrap_or(d.sensor_auto_scan);
     s.imbalance_response =
         ini.get(S, "imbalance_response").and_then(ImbalanceResponse::parse).unwrap_or(d.imbalance_response);
+
+    // Overclock: a value that is missing takes its default; one that is present but out of
+    // range falls back too, and also unticks the part it belongs to, so a damaged file never
+    // applies a half-understood setting to the GPU.
+    let oc = |key: &str, fallback: f64, range: &RangeInclusive<f64>| -> (f64, bool) {
+        match ini.float(key) {
+            None => (fallback, true),
+            Some(Ok(v)) if range.contains(&v) => (v, true),
+            _ => (fallback, false),
+        }
+    };
+    let (from, from_ok) = oc("oc_uv_from_mv", d.oc_uv_from_mv, &OC_MV);
+    let (to, to_ok) = oc("oc_uv_to_mv", d.oc_uv_to_mv, &OC_MV);
+    let (target, target_ok) = oc("oc_uv_target_mhz", d.oc_uv_target_mhz, &OC_TARGET_MHZ);
+    let uv_ok = from_ok && to_ok && target_ok && from < to;
+    if uv_ok {
+        (s.oc_uv_from_mv, s.oc_uv_to_mv, s.oc_uv_target_mhz) = (from, to, target);
+    }
+    s.oc_uv_enabled = uv_ok && ini.boolean("oc_uv_enabled").unwrap_or(d.oc_uv_enabled);
+    let (power, power_ok) = oc("oc_power_w", d.oc_power_w, &OC_POWER_W);
+    s.oc_power_w = power;
+    s.oc_power_enabled = power_ok && ini.boolean("oc_power_enabled").unwrap_or(d.oc_power_enabled);
+    let (mem, mem_ok) = oc("oc_mem_offset_mhz", d.oc_mem_offset_mhz, &OC_MEM_MHZ);
+    s.oc_mem_offset_mhz = mem;
+    s.oc_mem_enabled = mem_ok && ini.boolean("oc_mem_enabled").unwrap_or(d.oc_mem_enabled);
+    s.oc_apply_delay_seconds = oc("oc_apply_delay_seconds", d.oc_apply_delay_seconds, &OC_DELAY_S).0;
 
     (s, baseline_from_ini(ini))
 }
@@ -275,6 +309,15 @@ pub fn save_settings(path: &Path, s: &Settings, keys: &[&str]) -> std::io::Resul
             "imbalance_delta_amps" => fmt_float(s.imbalance_delta_amps),
             "imbalance_sustained_seconds" => fmt_float(s.imbalance_sustained_seconds),
             "imbalance_response" => s.imbalance_response.key().to_string(),
+            "oc_uv_enabled" => fmt_bool(s.oc_uv_enabled),
+            "oc_uv_from_mv" => fmt_float(s.oc_uv_from_mv),
+            "oc_uv_to_mv" => fmt_float(s.oc_uv_to_mv),
+            "oc_uv_target_mhz" => fmt_float(s.oc_uv_target_mhz),
+            "oc_power_enabled" => fmt_bool(s.oc_power_enabled),
+            "oc_power_w" => fmt_float(s.oc_power_w),
+            "oc_mem_enabled" => fmt_bool(s.oc_mem_enabled),
+            "oc_mem_offset_mhz" => fmt_float(s.oc_mem_offset_mhz),
+            "oc_apply_delay_seconds" => fmt_float(s.oc_apply_delay_seconds),
             _ => continue,
         };
         ini.set(S, key, value);
@@ -313,7 +356,16 @@ pub fn patch_keys(p: &SettingsPatch) -> Vec<&'static str> {
         imbalance_delta_amps,
         imbalance_sustained_seconds,
         imbalance_response,
-        sensor_auto_scan
+        sensor_auto_scan,
+        oc_uv_enabled,
+        oc_uv_from_mv,
+        oc_uv_to_mv,
+        oc_uv_target_mhz,
+        oc_power_enabled,
+        oc_power_w,
+        oc_mem_enabled,
+        oc_mem_offset_mhz,
+        oc_apply_delay_seconds
     );
     keys
 }
@@ -342,7 +394,16 @@ pub fn merged(s: &Settings, p: &SettingsPatch) -> Settings {
         imbalance_delta_amps,
         imbalance_sustained_seconds,
         imbalance_response,
-        sensor_auto_scan
+        sensor_auto_scan,
+        oc_uv_enabled,
+        oc_uv_from_mv,
+        oc_uv_to_mv,
+        oc_uv_target_mhz,
+        oc_power_enabled,
+        oc_power_w,
+        oc_mem_enabled,
+        oc_mem_offset_mhz,
+        oc_apply_delay_seconds
     );
     m
 }
@@ -387,6 +448,24 @@ pub fn check(current: &Settings, p: &SettingsPatch) -> (Vec<String>, Vec<String>
     }
     if m.sag_serious_degrees <= m.sag_warn_degrees {
         errors.push("The serious sag angle must be larger than the warning angle".into());
+    }
+    let ocs: [(&str, Option<f64>, &RangeInclusive<f64>, &str); 6] = [
+        ("Undervolt start", p.oc_uv_from_mv, &OC_MV, "mV"),
+        ("Undervolt end", p.oc_uv_to_mv, &OC_MV, "mV"),
+        ("Undervolt target clock", p.oc_uv_target_mhz, &OC_TARGET_MHZ, "MHz"),
+        ("Power limit", p.oc_power_w, &OC_POWER_W, "W"),
+        ("Memory offset", p.oc_mem_offset_mhz, &OC_MEM_MHZ, "MHz"),
+        ("Apply delay", p.oc_apply_delay_seconds, &OC_DELAY_S, "s"),
+    ];
+    for (name, value, range, unit) in ocs {
+        if let Some(v) = value {
+            if !range.contains(&v) {
+                errors.push(format!("{name} must be between {} and {} {unit}", g(*range.start()), g(*range.end())));
+            }
+        }
+    }
+    if m.oc_uv_from_mv >= m.oc_uv_to_mv {
+        errors.push("The undervolt range must start below where it ends".into());
     }
     // Out of order, a lower tier would be skipped or a higher one would fire first.
     if !(m.threshold_amps < m.critical_amps && m.critical_amps < m.catastrophic_amps) {
@@ -475,6 +554,55 @@ mod tests {
         assert!(text.contains("future_key = x") && text.contains("threshold_amps = 9.0"));
         assert_eq!(load(&path).0.threshold_amps, 9.0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn overclock_is_off_by_default_and_parses() {
+        let d = from_ini(&Ini::parse("[Settings]\n")).0;
+        assert!(!d.oc_uv_enabled && !d.oc_power_enabled && !d.oc_mem_enabled);
+        assert_eq!(d.oc_apply_delay_seconds, 30.0);
+        let s = from_ini(&Ini::parse(
+            "[Settings]\noc_uv_enabled = True\noc_uv_from_mv = 820\noc_uv_to_mv = 895\noc_uv_target_mhz = 2827\n",
+        ))
+        .0;
+        assert!(s.oc_uv_enabled);
+        assert_eq!((s.oc_uv_from_mv, s.oc_uv_to_mv, s.oc_uv_target_mhz), (820.0, 895.0, 2827.0));
+    }
+
+    #[test]
+    fn a_bad_overclock_value_leaves_that_setting_unmanaged() {
+        let s = from_ini(&Ini::parse("[Settings]\noc_power_enabled = True\noc_power_w = lots\n")).0;
+        assert!(!s.oc_power_enabled);
+        let s = from_ini(&Ini::parse("[Settings]\noc_uv_enabled = True\noc_uv_from_mv = 900\noc_uv_to_mv = 850\n")).0;
+        assert!(!s.oc_uv_enabled);
+        let s = from_ini(&Ini::parse("[Settings]\noc_mem_enabled = True\noc_mem_offset_mhz = 99999\n")).0;
+        assert!(!s.oc_mem_enabled);
+        assert_eq!(s.oc_mem_offset_mhz, Settings::default().oc_mem_offset_mhz);
+    }
+
+    #[test]
+    fn overclock_keys_round_trip_through_the_patch_and_the_file() {
+        let p = SettingsPatch { oc_power_enabled: Some(true), oc_power_w: Some(480.0), ..Default::default() };
+        assert_eq!(patch_keys(&p), vec!["oc_power_enabled", "oc_power_w"]);
+        let m = merged(&Settings::default(), &p);
+        assert!(m.oc_power_enabled && m.oc_power_w == 480.0);
+        let path = std::env::temp_dir().join(format!("ag-oc-{}.ini", std::process::id()));
+        save_settings(&path, &m, &patch_keys(&p)).unwrap();
+        let back = load(&path).0;
+        let _ = std::fs::remove_file(&path);
+        assert!(back.oc_power_enabled && back.oc_power_w == 480.0);
+    }
+
+    #[test]
+    fn check_rejects_an_empty_undervolt_range_and_a_negative_delay() {
+        let base = Settings::default();
+        let p = SettingsPatch { oc_uv_from_mv: Some(900.0), oc_uv_to_mv: Some(850.0), ..Default::default() };
+        assert!(!check(&base, &p).0.is_empty());
+        let p = SettingsPatch { oc_apply_delay_seconds: Some(-1.0), ..Default::default() };
+        assert!(!check(&base, &p).0.is_empty());
+        let p = SettingsPatch { oc_power_w: Some(5000.0), ..Default::default() };
+        assert!(!check(&base, &p).0.is_empty());
+        assert!(check(&base, &SettingsPatch::default()).0.is_empty());
     }
 
     #[test]

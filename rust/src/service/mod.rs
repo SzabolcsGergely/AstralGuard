@@ -328,6 +328,8 @@ impl Shared {
                     imbalance_sustained_seconds: Some(d.imbalance_sustained_seconds),
                     imbalance_response: Some(d.imbalance_response),
                     sensor_auto_scan: Some(d.sensor_auto_scan),
+                    // The oc_* keys stay out: a reset must not change what the GPU runs at.
+                    ..Default::default()
                 };
                 let failures = self.apply(&patch);
                 self.notify(
@@ -471,5 +473,18 @@ mod tests {
         assert!(report.message.contains("no scan needed"), "{}", report.message);
         assert!(report.lines.is_empty());
         assert!(!shared.reconnect_now.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn reset_defaults_leaves_the_overclock_alone() {
+        let shared =
+            Shared::new(Settings { oc_power_enabled: true, oc_power_w: 480.0, ..Default::default() }, None, true);
+        let Response::Applied { failures } = shared.handle(Request::ResetDefaults) else {
+            panic!("not an apply answer")
+        };
+        assert!(failures.is_empty(), "{failures:?}");
+        let s = shared.settings();
+        assert!(s.oc_power_enabled);
+        assert_eq!(s.oc_power_w, 480.0);
     }
 }

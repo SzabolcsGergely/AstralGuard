@@ -28,6 +28,12 @@ const NVML_SUCCESS: i32 = 0;
 const NVML_ERROR_INSUFFICIENT_SIZE: i32 = 7;
 const NVML_DEVICE_NAME_BUFFER_SIZE: usize = 96;
 const NVML_MAX_CLOCK_ENTRIES: u32 = 256;
+const NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE: usize = 80;
+
+/// nvmlClockType_t values for the clock offset calls.
+pub(crate) const NVML_CLOCK_GRAPHICS: i32 = 0;
+pub(crate) const NVML_CLOCK_MEM: i32 = 2;
+const NVML_PSTATE_0: i32 = 0;
 
 /// Clock floors to try if the driver refuses the enumerated minimum. Each step is higher
 /// and less effective, so this only walks upward as a last resort.
@@ -50,13 +56,8 @@ pub struct BoardPower {
 impl BoardPower {
     pub fn open(subsystem_id: u32) -> Result<BoardPower, String> {
         let nvml = Nvml::init()?;
-        for i in 0..nvml.device_count()? {
-            let h = nvml.handle(i)?;
-            if nvml.subsystem_id(h)? == subsystem_id {
-                return Ok(BoardPower { nvml, handle: h });
-            }
-        }
-        Err(format!("NVML lists no GPU with subsystem 0x{subsystem_id:08X}"))
+        let handle = handle_for_subsystem(&nvml, subsystem_id)?;
+        Ok(BoardPower { nvml, handle })
     }
 
     pub fn watts(&self) -> Result<f64, String> {
@@ -79,11 +80,52 @@ struct NvmlPciInfo {
     bus_id: [u8; 32],
 }
 
-type Handle = *mut c_void;
+/// nvmlClockOffset_t (v1, 24 bytes).
+/// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06): reads the graphics and
+/// memory offsets with their ranges, and a +200 MHz set on P0 and its reset to 0 work.
+#[repr(C)]
+struct NvmlClockOffset {
+    version: u32,
+    clock_type: i32,
+    pstate: i32,
+    clock_offset_mhz: i32,
+    min_clock_offset_mhz: i32,
+    max_clock_offset_mhz: i32,
+}
+
+const NVML_CLOCK_OFFSET_V1: u32 = std::mem::size_of::<NvmlClockOffset>() as u32 | (1 << 24);
+const _: () = assert!(std::mem::size_of::<NvmlClockOffset>() == 24);
+
+impl NvmlClockOffset {
+    fn request(clock_type: i32) -> NvmlClockOffset {
+        NvmlClockOffset {
+            version: NVML_CLOCK_OFFSET_V1,
+            clock_type,
+            pstate: NVML_PSTATE_0,
+            clock_offset_mhz: 0,
+            min_clock_offset_mhz: 0,
+            max_clock_offset_mhz: 0,
+        }
+    }
+}
+
+pub(crate) type Handle = *mut c_void;
+
+/// The first NVML device with this PCI subsystem id.
+pub(crate) fn handle_for_subsystem(nvml: &Nvml, subsystem_id: u32) -> Result<Handle, String> {
+    for i in 0..nvml.device_count()? {
+        let h = nvml.handle(i)?;
+        if nvml.subsystem_id(h)? == subsystem_id {
+            return Ok(h);
+        }
+    }
+    Err(format!("NVML lists no GPU with subsystem 0x{subsystem_id:08X}"))
+}
 
 /// Thin binding over the handful of NVML calls the guard needs. Every call returns
 /// Err(status text) on a non-zero status; the caller decides which failures matter.
-struct Nvml {
+/// The overclock has its own instance (`overclock::gpu::RealGpu`), never the mitigator's.
+pub(crate) struct Nvml {
     lib: Library,
 }
 
@@ -99,7 +141,7 @@ macro_rules! call {
 }
 
 impl Nvml {
-    fn init() -> Result<Nvml, String> {
+    pub(crate) fn init() -> Result<Nvml, String> {
         let lib = unsafe { Library::new(NVML_LIBRARY) }.map_err(|e| format!("{NVML_LIBRARY} not loadable ({e})"))?;
         let nvml = Nvml { lib };
         call!(nvml, "nvmlInit_v2", unsafe extern "C" fn() -> i32,);
@@ -138,7 +180,7 @@ impl Nvml {
         Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
-    fn power_limit_mw(&self, h: Handle) -> Result<u32, String> {
+    pub(crate) fn power_limit_mw(&self, h: Handle) -> Result<u32, String> {
         let mut v = 0u32;
         call!(self, "nvmlDeviceGetPowerManagementLimit", unsafe extern "C" fn(Handle, *mut u32) -> i32, h, &mut v);
         Ok(v)
@@ -151,7 +193,7 @@ impl Nvml {
         Ok(v)
     }
 
-    fn power_limit_constraints_mw(&self, h: Handle) -> Result<(u32, u32), String> {
+    pub(crate) fn power_limit_constraints_mw(&self, h: Handle) -> Result<(u32, u32), String> {
         let (mut lo, mut hi) = (0u32, 0u32);
         call!(
             self,
@@ -164,7 +206,7 @@ impl Nvml {
         Ok((lo, hi))
     }
 
-    fn set_power_limit_mw(&self, h: Handle, mw: u32) -> Result<(), String> {
+    pub(crate) fn set_power_limit_mw(&self, h: Handle, mw: u32) -> Result<(), String> {
         call!(self, "nvmlDeviceSetPowerManagementLimit", unsafe extern "C" fn(Handle, u32) -> i32, h, mw);
         Ok(())
     }
@@ -177,6 +219,35 @@ impl Nvml {
     fn reset_locked_clocks(&self, h: Handle) -> Result<(), String> {
         call!(self, "nvmlDeviceResetGpuLockedClocks", unsafe extern "C" fn(Handle) -> i32, h);
         Ok(())
+    }
+
+    /// (current, min, max) offset of one clock domain on P0, MHz.
+    /// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06): an offset set on P0
+    /// reads back on every P-state (P8 included), so P0 is the one to use.
+    pub(crate) fn get_clock_offset(&self, h: Handle, clock_type: i32) -> Result<(i32, i32, i32), String> {
+        let mut o = NvmlClockOffset::request(clock_type);
+        call!(self, "nvmlDeviceGetClockOffsets", unsafe extern "C" fn(Handle, *mut NvmlClockOffset) -> i32, h, &mut o);
+        Ok((o.clock_offset_mhz, o.min_clock_offset_mhz, o.max_clock_offset_mhz))
+    }
+
+    pub(crate) fn set_clock_offset(&self, h: Handle, clock_type: i32, mhz: i32) -> Result<(), String> {
+        let mut o = NvmlClockOffset::request(clock_type);
+        o.clock_offset_mhz = mhz;
+        call!(self, "nvmlDeviceSetClockOffsets", unsafe extern "C" fn(Handle, *mut NvmlClockOffset) -> i32, h, &mut o);
+        Ok(())
+    }
+
+    pub(crate) fn driver_version(&self) -> Result<String, String> {
+        let mut buf = [0u8; NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
+        call!(
+            self,
+            "nvmlSystemGetDriverVersion",
+            unsafe extern "C" fn(*mut u8, u32) -> i32,
+            buf.as_mut_ptr(),
+            NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE as u32
+        );
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
     /// NVML's two-step list protocol: ask for the size, then for the values. Empty on any
