@@ -4,7 +4,9 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
@@ -65,22 +67,84 @@ pub fn apps_use_light_theme() -> Option<bool> {
     r.is_ok().then_some(data != 0)
 }
 
+const SHOW_EVENT: PCWSTR = w!("Local\\AstralGuardShowDashboard");
+
 /// One dashboard per session: true (after bringing the other one up) if a UI is already
 /// running. The mutex is held until this process exits.
 pub fn another_instance_running() -> bool {
     unsafe {
-        let Ok(h) = CreateMutexW(None, true, w!("Local\\AstralGuardUI")) else {
-            return false;
+        let running = match CreateMutexW(None, true, w!("Local\\AstralGuardUI")) {
+            Ok(h) => {
+                let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+                let _: HANDLE = h; // never closed: the OS releases it when the process ends
+                exists
+            }
+            // Access denied: it exists, created by the elevated dashboard.
+            Err(e) => e.code() == windows::Win32::Foundation::E_ACCESSDENIED,
         };
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        if running && !signal_show() {
             if let Ok(other) = FindWindowW(PCWSTR::null(), w!("AstralGuard")) {
                 show_window(other.0 as isize);
             }
-            return true;
         }
-        let _: HANDLE = h; // never closed: the OS releases it when the process ends
-        false
+        running
     }
+}
+
+/// Ask the running dashboard to show itself. Works from a non-elevated process (the Start
+/// menu shortcut), where window messages to the elevated dashboard are blocked.
+fn signal_show() -> bool {
+    unsafe {
+        match OpenEventW(EVENT_MODIFY_STATE, false, SHOW_EVENT) {
+            Ok(ev) => {
+                let ok = SetEvent(ev).is_ok();
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+                ok
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// The other half of signal_show: a thread that shows the window whenever the event fires.
+/// The event lets any interactive user signal it; that can only ever open the dashboard.
+pub fn listen_for_show(hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>, ctx: eframe::egui::Context) {
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    let ev = unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SYNCHRONIZE | EVENT_MODIFY_STATE for interactive users, all for admins and SYSTEM.
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:(A;;0x100002;;;IU)(A;;GA;;;BA)(A;;GA;;;SY)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: false.into(),
+        };
+        // The descriptor stays allocated for the life of the process; it is tiny.
+        match CreateEventW(Some(&sa), false, false, SHOW_EVENT) {
+            Ok(ev) => ev.0 as isize,
+            Err(_) => return,
+        }
+    };
+    let _ = std::thread::Builder::new().name("show-event".into()).spawn(move || loop {
+        let ev = HANDLE(ev as *mut core::ffi::c_void);
+        if unsafe { WaitForSingleObject(ev, INFINITE) }.0 != 0 {
+            return;
+        }
+        show_window(hwnd.load(std::sync::atomic::Ordering::Relaxed));
+        ctx.request_repaint();
+    });
 }
 
 /// Open a file or folder with its default program.
