@@ -36,7 +36,6 @@ rust/                     the whole program: one crate, one binary (astralguard)
   build.ps1               Windows GNU build helper
 .github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags)
 docs/screenshots/         README images, rendered with --screenshot
-tools/                    one-off diagnostics
 ```
 
 ## Building
