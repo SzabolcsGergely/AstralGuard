@@ -54,6 +54,7 @@ pub const ASTRAL_CARDS: &[(u32, &str, f64)] = &[
     (0x8A5A1043, "ROG Astral RTX 5090 BTF OC", 357.6),
     (0x8A3C1043, "ROG Astral RTX 5090 BTF OC", 357.6),
     (0x89DF1043, "ROG Astral RTX 5080 (non-OC)", 357.6),
+    (0x89FF1043, "ROG Astral RTX 5090", 357.6),
 ];
 /// Every air-cooled Astral shares this cooler.
 pub const DEFAULT_CARD_LENGTH_MM: f64 = 357.6;

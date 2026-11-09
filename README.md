@@ -77,6 +77,7 @@ is recognised by its PCI subsystem ID:
 | Card | Subsystem ID |
 |---|---|
 | ROG Astral RTX 5090 OC | `0x89E31043` |
+| ROG Astral RTX 5090 | `0x89FF1043` |
 | ROG Astral RTX 5090 OC White | `0x8A2E1043` |
 | ROG Astral RTX 5090 BTF OC | `0x8A5A1043`, `0x8A3C1043` |
 | ROG Astral RTX 5090D OC | `0x89EA1043` |
