@@ -45,18 +45,22 @@ jobs:
   deb:
     name: Debian package
     runs-on: ubuntu-latest
+    # Built on Debian 12 (glibc 2.36), so the package installs on Debian 12+ and
+    # Ubuntu 22.04+; a binary built on the newest runner would need the newest glibc.
+    container: debian:bookworm
     steps:
-      - uses: actions/checkout@v4
-      - name: System libraries
+      - name: Build tools and libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libgtk-3-dev \
-            libxdo-dev libayatana-appindicator3-dev libxkbcommon-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+            dpkg-dev pkg-config libssl-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          key: bookworm
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb
@@ -69,20 +73,40 @@ jobs:
         run: |
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
-      - name: Install test
-        run: |
-          # Install and remove without starting the service: no Astral card on a CI runner.
-          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
-          sudo chmod +x /usr/sbin/policy-rc.d
-          sudo apt-get install -y ./dist/*.deb
-          getent group astralguard
-          astralguard status || true
-          sudo apt-get remove -y astralguard
       - uses: actions/upload-artifact@v4
         with:
           name: package-deb
           path: dist/*.deb
           if-no-files-found: error
+
+  deb-test:
+    name: Install .deb on ${{ matrix.image }}
+    needs: deb
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:latest"]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-deb
+          path: dist
+      - name: Install, check, remove
+        run: |
+          # Without starting the service: there is no Astral card on a CI runner.
+          printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+          chmod +x /usr/sbin/policy-rc.d
+          apt-get update
+          apt-get install -y ./dist/*.deb
+          getent group astralguard
+          test -x /usr/bin/astralguard
+          test -f /lib/systemd/system/astralguard.service || test -f /usr/lib/systemd/system/astralguard.service
+          # Every shared library resolves (the binary needs no display to start up to here).
+          if ldd /usr/bin/astralguard | grep 'not found'; then exit 1; fi
+          astralguard status || true
+          apt-get remove -y astralguard
 
   arch:
     name: Arch Linux package

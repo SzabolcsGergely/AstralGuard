@@ -83,11 +83,11 @@ priority = "optional"
 # libayatana-appindicator3 is loaded at runtime by the tray, so dpkg-shlibdeps cannot see it.
 depends = "$auto, libayatana-appindicator3-1"
 recommends = "kmod"
+# The astralguard group is created in postinst (works on releases without systemd-sysusers).
 maintainer-scripts = "packaging/linux/debian/"
 systemd-units = { unit-name = "astralguard", unit-scripts = "packaging/linux/", enable = true, start = true }
 assets = [
     ["target/release/astralguard", "usr/bin/", "755"],
-    ["packaging/linux/sysusers.conf", "usr/lib/sysusers.d/astralguard.conf", "644"],
     ["packaging/linux/modules-load.conf", "usr/lib/modules-load.d/astralguard.conf", "644"],
     ["packaging/linux/astralguard-ui.desktop", "etc/xdg/autostart/astralguard-ui.desktop", "644"],
     ["../README.md", "usr/share/doc/astralguard/README.md", "644"],
