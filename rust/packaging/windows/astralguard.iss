@@ -1,4 +1,4 @@
-﻿; AstralGuard setup (Inno Setup 6). The release workflow builds it:
+; AstralGuard setup (Inno Setup 6). The release workflow builds it:
 ;   iscc /DAppVersion=2.0.0 /DSourceExe=<path to astralguard.exe> /DRepoRoot=<repo> /O<out> astralguard.iss
 ;
 ; Installs astralguard.exe to Program Files and, unless unticked, registers the logon task
@@ -37,6 +37,7 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\astralguard.exe
+SetupIconFile={#RepoRoot}\rust\assets\icon\astralguard.ico
 UninstallDisplayName=AstralGuard
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName=AstralGuard

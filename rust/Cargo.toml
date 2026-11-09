@@ -90,5 +90,7 @@ assets = [
     ["target/release/astralguard", "usr/bin/", "755"],
     ["packaging/linux/modules-load.conf", "usr/lib/modules-load.d/astralguard.conf", "644"],
     ["packaging/linux/astralguard-ui.desktop", "etc/xdg/autostart/astralguard-ui.desktop", "644"],
+    ["assets/icon/astralguard.svg", "usr/share/icons/hicolor/scalable/apps/astralguard.svg", "644"],
+    ["assets/icon/astralguard-256.png", "usr/share/icons/hicolor/256x256/apps/astralguard.png", "644"],
     ["../README.md", "usr/share/doc/astralguard/README.md", "644"],
 ]

@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- AstralGuard: a shield (the guard), a four-point star (Astral) and the 12V-2x6
+       connector face it watches. 32 px and below use astralguard-small.svg. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B2D91"/>
+      <stop offset="1" stop-color="#120B36"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A99BFF"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#7DD3FC" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7DD3FC" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="star" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#C7F0FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- shield -->
+  <path d="M128 14 C160 32 194 38 222 38 L222 118 C222 180 182 220 128 244 C74 220 34 180 34 118 L34 38 C62 38 96 32 128 14 Z"
+        fill="url(#sky)" stroke="url(#rim)" stroke-width="9" stroke-linejoin="round"/>
+
+  <!-- small background stars -->
+  <circle cx="72" cy="70" r="3" fill="#C4B5FD" opacity="0.8"/>
+  <circle cx="186" cy="62" r="2.5" fill="#C4B5FD" opacity="0.7"/>
+  <circle cx="190" cy="118" r="2" fill="#C4B5FD" opacity="0.6"/>
+  <circle cx="66" cy="124" r="2" fill="#C4B5FD" opacity="0.6"/>
+
+  <!-- the star -->
+  <circle cx="128" cy="86" r="50" fill="url(#glow)"/>
+  <path d="M128 42 C132 74 142 82 172 86 C142 90 132 98 128 130 C124 98 114 90 84 86 C114 82 124 74 128 42 Z"
+        fill="url(#star)"/>
+
+  <!-- 12V-2x6 connector face: housing and two rows of pins -->
+  <rect x="86" y="146" width="84" height="50" rx="9" fill="#0B0726" stroke="#8B7CF6" stroke-width="4" stroke-opacity="0.85"/>
+  <g fill="#34D399">
+    <rect x="97" y="155" width="16" height="13" rx="3.5"/>
+    <rect x="120" y="155" width="16" height="13" rx="3.5"/>
+    <rect x="143" y="155" width="16" height="13" rx="3.5"/>
+    <rect x="97" y="174" width="16" height="13" rx="3.5"/>
+    <rect x="120" y="174" width="16" height="13" rx="3.5"/>
+    <rect x="143" y="174" width="16" height="13" rx="3.5"/>
+  </g>
+</svg>

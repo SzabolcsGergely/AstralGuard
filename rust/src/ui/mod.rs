@@ -140,8 +140,45 @@ pub(crate) fn open_path(path: &str) {
 const DEFAULT_SIZE: Vec2 = Vec2::new(800.0, 820.0);
 const MIN_SIZE: Vec2 = Vec2::new(660.0, 560.0);
 
+/// The window (taskbar) icon: the app icon with a status dot in the corner, so the taskbar
+/// shows the state at a glance. Falls back to the plain dot if the PNG cannot be read.
 fn icon_data(status: Status) -> Arc<egui::IconData> {
-    Arc::new(egui::IconData { rgba: tray::dot_rgba(status.color(), 64), width: 64, height: 64 })
+    const SIZE: u32 = 64;
+    let Some(mut rgba) = app_icon_rgba(SIZE) else {
+        return Arc::new(egui::IconData { rgba: tray::dot_rgba(status.color(), SIZE), width: SIZE, height: SIZE });
+    };
+    // A dark ring, then the status colour, centred at (46, 46).
+    for (rgb, size) in [([11, 7, 38], 36), (status.color(), 30)] {
+        let dot = tray::dot_rgba(rgb, size);
+        let off = 46 - size / 2;
+        for y in 0..size {
+            for x in 0..size {
+                let s = ((y * size + x) * 4) as usize;
+                let d = (((y + off) * SIZE + x + off) * 4) as usize;
+                let a = dot[s + 3] as f32 / 255.0;
+                for c in 0..3 {
+                    rgba[d + c] = (dot[s + c] as f32 * a + rgba[d + c] as f32 * (1.0 - a)).round() as u8;
+                }
+                rgba[d + 3] = rgba[d + 3].max(dot[s + 3]);
+            }
+        }
+    }
+    Arc::new(egui::IconData { rgba, width: SIZE, height: SIZE })
+}
+
+/// assets/icon/astralguard-64.png as RGBA8.
+fn app_icon_rgba(size: u32) -> Option<Vec<u8>> {
+    const PNG: &[u8] = include_bytes!("../../assets/icon/astralguard-64.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let ok = info.width == size
+        && info.height == size
+        && info.color_type == png::ColorType::Rgba
+        && info.bit_depth == png::BitDepth::Eight;
+    ok.then(|| buf[..info.buffer_size()].to_vec())
 }
 
 pub fn run(args: &[String]) -> i32 {

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- AstralGuard at 32 px and below: shield and star only, heavier strokes. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B2D91"/>
+      <stop offset="1" stop-color="#120B36"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A99BFF"/>
+      <stop offset="1" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <path d="M128 14 C160 32 194 38 222 38 L222 118 C222 180 182 220 128 244 C74 220 34 180 34 118 L34 38 C62 38 96 32 128 14 Z"
+        fill="url(#sky)" stroke="url(#rim)" stroke-width="18" stroke-linejoin="round"/>
+  <path d="M128 50 C134 96 146 108 192 116 C146 124 134 136 128 182 C122 136 110 124 64 116 C110 108 122 96 128 50 Z"
+        fill="#FFFFFF"/>
+</svg>

@@ -44,6 +44,8 @@ package() {
     install -Dm644 "$lin/sysusers.conf" "$pkgdir/usr/lib/sysusers.d/astralguard.conf"
     install -Dm644 "$lin/modules-load.conf" "$pkgdir/usr/lib/modules-load.d/astralguard.conf"
     install -Dm644 "$lin/astralguard-ui.desktop" "$pkgdir/etc/xdg/autostart/astralguard-ui.desktop"
+    install -Dm644 rust/assets/icon/astralguard.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/astralguard.svg"
+    install -Dm644 rust/assets/icon/astralguard-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/astralguard.png"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
