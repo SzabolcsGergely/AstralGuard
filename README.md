@@ -271,7 +271,11 @@ The service and the UI talk over a local socket: one JSON request, one JSON resp
 Windows it is a named pipe that only elevated processes can write to, so an ordinary
 program cannot pause the guard. On Linux it is `/run/astralguard/astralguard.sock`, open
 to root and the `astralguard` group. On Linux, systemd does the watchdog's job
-(`Restart=on-failure`) and the UI starts from the desktop session's autostart.
+(`Restart=on-failure`) and the UI starts from the desktop session's autostart. There
+the tray is its own process and the dashboard window another one (`astralguard ui
+--window`), started from the tray and gone when it is closed: Wayland gives an app no way
+to hide its window. The tray is a StatusNotifierItem: left click opens the dashboard,
+right click the menu.
 
 **Read-only hardware access.** The sensor code only ever sets a register pointer and reads
 from the monitor chip at I2C address `0x2B`; it never writes a data register. NVAPI's I2C

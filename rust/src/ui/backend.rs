@@ -89,6 +89,11 @@ pub struct Link {
     /// The IMU view wants 10 Hz.
     pub fast: AtomicBool,
     pub quit: AtomicBool,
+    /// Raise the service's notices on the desktop (Linux). Off in a dashboard window
+    /// process: the tray process already does, and twice would be noise.
+    pub notices: AtomicBool,
+    /// The user stopped the guard from this window (Exit).
+    pub guard_stopped: AtomicBool,
     repaint: Mutex<Option<egui::Context>>,
     jobs: Mutex<Option<Sender<Job>>>,
 }
@@ -100,6 +105,8 @@ impl Link {
             window_visible: AtomicBool::new(true),
             fast: AtomicBool::new(false),
             quit: AtomicBool::new(false),
+            notices: AtomicBool::new(true),
+            guard_stopped: AtomicBool::new(false),
             repaint: Mutex::new(None),
             jobs: Mutex::new(None),
         })
@@ -202,7 +209,9 @@ fn worker(link: Arc<Link>, mut backend: Box<dyn Backend>, rx: Receiver<Job>) {
         link.repaint();
 
         #[cfg(not(windows))]
-        notices.poll(&mut *backend);
+        if link.notices.load(Ordering::Relaxed) {
+            notices.poll(&mut *backend);
+        }
     }
 }
 
