@@ -25,6 +25,14 @@ macro_rules! num {
 }
 
 // indexes into NUMS, grouped by card
+/// Why the automatic sensor scan exists and when it runs; shown in the scan popup and as
+/// the Settings checkbox's tooltip.
+pub const AUTO_SCAN_WHY: &str = "The card's pin monitor sits on one of its I2C buses. A driver \
+update, a kernel change or a different card can move it to another bus; the pins then stop \
+reading and the connector is not protected. With this on, the guard scans by itself when that \
+happens. It does not scan at every start: only when the pins stop giving valid readings, and \
+only once each time.";
+
 const OVERCURRENT: [usize; 5] = [0, 1, 2, 3, 4];
 const IMBALANCE: [usize; 4] = [5, 6, 7, 8];
 const SAG: [usize; 4] = [9, 10, 11, 12];
@@ -76,6 +84,7 @@ pub struct SettingsView {
     imbalance_enabled: bool,
     response_mode: ResponseMode,
     imbalance_response: ImbalanceResponse,
+    sensor_auto_scan: bool,
     base: Option<Settings>,
     msg: Option<(String, MsgKind, Instant)>,
     busy: Option<&'static str>,
@@ -92,6 +101,7 @@ impl Default for SettingsView {
             imbalance_enabled: true,
             response_mode: ResponseMode::Tiered,
             imbalance_response: ImbalanceResponse::Warn,
+            sensor_auto_scan: false,
             base: None,
             msg: None,
             busy: None,
@@ -114,6 +124,7 @@ impl SettingsView {
         self.imbalance_enabled = s.imbalance_enabled;
         self.response_mode = s.response_mode;
         self.imbalance_response = s.imbalance_response;
+        self.sensor_auto_scan = s.sensor_auto_scan;
         self.base = Some(s.clone());
         self.reload = false;
     }
@@ -141,6 +152,9 @@ impl SettingsView {
         }
         if self.imbalance_response != base.imbalance_response {
             p.imbalance_response = Some(self.imbalance_response);
+        }
+        if self.sensor_auto_scan != base.sensor_auto_scan {
+            p.sensor_auto_scan = Some(self.sensor_auto_scan);
         }
         (p, errors)
     }
@@ -434,6 +448,23 @@ impl SettingsView {
                     });
                     ui.label(RichText::new("Applies at once · needs admin").color(t.muted()).size(12.0));
                     ui.add_space(6.0);
+                    // Linux only: on Windows the driver addresses the pin monitor directly.
+                    if cfg!(target_os = "linux") {
+                        let ch = self.sensor_auto_scan != base.sensor_auto_scan;
+                        ui.checkbox(
+                            &mut self.sensor_auto_scan,
+                            RichText::new("Scan for the pin sensor automatically").color(if ch {
+                                t.accent
+                            } else {
+                                t.text
+                            }),
+                        )
+                        .on_hover_text(AUTO_SCAN_WHY);
+                        ui.label(
+                            RichText::new("Only when it stops reading, once each time").color(t.muted()).size(12.0),
+                        );
+                        ui.add_space(6.0);
+                    }
                     if ui.checkbox(&mut prefs.check_updates, "Check for updates daily").changed() {
                         prefs_changed = true;
                     }

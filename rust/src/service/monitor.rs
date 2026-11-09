@@ -188,6 +188,9 @@ pub fn run(shared: &Arc<Shared>) -> bool {
     let mut last_sample: Option<f64> = None;
     let mut missing_notified = false;
     let mut missing_logged = false;
+    // The automatic sensor scan runs at most once per time the sensor cannot be read;
+    // a successful connection re-arms it.
+    let mut auto_scanned = false;
     let mut connected_notified = false;
     let mut paused_since: Option<f64> = None;
     let mut last_pause_reminder = 0.0;
@@ -240,8 +243,21 @@ pub fn run(shared: &Arc<Shared>) -> bool {
             if !missing_logged {
                 logger::info("Waiting for the card's pin sensors...");
             }
-            match PinSensor::connect() {
-                Ok(new) => {
+            // A sensor scan holds the bus lock while it talks to the adapters: no connect then
+            // (try_lock: the loop never waits for a scan). Held until the card is published, so
+            // a scan that starts right after sees a connected sensor and refuses.
+            let bus = shared.bus.try_lock();
+            let attempt = match &bus {
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => Some(PinSensor::connect()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            match attempt {
+                None => {
+                    drop(bus);
+                    wait_or_stop(shared, 0.5);
+                    continue;
+                }
+                Some(Ok(new)) => {
                     let msg = format!("Connected: {}", new.description());
                     logger::info(&msg);
                     shared.event(EventKind::Info, 1002, &msg);
@@ -254,19 +270,42 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                     shared.update(|l| {
                         l.card = model;
                         l.card_subsystem = Some(sub);
+                        l.sensor_scan_suggested = false;
+                        l.sensor_problem.clear();
                     });
                     sensor = Some(new);
                     missing_notified = false;
                     missing_logged = false;
+                    auto_scanned = false;
+                    drop(bus);
                     // A new connection starts its timers from scratch.
                     t1 = Tier1::default();
                     last_sample = None;
                 }
-                Err(detail) => {
+                Some(Err(detail)) => {
+                    // Released before an automatic scan, which takes it.
+                    drop(bus);
+                    // A card that is there but unreadable is worth a scan; no card is not.
+                    let scan = crate::sensor::scan_possible();
+                    shared.update(|l| {
+                        l.sensor_scan_suggested = scan;
+                        l.sensor_problem = detail.clone();
+                    });
+                    if scan && !auto_scanned && shared.settings().sensor_auto_scan {
+                        auto_scanned = true;
+                        if shared.scan_sensor("automatically (the setting is on)").found {
+                            shared.reconnect_now.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
                     if !missing_notified {
                         shared.notify(
                             APP_NAME,
-                            "Cannot read the card's pin sensors. Only ASUS ROG Astral cards and derivatives are supported.",
+                            if scan {
+                                "The card was found, but its pin sensors give no valid readings. Open the dashboard and press Scan."
+                            } else {
+                                "Cannot read the card's pin sensors. Only ASUS ROG Astral cards and derivatives are supported."
+                            },
                         );
                         missing_notified = true;
                         connected_notified = false;
@@ -363,9 +402,13 @@ pub fn run(shared: &Arc<Shared>) -> bool {
     shutting_down
 }
 
+/// Sleep up to `seconds`; returns early to stop, or when a sensor scan saved an adapter.
 fn wait_or_stop(shared: &Shared, seconds: f64) {
     let end = crate::now() + seconds;
     while crate::now() < end && !shared.stop.load(Ordering::Relaxed) {
+        if shared.reconnect_now.swap(false, Ordering::Relaxed) {
+            return;
+        }
         sleep(0.1);
     }
 }

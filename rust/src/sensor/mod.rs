@@ -15,6 +15,8 @@
 //!   ~4096 counts per g, then a status byte. Card horizontal: X=-35 Y=-33 Z=+4090.
 
 #[cfg(target_os = "linux")]
+pub mod detect;
+#[cfg(target_os = "linux")]
 mod i2cdev;
 #[cfg(windows)]
 mod nvapi;
@@ -32,6 +34,13 @@ pub const GSENSOR_COUNTS_PER_G: f64 = 4096.0;
 /// currents (10-20 A) pass untouched; only impossible values are rejected.
 pub const PLAUSIBLE_MAX_AMPS: f64 = 30.0;
 pub const PLAUSIBLE_MAX_VOLTS: f64 = 16.0;
+/// A running card is fed from the 12 V rail, so at least one pin must show it. A block
+/// where every pin is below this is not a measurement: an all-zero answer would otherwise
+/// read as 0 A, i.e. "Safe", while nothing is being watched. Seen 2026-11-09 on a ROG
+/// Astral RTX 5090 OC under Linux (all pins 0.00-0.06 V). Far below ATX's 11.4 V floor so
+/// a sagging rail under load never trips it. Judged on the whole block, never per pin: one
+/// pin reading low can be a real fault and must reach the threshold engine.
+pub const PLAUSIBLE_MIN_RAIL_VOLTS: f64 = 6.0;
 /// At rest the accelerometer sees 1 g. Far off is a bad read or a knock mid-sample.
 pub const PLAUSIBLE_MIN_G: f64 = 0.7;
 pub const PLAUSIBLE_MAX_G: f64 = 1.3;
@@ -129,6 +138,11 @@ pub fn is_plausible(volts: f64, amps: f64) -> bool {
     (0.0..=PLAUSIBLE_MAX_VOLTS).contains(&volts) && (0.0..=PLAUSIBLE_MAX_AMPS).contains(&amps)
 }
 
+/// False when no pin shows the 12 V rail (see PLAUSIBLE_MIN_RAIL_VOLTS).
+pub fn rail_is_live(pins: &[(u8, f64, f64)]) -> bool {
+    pins.iter().any(|(_, v, _)| *v >= PLAUSIBLE_MIN_RAIL_VOLTS)
+}
+
 /// 7 raw bytes from 0x70 -> (x, y, z) in g.
 pub fn parse_gsensor_block(raw: &[u8; GSENSOR_DATA_SIZE]) -> [f64; 3] {
     let s16be = |o: usize| i16::from_be_bytes([raw[o], raw[o + 1]]) as f64 / GSENSOR_COUNTS_PER_G;
@@ -186,6 +200,12 @@ impl PinSensor {
         if let Some((_, v, a)) = parsed.iter().find(|(_, v, a)| !is_plausible(*v, *a)) {
             return Err(format!("implausible sample (V={v:.3} A={a:.3})"));
         }
+        if !rail_is_live(&parsed) {
+            let top = parsed.iter().map(|(_, v, _)| *v).fold(0.0, f64::max);
+            return Err(format!(
+                "implausible sample: no pin shows the 12 V rail (highest {top:.3} V); wrong I2C port or chip not reporting"
+            ));
+        }
         Ok(parsed.into_iter().map(|(pin, volts, amps)| Pin { name: format!("Pin{pin}"), amps, volts }).collect())
     }
 
@@ -199,6 +219,28 @@ impl PinSensor {
             return Err(format!("implausible g-sensor sample ({:.3}, {:.3}, {:.3})", v[0], v[1], v[2]));
         }
         Ok(v)
+    }
+}
+
+/// Is a supported card on the system, whether or not its pin monitor can be read? Linux
+/// only (sysfs, no bus traffic): there a scan can find the monitor. On Windows NVAPI
+/// addresses the chip's port directly, so there is nothing to scan.
+pub fn scan_possible() -> bool {
+    #[cfg(target_os = "linux")]
+    return i2cdev::adapters().map(|a| !a.is_empty()).unwrap_or(false);
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// The sensor scan (see detect.rs); saves what it finds.
+pub fn scan() -> crate::protocol::ScanReport {
+    #[cfg(target_os = "linux")]
+    return detect::scan(true);
+    #[cfg(not(target_os = "linux"))]
+    crate::protocol::ScanReport {
+        found: false,
+        message: "The sensor scan is for Linux; on Windows the driver addresses the pin monitor directly.".into(),
+        lines: Vec::new(),
     }
 }
 
@@ -241,6 +283,24 @@ mod tests {
         assert!(!is_plausible(65.535, 1.0));
         assert!(!is_plausible(12.0, 65.535));
         assert!(is_plausible(12.0, 22.0));
+    }
+
+    #[test]
+    fn dead_rail_is_rejected_one_low_pin_is_not() {
+        // What the probe read on Linux: all pins ~0 V.
+        let dead: Vec<_> = (1..=6u8).map(|p| (p, if p == 1 { 0.056 } else { 0.0 }, 0.0)).collect();
+        assert!(!rail_is_live(&dead));
+        assert!(!rail_is_live(&parse_pin_block(&[0u8; 24])));
+        // Healthy idle card.
+        let idle: Vec<_> = (1..=6u8).map(|p| (p, 12.05, 0.3)).collect();
+        assert!(rail_is_live(&idle));
+        // One pin lost contact: it must still pass, so the others' overload is seen.
+        let mut fault = idle.clone();
+        fault[2] = (3, 0.0, 0.0);
+        assert!(rail_is_live(&fault));
+        // A rail sagging under load is still a rail.
+        let sag: Vec<_> = (1..=6u8).map(|p| (p, 11.2, 9.0)).collect();
+        assert!(rail_is_live(&sag));
     }
 
     #[test]

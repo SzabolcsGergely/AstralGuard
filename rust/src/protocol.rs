@@ -146,6 +146,9 @@ pub struct Settings {
     pub imbalance_delta_amps: f64,
     pub imbalance_sustained_seconds: f64,
     pub imbalance_response: ImbalanceResponse,
+    /// Linux: scan for the pin monitor by itself when the card is there but unreadable,
+    /// once per time that happens (see sensor/detect.rs). Off: the dashboard asks.
+    pub sensor_auto_scan: bool,
 }
 
 impl Default for Settings {
@@ -176,6 +179,9 @@ impl Default for Settings {
             imbalance_delta_amps: 4.0,
             imbalance_sustained_seconds: 5.0,
             imbalance_response: ImbalanceResponse::Warn,
+            // Off: a scan touches I2C buses other than the known one, so the first one is
+            // the user's decision; the scan popup offers to make it automatic.
+            sensor_auto_scan: false,
         }
     }
 }
@@ -200,6 +206,7 @@ pub struct SettingsPatch {
     pub imbalance_delta_amps: Option<f64>,
     pub imbalance_sustained_seconds: Option<f64>,
     pub imbalance_response: Option<ImbalanceResponse>,
+    pub sensor_auto_scan: Option<bool>,
 }
 
 #[cfg_attr(not(feature = "ui"), allow(dead_code))]
@@ -273,6 +280,22 @@ pub struct Live {
     /// Running under the watchdog: a crash is restarted.
     pub watchdog: bool,
     pub log_path: String,
+    /// A supported card is present but its pin monitor gives no valid readings: the
+    /// dashboard offers a sensor scan (Linux; see sensor/detect.rs).
+    pub sensor_scan_suggested: bool,
+    /// Why the sensor cannot be read, "" while it can.
+    pub sensor_problem: String,
+}
+
+/// What a sensor scan found, one line per I2C adapter.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ScanReport {
+    /// An adapter passed and was saved; the service reconnects to it.
+    pub found: bool,
+    /// One sentence for the user.
+    pub message: String,
+    /// Per adapter: "/dev/i2c-9 NVIDIA i2c adapter 1 at 1:00.0: IT8915: ...".
+    pub lines: Vec<String>,
 }
 
 /// Something the user should be told about (desktop notification).
@@ -324,6 +347,9 @@ pub enum Request {
     Events {
         since: u64,
     },
+    /// Find the card's pin monitor on its I2C adapters and save the one that passes.
+    /// Refused while the sensor is reading fine, so it can never interrupt protection.
+    ScanSensor,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -339,6 +365,7 @@ pub enum Response {
     Names { names: Vec<String> },
     Text { text: String },
     Events { notices: Vec<Notice> },
+    Scan { report: ScanReport },
     Error { message: String },
 }
 

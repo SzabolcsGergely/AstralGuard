@@ -198,6 +198,7 @@ pub fn from_ini(ini: &Ini) -> (Settings, Option<SagBaseline>) {
     s.imbalance_delta_amps = positive("imbalance_delta_amps", d.imbalance_delta_amps);
     s.imbalance_sustained_seconds = positive("imbalance_sustained_seconds", d.imbalance_sustained_seconds);
     s.imbalance_enabled = ini.boolean("imbalance_enabled").unwrap_or(d.imbalance_enabled);
+    s.sensor_auto_scan = ini.boolean("sensor_auto_scan").unwrap_or(d.sensor_auto_scan);
     s.imbalance_response =
         ini.get(S, "imbalance_response").and_then(ImbalanceResponse::parse).unwrap_or(d.imbalance_response);
 
@@ -213,6 +214,33 @@ fn baseline_from_ini(ini: &Ini) -> Option<SagBaseline> {
     }
     let sub = u32::from_str_radix(sub.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
     Some(SagBaseline { vector: [parts[0], parts[1], parts[2]], subsystem: sub })
+}
+
+/// The Linux I2C adapter `astralguard probe --detect` proved carries the IT8915, and the
+/// card it was proved on. Written only by detection, never by the dashboard.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct I2cChoice {
+    /// The driver's adapter name, e.g. "NVIDIA i2c adapter 3 at 1:00.0"
+    pub adapter: String,
+    pub subsystem: u32,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn load_i2c_choice(path: &Path) -> Option<I2cChoice> {
+    let ini = Ini::read(path);
+    let adapter = ini.get(S, "i2c_adapter")?.trim().to_string();
+    let sub = ini.get(S, "i2c_adapter_subsystem")?.trim();
+    let subsystem = u32::from_str_radix(sub.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    (!adapter.is_empty()).then_some(I2cChoice { adapter, subsystem })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn save_i2c_choice(path: &Path, c: &I2cChoice) -> std::io::Result<()> {
+    let mut ini = Ini::read(path);
+    ini.set(S, "i2c_adapter", c.adapter.clone());
+    ini.set(S, "i2c_adapter_subsystem", format!("0x{:08X}", c.subsystem));
+    ini.write(path)
 }
 
 /// Python's str(float): "9.5", "15.0".
@@ -241,6 +269,7 @@ pub fn save_settings(path: &Path, s: &Settings, keys: &[&str]) -> std::io::Resul
             "sag_sustained_seconds" => fmt_float(s.sag_sustained_seconds),
             "sag_card_length_mm" => fmt_float(s.sag_card_length_mm),
             "imbalance_enabled" => fmt_bool(s.imbalance_enabled),
+            "sensor_auto_scan" => fmt_bool(s.sensor_auto_scan),
             "imbalance_min_amps" => fmt_float(s.imbalance_min_amps),
             "imbalance_percent" => fmt_float(s.imbalance_percent),
             "imbalance_delta_amps" => fmt_float(s.imbalance_delta_amps),
@@ -283,7 +312,8 @@ pub fn patch_keys(p: &SettingsPatch) -> Vec<&'static str> {
         imbalance_percent,
         imbalance_delta_amps,
         imbalance_sustained_seconds,
-        imbalance_response
+        imbalance_response,
+        sensor_auto_scan
     );
     keys
 }
@@ -311,7 +341,8 @@ pub fn merged(s: &Settings, p: &SettingsPatch) -> Settings {
         imbalance_percent,
         imbalance_delta_amps,
         imbalance_sustained_seconds,
-        imbalance_response
+        imbalance_response,
+        sensor_auto_scan
     );
     m
 }
@@ -428,6 +459,33 @@ mod tests {
         let (s, b) = from_ini(&Ini::parse("[Settings]\nthreshold_amps = -1\n"));
         assert_eq!(s, Settings::default());
         assert!(b.is_none());
+    }
+
+    #[test]
+    fn i2c_choice_round_trips_and_keeps_other_keys() {
+        let dir = std::env::temp_dir().join(format!("ag-cfg-i2c-{}", std::process::id()));
+        let path = dir.join("config.ini");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "[Settings]\nfuture_key = x\nthreshold_amps = 9.0\n").unwrap();
+        assert_eq!(load_i2c_choice(&path), None);
+        let c = I2cChoice { adapter: "NVIDIA i2c adapter 3 at 1:00.0".into(), subsystem: 0x89E31043 };
+        save_i2c_choice(&path, &c).unwrap();
+        assert_eq!(load_i2c_choice(&path), Some(c));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("future_key = x") && text.contains("threshold_amps = 9.0"));
+        assert_eq!(load(&path).0.threshold_amps, 9.0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sensor_auto_scan_is_off_unless_set() {
+        assert!(!from_ini(&Ini::parse("[Settings]\n")).0.sensor_auto_scan);
+        assert!(from_ini(&Ini::parse("[Settings]\nsensor_auto_scan = True\n")).0.sensor_auto_scan);
+        assert!(!from_ini(&Ini::parse("[Settings]\nsensor_auto_scan = maybe\n")).0.sensor_auto_scan);
+        let on = Settings { sensor_auto_scan: true, ..Default::default() };
+        let p = SettingsPatch { sensor_auto_scan: Some(true), ..Default::default() };
+        assert_eq!(patch_keys(&p), vec!["sensor_auto_scan"]);
+        assert_eq!(merged(&Settings::default(), &p), on);
     }
 
     #[test]

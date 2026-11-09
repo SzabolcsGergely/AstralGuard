@@ -145,10 +145,18 @@ Or build it yourself with [`rust/packaging/linux/arch/PKGBUILD`](rust/packaging/
 (`makepkg -si`).
 
 > **Linux status: experimental.** The pins are read through the NVIDIA driver's I2C
-> adapters (`/dev/i2c-*`). Which adapter carries the monitor chip has not been verified on
-> Linux hardware yet. Run `sudo astralguard probe` once and check that it prints sensible
-> pin currents before relying on it. `ASTRALGUARD_I2C_BUS=<n>` in a systemd drop-in selects
-> an adapter explicitly.
+> adapters (`/dev/i2c-*`), with SMBus block reads. Verified on a ROG Astral RTX 5090 OC
+> (driver 620.70): adapter 1 carries the monitor chip. Run `sudo astralguard probe` once
+> and check that it prints about 12 V and sensible currents on every pin.
+>
+> If the card is found but its pins don't read, the dashboard shows **Pin sensor not
+> reading** with a **Scan** button (or run `sudo astralguard probe --detect`). The scan
+> tries the card's own I2C adapters, keeps the one that shows 12 V on every pin, about
+> 1 g on the accelerometer and a total that matches NVML's board power, and saves it
+> (`i2c_adapter` in `config.ini`). Tick **Scan automatically next time** in the scan popup
+> (or Settings → System) and the guard does this by itself the next time the pins stop
+> reading, for example after a driver update. `ASTRALGUARD_I2C_BUS=<n>` in a systemd
+> drop-in still selects an adapter explicitly.
 
 ### Updating and uninstalling
 
@@ -316,6 +324,7 @@ hand, stop the guard first.
 | `sag_warn_degrees` / `sag_serious_degrees` | `1` / `2` | Tilt from the calibrated position |
 | `sag_sustained_seconds` | `60` | How long the tilt must hold |
 | `sag_card_length_mm` | `0` | For the mm figure; `0` = the detected card's spec |
+| `sensor_auto_scan` | `false` | Linux: scan for the pin monitor by itself when the card is found but its pins stop reading, once each time (not at every start) |
 
 The sag baseline (`sag_baseline`, `sag_baseline_subsystem`) is written by **Calibrate** and
 re-taken automatically when a different card is installed.
@@ -359,6 +368,7 @@ source *AstralGuard*):
 | `astralguard ui [--show]` | Tray and dashboard alone |
 | `astralguard ui --demo` | Dashboard with a simulated card: no hardware, no service |
 | `astralguard probe` | Read the card a few times and print pins, volts and tilt. Read-only, safe next to a running guard. |
+| `astralguard probe --detect [--dry-run]` | Linux: find the I2C adapter that carries the pin monitor and save it (what the dashboard's **Scan** does) |
 | `astralguard status [--exit]` | Ask the running service for its state, or stop it (elevated / root) |
 | `astralguard register [--all-users]` / `unregister` | Windows, elevated: create / remove the logon task (for this user, or for everyone who signs in) and the Event Log source. The installer uses these. |
 
@@ -367,6 +377,8 @@ source *AstralGuard*):
 - **Tray says *Unknown (waiting for pin sensors)***: the card could not be read. Check that
   it is a supported Astral card and the NVIDIA driver is loaded; the log says why.
   `astralguard probe` shows exactly what the chip answers.
+- **Banner says *Pin sensor not reading***: the card is there but its pin monitor gives
+  no valid data (Linux). Press **Scan**; the result lists what each I2C adapter answered.
 - **Response shows *GPU limit unavailable* / *shutdown-only***: the guard is not running
   elevated (Windows) or as root (Linux), so it can only shut down. Start it through the
   logon task (Start menu) or the systemd unit.
