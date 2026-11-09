@@ -212,6 +212,10 @@ pub fn run(args: &[String]) -> i32 {
             }
             link2.set_ctx(ctx);
             let hwnd = Arc::new(AtomicIsize::new(window_handle(cc)));
+            #[cfg(windows)]
+            if !shot && !opts.demo {
+                win::listen_for_show(hwnd.clone(), ctx.clone());
+            }
             backend::start(link2.clone(), backend);
             let actions: tray::Actions = Arc::new(Mutex::new(Vec::new()));
             if !shot {

@@ -218,9 +218,16 @@ pub fn guard_running() -> bool {
                 let _ = CloseHandle(h);
                 true
             }
-            Err(_) => false,
+            // Created by an elevated guard: it exists, this process may just not open it.
+            Err(e) => e.code() == windows::Win32::Foundation::E_ACCESSDENIED,
         }
     }
+}
+
+/// Run the logon task now: starts the guard elevated without a UAC prompt. False when
+/// there is no enabled task.
+pub fn start_task() -> bool {
+    autostart() == Some(true) && schtasks(&["/run", "/tn", TASK_NAME])
 }
 
 fn schtasks(args: &[&str]) -> bool {

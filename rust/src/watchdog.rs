@@ -78,6 +78,13 @@ pub fn run(args: &[String]) -> i32 {
         }
         return 0;
     }
+    // Started without elevation (the Start menu shortcut) while the guard is not running:
+    // start it through the logon task, which runs it elevated, as at sign-in.
+    #[cfg(windows)]
+    if !crate::platform::is_elevated() && crate::platform::start_task() {
+        logger::info("Not elevated: started the guard through its logon task instead.");
+        return 0;
+    }
     let job = job::create();
     logger::info(format!(
         "Watchdog started (pid {}); supervising the service{}.",
