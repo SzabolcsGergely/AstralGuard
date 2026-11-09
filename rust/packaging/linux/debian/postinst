@@ -3,7 +3,7 @@ set -e
 
 if [ "$1" = "configure" ]; then
     # The dashboard talks to the root service through a socket owned by this group.
-    getent group astralguard >/dev/null || addgroup --system astralguard >/dev/null
+    getent group astralguard >/dev/null || groupadd --system astralguard
     # Installed with sudo: let that user use the dashboard (applies at the next login).
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ] && id "$SUDO_USER" >/dev/null 2>&1; then
         usermod -aG astralguard "$SUDO_USER" || true

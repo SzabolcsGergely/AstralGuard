@@ -262,7 +262,7 @@ Download the package for your system from the
 | System | File |
 |---|---|
 | Windows 10/11 (x64) | `AstralGuard-<version>-setup.exe` |
-| Debian, Ubuntu and derivatives | `astralguard_<version>-1_amd64.deb` |
+| Debian 12+, Ubuntu 22.04+ and derivatives | `astralguard_<version>-1_amd64.deb` |
 | Arch Linux and derivatives | `astralguard-<version>-1-x86_64.pkg.tar.zst` |
 
 `SHA256SUMS.txt` on the same page lists every file's checksum.
