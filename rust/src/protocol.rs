@@ -149,6 +149,21 @@ pub struct Settings {
     /// Linux: scan for the pin monitor by itself when the card is there but unreadable,
     /// once per time that happens (see sensor/detect.rs). Off: the dashboard asks.
     pub sensor_auto_scan: bool,
+    // Overclock (see the Overclock tab). Each part is applied only when its box is ticked;
+    // all off by default so a fresh install never touches the GPU's clocks or voltage.
+    pub oc_uv_enabled: bool,
+    /// Voltage/frequency curve undervolt: the points from `from` to `to` mV are pinned to
+    /// `target` MHz.
+    pub oc_uv_from_mv: f64,
+    pub oc_uv_to_mv: f64,
+    pub oc_uv_target_mhz: f64,
+    pub oc_power_enabled: bool,
+    pub oc_power_w: f64,
+    pub oc_mem_enabled: bool,
+    /// Afterburner units (twice the NVML offset's effective-clock figure).
+    pub oc_mem_offset_mhz: f64,
+    /// Wait after the service starts before applying, so the driver has settled.
+    pub oc_apply_delay_seconds: f64,
 }
 
 impl Default for Settings {
@@ -182,6 +197,16 @@ impl Default for Settings {
             // Off: a scan touches I2C buses other than the known one, so the first one is
             // the user's decision; the scan popup offers to make it automatic.
             sensor_auto_scan: false,
+            // Overclock: off until the user ticks it; values are the owner's tuned profile.
+            oc_uv_enabled: false,
+            oc_uv_from_mv: 820.0,
+            oc_uv_to_mv: 895.0,
+            oc_uv_target_mhz: 2827.0,
+            oc_power_enabled: false,
+            oc_power_w: 520.0,
+            oc_mem_enabled: false,
+            oc_mem_offset_mhz: 2000.0,
+            oc_apply_delay_seconds: 30.0,
         }
     }
 }
@@ -207,6 +232,15 @@ pub struct SettingsPatch {
     pub imbalance_sustained_seconds: Option<f64>,
     pub imbalance_response: Option<ImbalanceResponse>,
     pub sensor_auto_scan: Option<bool>,
+    pub oc_uv_enabled: Option<bool>,
+    pub oc_uv_from_mv: Option<f64>,
+    pub oc_uv_to_mv: Option<f64>,
+    pub oc_uv_target_mhz: Option<f64>,
+    pub oc_power_enabled: Option<bool>,
+    pub oc_power_w: Option<f64>,
+    pub oc_mem_enabled: Option<bool>,
+    pub oc_mem_offset_mhz: Option<f64>,
+    pub oc_apply_delay_seconds: Option<f64>,
 }
 
 #[cfg_attr(not(feature = "ui"), allow(dead_code))]
@@ -367,6 +401,55 @@ pub enum Response {
     Events { notices: Vec<Notice> },
     Scan { report: ScanReport },
     Error { message: String },
+}
+
+/// The outcome of one overclock setting in an apply, a restore or a re-apply after release.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct OcResult {
+    /// "undervolt" | "power" | "memory"
+    pub setting: String,
+    pub ok: bool,
+    /// One sentence for the user: what was written, or why not.
+    pub message: String,
+}
+
+/// What an apply did. Settings that are not managed and have nothing to restore get no entry.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct OcReport {
+    pub results: Vec<OcResult>,
+    /// Nothing was written because the guard is limiting the GPU; apply again after release.
+    pub deferred: bool,
+}
+
+/// The overclock state as read from the driver, for the Overclock tab. Every value is
+/// `None` when its read failed; the tab shows the rest.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct OcStatus {
+    pub available: bool,
+    /// Why the GPU cannot be reached, "" while it can.
+    pub reason: String,
+    /// Power limit in effect, W.
+    pub power_w: Option<u32>,
+    pub power_range_w: Option<(u32, u32)>,
+    /// Memory offset in effect, Afterburner units.
+    pub mem_ab: Option<i32>,
+    pub mem_range_ab: Option<(i32, i32)>,
+    /// The offset the configured From/To/Target gives on this card's curve (None if it is refused).
+    pub uv_offset_mhz: Option<i32>,
+    /// NVML's graphics clock offset; non-zero means another tool set one and the undervolt is refused.
+    pub foreign_core_offset_mhz: i32,
+    /// Some(true) once the curve write check passed on this driver, Some(false) if it failed,
+    /// None while it has not run on this driver.
+    pub curve_compatible: Option<bool>,
+    /// Core points as (mV, stock MHz).
+    pub stock_curve: Vec<(f32, f32)>,
+    /// Core points as (mV, effective MHz).
+    pub current_curve: Vec<(f32, f32)>,
+    pub live_mv: Option<f32>,
+    /// The current curve's clock at the live voltage (where the card sits on the graph).
+    pub live_mhz: Option<f32>,
+    /// Settings AstralGuard applied and will restore on untick: "undervolt", "power", "memory".
+    pub managed: Vec<String>,
 }
 
 /// Local socket name: a named pipe on Windows, a socket file on Linux.
