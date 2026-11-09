@@ -99,8 +99,10 @@ pub struct Api {
     query: QueryInterface,
 }
 
-/// An NVAPI physical GPU handle: an opaque token from EnumPhysicalGPUs, valid for the life
-/// of the process (NVAPI is never unloaded). Only dereferenced by the driver.
+/// An NVAPI physical GPU handle: an opaque token from EnumPhysicalGPUs. Only dereferenced by
+/// the driver. It may go stale after a re-Initialize (`with_reinit`, on every sensor connect,
+/// for instance after a driver reset), so callers do not keep one: they look it up again in
+/// every call (`gpu_by_subsystem`) under the lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuHandle(pub *mut c_void);
 
@@ -128,6 +130,8 @@ pub fn with<R>(f: impl FnOnce(&Api) -> Result<R, String>) -> Result<R, String> {
 /// `with`, but Initialize runs again first even if it already succeeded: for a (re)connect,
 /// so a driver reset since the last Initialize is recovered from. GPU handles from before
 /// may be stale afterwards; look them up again.
+// Only the Windows pin sensor connects through NVAPI.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn with_reinit<R>(f: impl FnOnce(&Api) -> Result<R, String>) -> Result<R, String> {
     enter(true, f)
 }

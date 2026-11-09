@@ -271,10 +271,52 @@ pub fn load_i2c_choice(path: &Path) -> Option<I2cChoice> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn save_i2c_choice(path: &Path, c: &I2cChoice) -> std::io::Result<()> {
+    update(path, |ini| {
+        ini.set(S, "i2c_adapter", c.adapter.clone());
+        ini.set(S, "i2c_adapter_subsystem", format!("0x{:08X}", c.subsystem));
+    })
+}
+
+/// Serializes every config.ini save in the process. Each one reads the whole file, changes its
+/// keys and writes it back through the same temporary file, so two at once (the IPC thread
+/// saving a setting while the monitor saves a driver check) would lose one's keys or fail the
+/// rename.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read config.ini, change it, write it back, under `WRITE_LOCK`.
+fn update(path: &Path, f: impl FnOnce(&mut Ini)) -> std::io::Result<()> {
+    // A panic in another save leaves nothing half-done in memory: the file is the state.
+    let _held = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut ini = Ini::read(path);
-    ini.set(S, "i2c_adapter", c.adapter.clone());
-    ini.set(S, "i2c_adapter_subsystem", format!("0x{:08X}", c.subsystem));
+    f(&mut ini);
     ini.write(path)
+}
+
+/// The driver version the overclock's curve write check last passed on
+/// (`oc_vf_verified_driver`): the check runs again only after a driver update.
+pub fn load_oc_verified(path: &Path) -> Option<String> {
+    let v = Ini::read(path).get(S, "oc_vf_verified_driver")?.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+pub fn save_oc_verified(path: &Path, driver: &str) -> std::io::Result<()> {
+    update(path, |ini| {
+        ini.set(S, "oc_vf_verified_driver", driver.to_string());
+    })
+}
+
+/// The driver version the curve write check failed on with a wrong landing
+/// (`oc_vf_failed_driver`): no further test writes on it, and no undervolt, until the driver
+/// changes (or the key is removed by hand).
+pub fn load_oc_vf_failed(path: &Path) -> Option<String> {
+    let v = Ini::read(path).get(S, "oc_vf_failed_driver")?.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+pub fn save_oc_vf_failed(path: &Path, driver: &str) -> std::io::Result<()> {
+    update(path, |ini| {
+        ini.set(S, "oc_vf_failed_driver", driver.to_string());
+    })
 }
 
 /// A float as config.ini stores it: "9.5", "15.0".
@@ -288,48 +330,48 @@ fn fmt_bool(v: bool) -> String {
 
 /// Write the given settings keys into config.ini, leaving every other key untouched.
 pub fn save_settings(path: &Path, s: &Settings, keys: &[&str]) -> std::io::Result<()> {
-    let mut ini = Ini::read(path);
-    for &key in keys {
-        let value = match key {
-            "threshold_amps" => fmt_float(s.threshold_amps),
-            "sustained_seconds_required" => fmt_float(s.sustained_seconds_required),
-            "response_mode" => s.response_mode.key().to_string(),
-            "critical_amps" => fmt_float(s.critical_amps),
-            "critical_seconds" => fmt_float(s.critical_seconds),
-            "catastrophic_amps" => fmt_float(s.catastrophic_amps),
-            "sag_enabled" => fmt_bool(s.sag_enabled),
-            "sag_warn_degrees" => fmt_float(s.sag_warn_degrees),
-            "sag_serious_degrees" => fmt_float(s.sag_serious_degrees),
-            "sag_sustained_seconds" => fmt_float(s.sag_sustained_seconds),
-            "sag_card_length_mm" => fmt_float(s.sag_card_length_mm),
-            "imbalance_enabled" => fmt_bool(s.imbalance_enabled),
-            "sensor_auto_scan" => fmt_bool(s.sensor_auto_scan),
-            "imbalance_min_amps" => fmt_float(s.imbalance_min_amps),
-            "imbalance_percent" => fmt_float(s.imbalance_percent),
-            "imbalance_delta_amps" => fmt_float(s.imbalance_delta_amps),
-            "imbalance_sustained_seconds" => fmt_float(s.imbalance_sustained_seconds),
-            "imbalance_response" => s.imbalance_response.key().to_string(),
-            "oc_uv_enabled" => fmt_bool(s.oc_uv_enabled),
-            "oc_uv_from_mv" => fmt_float(s.oc_uv_from_mv),
-            "oc_uv_to_mv" => fmt_float(s.oc_uv_to_mv),
-            "oc_uv_target_mhz" => fmt_float(s.oc_uv_target_mhz),
-            "oc_power_enabled" => fmt_bool(s.oc_power_enabled),
-            "oc_power_w" => fmt_float(s.oc_power_w),
-            "oc_mem_enabled" => fmt_bool(s.oc_mem_enabled),
-            "oc_mem_offset_mhz" => fmt_float(s.oc_mem_offset_mhz),
-            "oc_apply_delay_seconds" => fmt_float(s.oc_apply_delay_seconds),
-            _ => continue,
-        };
-        ini.set(S, key, value);
-    }
-    ini.write(path)
+    update(path, |ini| {
+        for &key in keys {
+            let value = match key {
+                "threshold_amps" => fmt_float(s.threshold_amps),
+                "sustained_seconds_required" => fmt_float(s.sustained_seconds_required),
+                "response_mode" => s.response_mode.key().to_string(),
+                "critical_amps" => fmt_float(s.critical_amps),
+                "critical_seconds" => fmt_float(s.critical_seconds),
+                "catastrophic_amps" => fmt_float(s.catastrophic_amps),
+                "sag_enabled" => fmt_bool(s.sag_enabled),
+                "sag_warn_degrees" => fmt_float(s.sag_warn_degrees),
+                "sag_serious_degrees" => fmt_float(s.sag_serious_degrees),
+                "sag_sustained_seconds" => fmt_float(s.sag_sustained_seconds),
+                "sag_card_length_mm" => fmt_float(s.sag_card_length_mm),
+                "imbalance_enabled" => fmt_bool(s.imbalance_enabled),
+                "sensor_auto_scan" => fmt_bool(s.sensor_auto_scan),
+                "imbalance_min_amps" => fmt_float(s.imbalance_min_amps),
+                "imbalance_percent" => fmt_float(s.imbalance_percent),
+                "imbalance_delta_amps" => fmt_float(s.imbalance_delta_amps),
+                "imbalance_sustained_seconds" => fmt_float(s.imbalance_sustained_seconds),
+                "imbalance_response" => s.imbalance_response.key().to_string(),
+                "oc_uv_enabled" => fmt_bool(s.oc_uv_enabled),
+                "oc_uv_from_mv" => fmt_float(s.oc_uv_from_mv),
+                "oc_uv_to_mv" => fmt_float(s.oc_uv_to_mv),
+                "oc_uv_target_mhz" => fmt_float(s.oc_uv_target_mhz),
+                "oc_power_enabled" => fmt_bool(s.oc_power_enabled),
+                "oc_power_w" => fmt_float(s.oc_power_w),
+                "oc_mem_enabled" => fmt_bool(s.oc_mem_enabled),
+                "oc_mem_offset_mhz" => fmt_float(s.oc_mem_offset_mhz),
+                "oc_apply_delay_seconds" => fmt_float(s.oc_apply_delay_seconds),
+                _ => continue,
+            };
+            ini.set(S, key, value);
+        }
+    })
 }
 
 pub fn save_baseline(path: &Path, b: &SagBaseline) -> std::io::Result<()> {
-    let mut ini = Ini::read(path);
-    ini.set(S, "sag_baseline", format!("{:.5},{:.5},{:.5}", b.vector[0], b.vector[1], b.vector[2]));
-    ini.set(S, "sag_baseline_subsystem", format!("0x{:08X}", b.subsystem));
-    ini.write(path)
+    update(path, |ini| {
+        ini.set(S, "sag_baseline", format!("{:.5},{:.5},{:.5}", b.vector[0], b.vector[1], b.vector[2]));
+        ini.set(S, "sag_baseline_subsystem", format!("0x{:08X}", b.subsystem));
+    })
 }
 
 /// The keys a patch touches, in config.ini spelling.
@@ -554,6 +596,66 @@ mod tests {
         assert!(text.contains("future_key = x") && text.contains("threshold_amps = 9.0"));
         assert_eq!(load(&path).0.threshold_amps, 9.0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oc_verified_driver_round_trips_and_keeps_other_keys() {
+        let path = std::env::temp_dir().join(format!("ag-cfg-ocv-{}.ini", std::process::id()));
+        fs::write(&path, "[Settings]\nfuture_key = x\n").unwrap();
+        assert_eq!(load_oc_verified(&path), None);
+        save_oc_verified(&path, "620.70.06").unwrap();
+        assert_eq!(load_oc_verified(&path).as_deref(), Some("620.70.06"));
+        assert!(fs::read_to_string(&path).unwrap().contains("future_key = x"));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn oc_vf_failed_driver_round_trips_next_to_the_verified_one() {
+        let path = std::env::temp_dir().join(format!("ag-cfg-ocf-{}.ini", std::process::id()));
+        fs::write(&path, "[Settings]\nfuture_key = x\n").unwrap();
+        assert_eq!(load_oc_vf_failed(&path), None);
+        save_oc_verified(&path, "620.70.06").unwrap();
+        save_oc_vf_failed(&path, "621.01").unwrap();
+        assert_eq!(load_oc_vf_failed(&path).as_deref(), Some("621.01"));
+        assert_eq!(load_oc_verified(&path).as_deref(), Some("620.70.06"), "both kept");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("oc_vf_failed_driver = 621.01") && text.contains("future_key = x"), "{text}");
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Every save is a read-modify-write of the whole file through one temporary file: two at
+    /// once (the IPC thread saving a setting, the monitor saving a verified driver) must not lose
+    /// either one's key.
+    #[test]
+    fn concurrent_saves_keep_every_key() {
+        let path = std::env::temp_dir().join(format!("ag-cfg-race-{}.ini", std::process::id()));
+        fs::write(&path, "[Settings]\n").unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        match n % 4 {
+                            0 => save_oc_verified(&p, &format!("v{i}")).unwrap(),
+                            1 => save_oc_vf_failed(&p, &format!("f{i}")).unwrap(),
+                            2 => {
+                                let s = Settings { threshold_amps: 9.0, ..Settings::default() };
+                                save_settings(&p, &s, &["threshold_amps"]).unwrap()
+                            }
+                            _ => save_baseline(&p, &SagBaseline { vector: [0.0, 0.0, 1.0], subsystem: 1 }).unwrap(),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let ini = Ini::read(&path);
+        for key in ["oc_vf_verified_driver", "oc_vf_failed_driver", "threshold_amps", "sag_baseline"] {
+            assert!(ini.get(S, key).is_some(), "{key} lost: {}", ini.to_text());
+        }
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -30,7 +30,15 @@ fn volt_mv(p: &RawPoint) -> f64 {
 /// Points with voltage in `[from_mv, to_mv]` get one shared offset that lands the highest of them
 /// (the highest core point at or below `to_mv`) on `target_mhz`. Points above `to_mv` are capped to
 /// `target_mhz` so the card cannot boost past the target at a higher voltage. Points below `from_mv`
-/// stay stock. Every core point gets an entry, so the plan owns the whole curve and re-planning over
+/// stay stock (offset 0).
+///
+/// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): with the owner's
+/// undervolt applied, the driver raised the two points just below From to smooth the jump while
+/// their offsets stayed 0 (810 mV 757 -> 1012 MHz, 815 mV 847 -> 1402 MHz; 800 mV unchanged at
+/// 675). So "stock below From" holds for the offsets AstralGuard writes; the driver may still
+/// lift the points right below From.
+///
+/// Every core point gets an entry, so the plan owns the whole curve and re-planning over
 /// an already-applied curve is idempotent because everything is measured from stock.
 ///
 /// Points from the first memory-flagged one onward belong to the memory domain and never get a delta.

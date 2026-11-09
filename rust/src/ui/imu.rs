@@ -1,4 +1,4 @@
-//! IMU tab: bubble level, per-axis angles, sag, a minute of strip chart.
+//! Anti-sag tab: bubble level, per-axis angles, sag, a minute of strip chart.
 
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 

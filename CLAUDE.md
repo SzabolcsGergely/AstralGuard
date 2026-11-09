@@ -21,6 +21,11 @@ rust/                     the whole program: one crate, one binary (astralguard)
   src/sensor/             IT8915 per-pin + accelerometer reads: nvapi.rs (Windows), i2cdev.rs (Linux),
                           detect.rs (Linux sensor scan: probe --detect / dashboard Scan)
   src/mitigation.rs       NVML clock lock + power limit, and putting them back
+  src/nvapi.rs            the one shared NVAPI binding (Windows pin reads, V/F curve calls), one lock;
+                          loaded once, never unloaded, Initialize again on every Windows sensor
+                          connect (recovers after a driver reset)
+  src/overclock/          the optional overclock: curve.rs (math), gpu.rs (OcGpu trait + RealGpu),
+                          mod.rs (Overclocker, overclock.active marker, probe)
   src/service/            the protection core
     monitor.rs            0.5 s loop: read pins, tier 1 timer, act on the ladder's decision
     response.rs           the response ladder (tiers 1-3, grace, hold, release, retrigger)
@@ -28,7 +33,7 @@ rust/                     the whole program: one crate, one binary (astralguard)
     flight.rs             last minute of samples, dumped when the guard acts
     crosscheck.rs         observational comparison with HWiNFO, never decides anything
   src/platform/           windows.rs / linux.rs: elevation, toasts, event log, shutdown, autostart
-  src/ui/                 tray + egui dashboard (feature "ui"); demo.rs = simulated service;
+  src/ui/                 tray + egui dashboard (feature "ui"); overclock.rs = the Overclock tab; demo.rs = simulated service;
                           host.rs = Linux tray process that starts the window as `ui --window`
   build.rs                Windows: embeds the icon + version info (writes a .res itself)
   assets/icon/            icon sources (SVG), render.py, the generated .ico / PNGs
@@ -97,7 +102,7 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
   `--phase <s>` starts at a point in the cycle (52 = imbalance, 67 = GPU limited),
   `--offline` simulates a missing service, `--no-sensor` a card whose pin monitor reads
   nothing until Scan is pressed.
-- **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|imu|settings|log
+- **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|overclock|imu|settings|log
   [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]`
   renders one frame and exits. `docs/screenshots/` is made this way.
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
@@ -162,7 +167,9 @@ These are not style preferences. A change that breaks one gets rejected.
    (`%SystemRoot%\System32\shutdown.exe`, `/usr/bin/systemctl`), never PATH.
 5. **GPU limiting is reversible.** `mitigation.rs` records the clock and power limit before
    changing them and restores exactly those. The `mitigation.active` marker file covers a
-   crash while limited. Shutdown-only mode never touches NVML.
+   crash while limited. In shutdown-only mode the protection path never touches NVML. The
+   overclock is the user's separate, opt-in use of the GPU with its own NVML binding, and
+   it records and restores its own values the same way (`overclock.active`).
 6. **Defaults are safety decisions.** Changing a threshold or timing default needs a reason
    in the commit message. The dashboard asks for confirmation when a change weakens
    protection; keep that.
@@ -171,6 +178,14 @@ These are not style preferences. A change that breaks one gets rejected.
 8. **Verified facts are marked.** Sensor constants and NVML behaviour carry
    `VERIFIED (date, card)` notes; anything not confirmed on hardware is marked
    `UNVERIFIED`, like the Linux I2C adapter mapping. Keep it that way.
+9. **NVAPI's V/F calls are the overclock's only.** The NVAPI V/F curve functions are
+   undocumented. They are used only in `overclock/`, only behind the compatibility check
+   (write 15 MHz to one point, because the driver does not apply a 5 MHz offset, read the whole curve back, restore), and a per-point offset
+   beyond ±1000 MHz is refused. NVAPI is loaded once and never unloaded, Initialize runs
+   again on every Windows sensor connect (so the binding recovers after a driver reset),
+   and every call goes through one lock. So a hung driver call delays the pin reads too;
+   that is why the overclock calls NVAPI only on apply, release and status requests. Rule 1
+   is unchanged: nothing here writes to I2C.
 
 ## Changing things
 

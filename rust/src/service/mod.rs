@@ -16,14 +16,15 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use crate::config::{self, SagBaseline};
 use crate::logger;
+use crate::overclock::{self, OcGpu, Overclocker};
 use crate::platform::{self, EventKind};
 use crate::protocol::{
-    fmt_tilt, ImbalanceResponse, Live, Notice, Request, Response, ResponseMode, Settings, SettingsPatch, APP_NAME,
-    APP_VERSION,
+    fmt_tilt, ImbalanceResponse, Live, Notice, OcReport, OcResult, OcStatus, Request, Response, ResponseMode, Settings,
+    SettingsPatch, APP_NAME, APP_VERSION,
 };
 
 /// 5 minutes of pin samples at the 0.5 s poll, for the dashboard's chart.
@@ -34,6 +35,151 @@ const NOTICES_KEPT: usize = 50;
 /// How long a starting service waits for a previous guard to release the lock.
 const SINGLE_INSTANCE_WAIT_SEC: u64 = 15;
 pub const SAG_FAST_MAX_SECONDS: f64 = 300.0;
+
+/// What the service needs from the overclock, so `Shared` holds it without a type parameter
+/// and the tests can give it a fake GPU.
+pub trait OcDriver {
+    fn apply(&mut self, s: &Settings, guard_engaged: bool) -> OcReport;
+    fn after_release(&mut self, s: &Settings) -> OcReport;
+    fn status(&mut self, s: &Settings) -> OcStatus;
+    fn verified_driver(&self) -> Option<String>;
+    /// The driver the curve write check failed on with a wrong landing, to be persisted.
+    fn failed_driver(&self) -> Option<String>;
+    fn subsystem(&self) -> u32;
+    /// What AstralGuard applied and will restore; no driver call.
+    fn managed(&self) -> Vec<String>;
+}
+
+impl<G: OcGpu> OcDriver for Overclocker<G> {
+    fn apply(&mut self, s: &Settings, guard_engaged: bool) -> OcReport {
+        Overclocker::apply(self, s, guard_engaged)
+    }
+    fn after_release(&mut self, s: &Settings) -> OcReport {
+        Overclocker::after_release(self, s)
+    }
+    fn status(&mut self, s: &Settings) -> OcStatus {
+        Overclocker::status(self, s)
+    }
+    fn verified_driver(&self) -> Option<String> {
+        Overclocker::verified_driver(self).map(str::to_string)
+    }
+    fn failed_driver(&self) -> Option<String> {
+        Overclocker::failed_driver(self).map(str::to_string)
+    }
+    fn subsystem(&self) -> u32 {
+        Overclocker::subsystem(self)
+    }
+    fn managed(&self) -> Vec<String> {
+        Overclocker::managed(self)
+    }
+}
+
+/// Opens the overclocker for a card subsystem: the real GPU in the service, a fake in tests.
+type OcFactory = dyn Fn(u32) -> Result<Box<dyn OcDriver + Send>, String> + Send + Sync;
+
+/// How a call on the overclocker went.
+pub enum OcAccess<R> {
+    Ran(R),
+    /// In use elsewhere (a status read for the dashboard); only `try_overclock` returns it.
+    Busy,
+    /// No card found yet, so no GPU to open.
+    NoCard,
+    /// The GPU could not be opened.
+    Unavailable(String),
+}
+
+impl<R> OcAccess<R> {
+    /// The same outcome without the result.
+    pub fn ran(self) -> OcAccess<()> {
+        match self {
+            OcAccess::Ran(_) => OcAccess::Ran(()),
+            OcAccess::Busy => OcAccess::Busy,
+            OcAccess::NoCard => OcAccess::NoCard,
+            OcAccess::Unavailable(e) => OcAccess::Unavailable(e),
+        }
+    }
+}
+
+const NO_CARD: &str = "no card connected";
+const REFUSED_LIMITED: &str = "GPU is limited by the guard; try again after it releases";
+/// The monitor saw the GPU limited after the IPC thread had saved: the release applies it.
+const DEFERRED_LIMITED: &str = "Saved; will be applied when the guard releases the GPU";
+/// The loop may have been inside the write when the wait ran out.
+const TIMED_OUT: &str =
+    "Saved, but the guard's loop did not answer in time; the overclock may or may not have been written — see the tab";
+/// An overclock driver call on the monitor thread longer than this is logged: the pin reads
+/// waited for it (see `try_overclock`).
+const SLOW_OC_CALL: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long Apply now waits for the monitor loop to run it.
+const APPLY_NOW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Every overclock setting, from `from` into `to`.
+fn copy_oc(from: &Settings, to: &mut Settings) {
+    to.oc_uv_enabled = from.oc_uv_enabled;
+    to.oc_uv_from_mv = from.oc_uv_from_mv;
+    to.oc_uv_to_mv = from.oc_uv_to_mv;
+    to.oc_uv_target_mhz = from.oc_uv_target_mhz;
+    to.oc_power_enabled = from.oc_power_enabled;
+    to.oc_power_w = from.oc_power_w;
+    to.oc_mem_enabled = from.oc_mem_enabled;
+    to.oc_mem_offset_mhz = from.oc_mem_offset_mhz;
+    to.oc_apply_delay_seconds = from.oc_apply_delay_seconds;
+}
+
+/// Only the oc_* keys of a patch: Apply now must not change anything else, whatever it is sent.
+fn oc_only(p: &SettingsPatch) -> SettingsPatch {
+    SettingsPatch {
+        oc_uv_enabled: p.oc_uv_enabled,
+        oc_uv_from_mv: p.oc_uv_from_mv,
+        oc_uv_to_mv: p.oc_uv_to_mv,
+        oc_uv_target_mhz: p.oc_uv_target_mhz,
+        oc_power_enabled: p.oc_power_enabled,
+        oc_power_w: p.oc_power_w,
+        oc_mem_enabled: p.oc_mem_enabled,
+        oc_mem_offset_mhz: p.oc_mem_offset_mhz,
+        oc_apply_delay_seconds: p.oc_apply_delay_seconds,
+        ..SettingsPatch::default()
+    }
+}
+
+/// Clears `oc_apply_running` however the Apply now ends, a panic included.
+struct ApplyRunning<'a>(&'a AtomicBool);
+
+impl Drop for ApplyRunning<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Any overclock setting ticked.
+pub fn oc_ticked(s: &Settings) -> bool {
+    s.oc_uv_enabled || s.oc_power_enabled || s.oc_mem_enabled
+}
+
+/// The service's overclocker: the real GPU, its marker, and the driver version verified before.
+fn real_overclocker(subsystem: u32) -> Result<Box<dyn OcDriver + Send>, String> {
+    let gpu = overclock::gpu::RealGpu::open(subsystem)?;
+    let verified = config::load_oc_verified(&config::config_path());
+    let failed = config::load_oc_vf_failed(&config::config_path());
+    logger::info(format!("Overclock: GPU 0x{subsystem:08X} opened."));
+    Ok(Box::new(Overclocker::new(gpu, overclock::marker_path(), verified, failed)))
+}
+
+/// The warning for an overclock call that held the monitor thread longer than `SLOW_OC_CALL`.
+fn slow_call_note(what: &str, took: std::time::Duration) -> Option<String> {
+    (took > SLOW_OC_CALL).then(|| {
+        format!("Overclock: {what} took {} ms on the monitor thread; the pin reads waited for it", took.as_millis())
+    })
+}
+
+/// One failed result per setting, for an Apply now that wrote nothing.
+fn oc_refused(message: &str) -> OcReport {
+    let results = ["undervolt", "power", "memory"]
+        .into_iter()
+        .map(|setting| OcResult { setting: setting.into(), ok: false, message: message.into() })
+        .collect();
+    OcReport { results, deferred: false }
+}
 
 pub struct State {
     /// The live snapshot without the histories and settings, which are filled in on read.
@@ -60,6 +206,24 @@ pub struct Shared {
     pub bus: Mutex<()>,
     fast_until: Mutex<f64>,
     pub baseline: Mutex<Option<SagBaseline>>,
+    /// Opened on first need (a status request, Apply now, the start-up apply or a release) for
+    /// the card the sensor found, so nothing touches NVML or NVAPI while no overclock setting is
+    /// ticked or managed. Never held while taking another of these locks: callers clone the
+    /// settings and read `state` first, then lock this alone.
+    overclock: Mutex<Option<Box<dyn OcDriver + Send>>>,
+    oc_factory: Box<OcFactory>,
+    /// The overclock marker, read without opening the GPU (`overclock_managed`).
+    oc_marker: std::path::PathBuf,
+    /// The last GPU open error logged; a leaf lock, never held with another.
+    oc_open_error: Mutex<String>,
+    /// Apply now, handed from the IPC thread to the monitor thread (which answers on it), so
+    /// the GPU write is ordered against the guard's engage decisions. One slot; a leaf lock.
+    oc_mailbox: Mutex<Option<std::sync::mpsc::SyncSender<OcReport>>>,
+    /// An Apply now is between its save and its answer; a second one is refused.
+    oc_apply_running: AtomicBool,
+    /// Where the curve write check's results (`oc_vf_verified_driver`, `oc_vf_failed_driver`)
+    /// are saved: config.ini, or nowhere in tests.
+    oc_config: Option<std::path::PathBuf>,
     /// Tests: no toasts, no Event Log, no config writes.
     pub quiet: bool,
     pub watchdog: bool,
@@ -72,10 +236,45 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Shared {
     pub fn new(settings: Settings, baseline: Option<SagBaseline>, quiet: bool) -> Arc<Shared> {
+        let oc_config = (!quiet).then(config::config_path);
+        Shared::build(settings, baseline, quiet, overclock::marker_path(), Box::new(real_overclocker), oc_config)
+    }
+
+    /// Tests: a quiet service whose overclocker comes from `factory`.
+    #[cfg(test)]
+    pub fn with_overclock_factory(
+        settings: Settings,
+        marker: std::path::PathBuf,
+        factory: Box<OcFactory>,
+    ) -> Arc<Shared> {
+        Shared::build(settings, None, true, marker, factory, None)
+    }
+
+    /// Tests: as `with_overclock_factory`, with the driver check results saved to `config`.
+    #[cfg(test)]
+    pub fn with_overclock_config(
+        settings: Settings,
+        marker: std::path::PathBuf,
+        factory: Box<OcFactory>,
+        config: std::path::PathBuf,
+    ) -> Arc<Shared> {
+        Shared::build(settings, None, true, marker, factory, Some(config))
+    }
+
+    fn build(
+        settings: Settings,
+        baseline: Option<SagBaseline>,
+        quiet: bool,
+        oc_marker: std::path::PathBuf,
+        oc_factory: Box<OcFactory>,
+        oc_config: Option<std::path::PathBuf>,
+    ) -> Arc<Shared> {
         let live = Live {
             version: APP_VERSION.into(),
             last_message: "Starting...".into(),
             card_length_mm: crate::sensor::DEFAULT_CARD_LENGTH_MM,
+            // From the start, so a loop that never gets going shows as stalled too.
+            loop_at: crate::now(),
             ..Default::default()
         };
         Arc::new(Shared {
@@ -95,6 +294,13 @@ impl Shared {
             bus: Mutex::new(()),
             fast_until: Mutex::new(0.0),
             baseline: Mutex::new(baseline),
+            overclock: Mutex::new(None),
+            oc_factory,
+            oc_marker,
+            oc_open_error: Mutex::new(String::new()),
+            oc_mailbox: Mutex::new(None),
+            oc_apply_running: AtomicBool::new(false),
+            oc_config,
             quiet,
             watchdog: std::env::var_os("GUARD_WATCHDOG").is_some(),
         })
@@ -212,8 +418,24 @@ impl Shared {
         live
     }
 
+    /// config.ini, except in tests.
+    fn save_to_disk(&self, s: &Settings, keys: &[&str]) -> std::io::Result<()> {
+        if self.quiet {
+            return Ok(());
+        }
+        config::save_settings(&config::config_path(), s, keys)
+    }
+
     /// Apply a validated change: memory first (the ladder reads it next tick), then disk.
     fn apply(&self, patch: &SettingsPatch) -> Vec<String> {
+        self.apply_with(patch, &|s, keys| self.save_to_disk(s, keys))
+    }
+
+    fn apply_with(
+        &self,
+        patch: &SettingsPatch,
+        save: &dyn Fn(&Settings, &[&str]) -> std::io::Result<()>,
+    ) -> Vec<String> {
         let mut failures = Vec::new();
         let (errors, _warnings) = config::check(&self.settings(), patch);
         if !errors.is_empty() {
@@ -223,10 +445,8 @@ impl Shared {
         let after = config::merged(&before, patch);
         *lock(&self.settings) = after.clone();
         let keys = config::patch_keys(patch);
-        if !self.quiet {
-            if let Err(e) = config::save_settings(&config::config_path(), &after, &keys) {
-                failures.push(format!("not saved to config.ini ({e})"));
-            }
+        if let Err(e) = save(&after, &keys) {
+            failures.push(format!("not saved to config.ini ({e})"));
         }
         if !keys.is_empty() {
             logger::info(format!(
@@ -261,6 +481,203 @@ impl Shared {
             self.notify(APP_NAME, &msg);
         }
         failures
+    }
+
+    /// Run `f` on the overclocker for the connected card, opening it first if there is none
+    /// or it is for another card. `wait`: the IPC thread waits for the lock, the monitor never
+    /// does (a status read can be busy in the driver for a while; the pin loop must not stall).
+    fn run_overclock<R>(&self, wait: bool, f: impl FnOnce(&mut dyn OcDriver) -> R) -> OcAccess<R> {
+        let Some(subsystem) = self.live_field(|l| l.card_subsystem) else { return OcAccess::NoCard };
+        let mut guard = if wait {
+            lock(&self.overclock)
+        } else {
+            match self.overclock.try_lock() {
+                Ok(g) => g,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => return OcAccess::Busy,
+            }
+        };
+        let opening = guard.as_ref().map(|d| d.subsystem()) != Some(subsystem);
+        if opening {
+            *guard = None;
+            match (self.oc_factory)(subsystem) {
+                Ok(d) => *guard = Some(d),
+                Err(e) => {
+                    drop(guard);
+                    self.note_open_result(Some(&e));
+                    return OcAccess::Unavailable(e);
+                }
+            }
+        }
+        let Some(driver) = guard.as_mut() else { return OcAccess::NoCard };
+        let before = (driver.verified_driver(), driver.failed_driver());
+        let r = f(driver.as_mut());
+        let after = (driver.verified_driver(), driver.failed_driver());
+        drop(guard);
+        if opening {
+            self.note_open_result(None);
+        }
+        self.save_driver_checks(before, after);
+        OcAccess::Ran(r)
+    }
+
+    /// Persist a newly passed or newly failed curve write check, so a restart neither probes a
+    /// verified driver again nor writes test offsets on one known to be wrong.
+    fn save_driver_checks(&self, before: (Option<String>, Option<String>), after: (Option<String>, Option<String>)) {
+        let Some(path) = &self.oc_config else { return };
+        if let Some(v) = after.0.filter(|a| Some(a) != before.0.as_ref()) {
+            if let Err(e) = config::save_oc_verified(path, &v) {
+                logger::warn(format!("Overclock: could not save the verified driver version ({e})"));
+            }
+        }
+        if let Some(v) = after.1.filter(|a| Some(a) != before.1.as_ref()) {
+            if let Err(e) = config::save_oc_vf_failed(path, &v) {
+                logger::warn(format!("Overclock: could not save the failed driver version ({e})"));
+            }
+        }
+    }
+
+    /// Log a failed GPU open once per distinct error: the monitor retries the start-up apply
+    /// and the dashboard asks for status every few seconds. A success re-arms it. True when it
+    /// logged.
+    fn note_open_result(&self, error: Option<&str>) -> bool {
+        let mut last = lock(&self.oc_open_error);
+        let Some(e) = error else {
+            last.clear();
+            return false;
+        };
+        if *last == e {
+            return false;
+        }
+        *last = e.to_string();
+        logger::warn(format!("Overclock unavailable: {e}"));
+        true
+    }
+
+    /// For the monitor thread: never waits for the lock. The driver calls themselves (and a GPU
+    /// open) can still take long, and the pin reads wait for them, so each one that takes longer
+    /// than `SLOW_OC_CALL` is logged with its duration; `what` names it ("Apply now", ...).
+    pub fn try_overclock<R>(&self, what: &str, f: impl FnOnce(&mut dyn OcDriver) -> R) -> OcAccess<R> {
+        let start = std::time::Instant::now();
+        let r = self.run_overclock(false, f);
+        if let Some(note) = slow_call_note(what, start.elapsed()) {
+            logger::warn(note);
+        }
+        r
+    }
+
+    /// What AstralGuard has applied on the connected card, without opening the GPU: from the
+    /// overclocker when it is open and free, else from its marker file.
+    pub fn overclock_managed(&self) -> Vec<String> {
+        let Some(subsystem) = self.live_field(|l| l.card_subsystem) else { return Vec::new() };
+        if let Ok(guard) = self.overclock.try_lock() {
+            if let Some(d) = guard.as_ref().filter(|d| d.subsystem() == subsystem) {
+                return d.managed();
+            }
+        }
+        overclock::managed_in_marker(&self.oc_marker, subsystem)
+    }
+
+    /// The Overclock tab's view, read from the driver on request (the dashboard asks while the
+    /// tab is visible).
+    fn overclock_status(&self) -> OcStatus {
+        let s = self.settings();
+        let unavailable = |reason: String| OcStatus { available: false, reason, ..OcStatus::default() };
+        match self.run_overclock(true, |d| d.status(&s)) {
+            OcAccess::Ran(st) => st,
+            OcAccess::NoCard | OcAccess::Busy => unavailable(NO_CARD.into()),
+            OcAccess::Unavailable(e) => unavailable(e),
+        }
+    }
+
+    /// Apply now. Saved first, through the same path as every setting, so the next start
+    /// applies exactly what was written; then written by the monitor thread (`serve_apply_now`),
+    /// never from here: only there is the write ordered against the guard engaging.
+    fn apply_overclock(&self, changes: &SettingsPatch) -> OcReport {
+        self.apply_overclock_with(changes, &|s, keys| self.save_to_disk(s, keys), APPLY_NOW_WAIT)
+    }
+
+    fn apply_overclock_with(
+        &self,
+        changes: &SettingsPatch,
+        save: &dyn Fn(&Settings, &[&str]) -> std::io::Result<()>,
+        wait: std::time::Duration,
+    ) -> OcReport {
+        // Early, so a refused apply saves nothing either; the monitor checks again before writing.
+        if self.live_field(|l| l.engaged) {
+            return oc_refused(REFUSED_LIMITED);
+        }
+        if self.oc_apply_running.swap(true, Ordering::SeqCst) {
+            return oc_refused("an apply is already running");
+        }
+        let _running = ApplyRunning(&self.oc_apply_running);
+        self.save_and_hand_over(&oc_only(changes), save, wait)
+    }
+
+    fn save_and_hand_over(
+        &self,
+        changes: &SettingsPatch,
+        save: &dyn Fn(&Settings, &[&str]) -> std::io::Result<()>,
+        wait: std::time::Duration,
+    ) -> OcReport {
+        let before = self.settings();
+        let failures = self.apply_with(changes, save);
+        if !failures.is_empty() {
+            // Nothing written: a value the check refused, or one that is not saved. An unsaved
+            // value is taken back out of memory too, or a later release would write what the
+            // next start does not apply.
+            copy_oc(&before, &mut lock(&self.settings));
+            let results = failures
+                .into_iter()
+                .map(|f| OcResult {
+                    setting: "settings".into(),
+                    ok: false,
+                    message: format!("{f}; nothing written to the GPU"),
+                })
+                .collect();
+            return OcReport { results, deferred: false };
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        *lock(&self.oc_mailbox) = Some(tx);
+        match rx.recv_timeout(wait) {
+            Ok(report) => report,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Withdrawn, so a late loop does not write what nobody waits for any more.
+                lock(&self.oc_mailbox).take();
+                oc_refused(TIMED_OUT)
+            }
+            // The monitor dropped the request: the overclock panicked there (logged).
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                oc_refused("Saved, but the overclock failed with an internal error (see the log)")
+            }
+        }
+    }
+
+    /// The monitor thread's half of Apply now, with its own view of whether the guard limits the
+    /// GPU. True when a request was answered. A busy overclocker (a status read) keeps the
+    /// request for the next iteration.
+    pub fn serve_apply_now(&self, engaged: bool) -> bool {
+        let Some(reply) = lock(&self.oc_mailbox).take() else { return false };
+        let s = self.settings();
+        let report = if engaged {
+            oc_refused(DEFERRED_LIMITED)
+        } else if !oc_ticked(&s) && self.overclock_managed().is_empty() {
+            // Nothing to write and nothing to restore: the GPU is not even opened.
+            OcReport::default()
+        } else {
+            match self.try_overclock("Apply now", |d| d.apply(&s, false)) {
+                OcAccess::Ran(report) => report,
+                OcAccess::Busy => {
+                    lock(&self.oc_mailbox).get_or_insert(reply);
+                    return false;
+                }
+                OcAccess::NoCard => oc_refused(&format!("Saved, but {NO_CARD}.")),
+                OcAccess::Unavailable(e) => oc_refused(&format!("Saved, but the GPU cannot be reached: {e}")),
+            }
+        };
+        // A request that timed out meanwhile has no receiver; nothing to do then.
+        let _ = reply.send(report);
+        true
     }
 
     /// The sensor scan, from the dashboard or automatic. Only while no sensor is connected: a working sensor is never
@@ -343,6 +760,8 @@ impl Shared {
                 Response::Ok
             }
             Request::ScanSensor => Response::Scan { report: self.scan_sensor("from the dashboard") },
+            Request::ApplyOverclock { changes } => Response::Overclock { report: self.apply_overclock(&changes) },
+            Request::OverclockStatus => Response::OverclockStatus { status: self.overclock_status() },
             Request::CalibrateSag => {
                 self.calibrate_request.store(true, Ordering::Relaxed);
                 Response::Ok
@@ -448,6 +867,9 @@ pub fn run(_args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overclock::fake::{FakeGpu, OWNERS_DRIVER, OWNERS_SUBSYSTEM};
+    use crate::overclock::Overclocker;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn a_scan_never_runs_while_the_sensor_is_reading() {
@@ -471,5 +893,380 @@ mod tests {
         let s = shared.settings();
         assert!(s.oc_power_enabled);
         assert_eq!(s.oc_power_w, 480.0);
+    }
+
+    /// A quiet service whose overclocker, once opened, drives a fake owner's card. `opened`
+    /// counts the opens: zero means the GPU was never touched at all. The marker is removed on drop.
+    pub(super) struct FakeService {
+        pub shared: Arc<Shared>,
+        pub gpu: FakeGpu,
+        pub opened: Arc<AtomicUsize>,
+        pub marker: std::path::PathBuf,
+    }
+
+    impl Drop for FakeService {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.marker);
+        }
+    }
+
+    /// A fresh marker path for `name` (any old file removed).
+    pub(super) fn test_marker(name: &str) -> std::path::PathBuf {
+        let marker = std::env::temp_dir().join(format!("ag-svc-oc-{}-{name}.active", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        marker
+    }
+
+    /// With the owner's card connected (as the sensor would report it).
+    pub(super) fn fake_service(marker: std::path::PathBuf, settings: Settings) -> FakeService {
+        let gpu = FakeGpu::owners();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let (g, o, m) = (gpu.clone(), Arc::clone(&opened), marker.clone());
+        let factory = move |subsystem: u32| -> Result<Box<dyn OcDriver + Send>, String> {
+            o.fetch_add(1, Ordering::SeqCst);
+            g.state().subsystem = subsystem;
+            Ok(Box::new(Overclocker::new(g.clone(), m.clone(), Some(OWNERS_DRIVER.into()), None)))
+        };
+        let shared = Shared::with_overclock_factory(settings, marker.clone(), Box::new(factory));
+        shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        FakeService { shared, gpu, opened, marker }
+    }
+
+    fn power_520() -> SettingsPatch {
+        SettingsPatch { oc_power_enabled: Some(true), oc_power_w: Some(520.0), ..Default::default() }
+    }
+
+    /// Apply now through the IPC handler, with this thread standing in for the monitor loop
+    /// (whose view of `engaged` is `loop_engaged`).
+    fn apply_now_seen_by(shared: &Arc<Shared>, changes: SettingsPatch, loop_engaged: bool) -> OcReport {
+        let ipc = Arc::clone(shared);
+        let request = std::thread::spawn(move || ipc.handle(Request::ApplyOverclock { changes }));
+        while !request.is_finished() {
+            shared.serve_apply_now(loop_engaged);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Response::Overclock { report } = request.join().unwrap() else { panic!("not an overclock answer") };
+        report
+    }
+
+    fn apply_now(shared: &Arc<Shared>, changes: SettingsPatch) -> OcReport {
+        apply_now_seen_by(shared, changes, false)
+    }
+
+    /// Wait until an Apply now has been handed to the (stand-in) monitor loop.
+    pub(super) fn wait_for_mailbox(shared: &Shared) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock(&shared.oc_mailbox).is_none() {
+            assert!(std::time::Instant::now() < end, "no Apply now arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn saved(_: &Settings, _: &[&str]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn apply_now_is_refused_when_the_loop_sees_the_gpu_limited() {
+        // The IPC thread saw it released; the guard engaged before the loop got to the write.
+        let f = fake_service(test_marker("loop-limited"), Settings::default());
+        let report = apply_now_seen_by(&f.shared, power_520(), true);
+        assert!(report.results.iter().all(|r| !r.ok) && !report.results.is_empty(), "{report:?}");
+        let msg = &report.results[0].message;
+        assert!(msg.contains("Saved; will be applied when the guard releases the GPU"), "{report:?}");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+        // Saved: the release's check writes it once the guard lets go.
+        assert!(f.shared.settings().oc_power_enabled);
+    }
+
+    #[test]
+    fn apply_now_times_out_when_the_loop_does_not_answer() {
+        let f = fake_service(test_marker("timeout"), Settings::default());
+        let report = f.shared.apply_overclock_with(&power_520(), &saved, std::time::Duration::from_millis(30));
+        assert!(report.results.iter().all(|r| !r.ok) && !report.results.is_empty(), "{report:?}");
+        let msg = &report.results[0].message;
+        assert!(
+            msg.contains(
+                "the guard's loop did not answer in time; the overclock may or may not have been written — see the tab"
+            ),
+            "{report:?}"
+        );
+        assert!(lock(&f.shared.oc_mailbox).is_none(), "withdrawn");
+        assert!(!f.shared.serve_apply_now(false), "a late loop finds nothing to write");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        // Not stuck: the next one goes through.
+        assert!(apply_now(&f.shared, power_520()).results.iter().all(|r| r.ok));
+    }
+
+    #[test]
+    fn a_second_apply_now_while_one_is_pending_is_refused() {
+        let f = fake_service(test_marker("second"), Settings::default());
+        let ipc = Arc::clone(&f.shared);
+        let first = std::thread::spawn(move || ipc.handle(Request::ApplyOverclock { changes: power_520() }));
+        wait_for_mailbox(&f.shared);
+        let second = f.shared.apply_overclock_with(&power_520(), &saved, std::time::Duration::from_secs(5));
+        assert!(second.results.iter().all(|r| !r.ok) && !second.results.is_empty(), "{second:?}");
+        assert!(second.results[0].message.contains("an apply is already running"), "{second:?}");
+        assert!(f.shared.serve_apply_now(false));
+        let Response::Overclock { report } = first.join().unwrap() else { panic!("not an overclock answer") };
+        assert!(report.results.iter().all(|r| r.ok), "{report:?}");
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()], "written once");
+    }
+
+    #[test]
+    fn apply_overclock_is_refused_while_limited() {
+        let f = fake_service(test_marker("refused"), Settings::default());
+        f.shared.update(|l| l.engaged = true);
+        let report = apply_now(&f.shared, power_520());
+        assert!(!report.results.is_empty());
+        assert!(report.results.iter().all(|r| !r.ok), "{report:?}");
+        assert!(report.results[0].message.contains("try again after it releases"), "{report:?}");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+        assert!(!f.shared.settings().oc_power_enabled, "a refused apply saves nothing either");
+    }
+
+    #[test]
+    fn apply_overclock_saves_then_applies() {
+        let f = fake_service(test_marker("applies"), Settings::default());
+        let report = apply_now(&f.shared, power_520());
+        assert!(!report.deferred);
+        assert!(report.results.iter().all(|r| r.ok), "{report:?}");
+        let s = f.shared.settings();
+        assert!(s.oc_power_enabled);
+        assert_eq!(s.oc_power_w, 520.0);
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()]);
+    }
+
+    /// Apply now carries only the overclock: anything else in its patch is dropped before the
+    /// check and the save, so it cannot change protection through the Overclock tab.
+    #[test]
+    fn apply_overclock_ignores_non_overclock_keys() {
+        let f = fake_service(test_marker("oc-only"), Settings::default());
+        let saved_keys = Arc::new(Mutex::new(Vec::<String>::new()));
+        let k = Arc::clone(&saved_keys);
+        let record = move |_: &Settings, keys: &[&str]| {
+            k.lock().unwrap().extend(keys.iter().map(|s| s.to_string()));
+            Ok(())
+        };
+        let changes = SettingsPatch { threshold_amps: Some(12.0), ..power_520() };
+        let ipc = Arc::clone(&f.shared);
+        let request = std::thread::spawn(move || ipc.apply_overclock_with(&changes, &record, APPLY_NOW_WAIT));
+        while !request.is_finished() {
+            f.shared.serve_apply_now(false);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(request.join().unwrap().results.iter().all(|r| r.ok));
+        assert_eq!(f.shared.settings().threshold_amps, Settings::default().threshold_amps);
+        assert!(f.shared.settings().oc_power_enabled);
+        let keys = saved_keys.lock().unwrap().clone();
+        assert!(!keys.contains(&"threshold_amps".to_string()), "{keys:?}");
+        assert!(keys.contains(&"oc_power_w".to_string()), "{keys:?}");
+    }
+
+    /// A panic between the save and the answer must not leave every later Apply now refused.
+    #[test]
+    fn a_panicking_apply_now_does_not_block_the_next_one() {
+        let f = fake_service(test_marker("panic-flag"), Settings::default());
+        let boom = |_: &Settings, _: &[&str]| -> std::io::Result<()> { panic!("save exploded") };
+        let shared = Arc::clone(&f.shared);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.apply_overclock_with(&power_520(), &boom, APPLY_NOW_WAIT)
+        }));
+        assert!(r.is_err());
+        assert!(!f.shared.oc_apply_running.load(Ordering::SeqCst), "cleared on unwind");
+    }
+
+    #[test]
+    fn apply_overclock_with_an_invalid_value_writes_nothing() {
+        let f = fake_service(test_marker("invalid"), Settings::default());
+        let changes = SettingsPatch { oc_power_enabled: Some(true), oc_power_w: Some(-5.0), ..Default::default() };
+        let report = apply_now(&f.shared, changes);
+        assert!(!report.results.is_empty() && report.results.iter().all(|r| !r.ok), "{report:?}");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert!(!f.shared.settings().oc_power_enabled);
+    }
+
+    #[test]
+    fn apply_overclock_that_cannot_be_saved_is_taken_back_and_writes_nothing() {
+        let f = fake_service(test_marker("unsaved"), Settings::default());
+        let disk_full = |_: &Settings, _: &[&str]| Err(std::io::Error::other("disk full"));
+        let report = f.shared.apply_overclock_with(&power_520(), &disk_full, std::time::Duration::from_secs(5));
+        assert!(!report.results.is_empty() && report.results.iter().all(|r| !r.ok), "{report:?}");
+        let msg = &report.results[0].message;
+        assert!(msg.contains("not saved to config.ini (disk full)") && msg.contains("nothing written"), "{msg}");
+        let s = f.shared.settings();
+        assert!(!s.oc_power_enabled, "back to the value before");
+        assert_eq!(s.oc_power_w, Settings::default().oc_power_w);
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn apply_overclock_without_a_card_says_why() {
+        let f = fake_service(test_marker("nocard"), Settings::default());
+        f.shared.update(|l| l.card_subsystem = None);
+        let report = apply_now(&f.shared, power_520());
+        assert!(!report.results.is_empty() && report.results.iter().all(|r| !r.ok), "{report:?}");
+        assert!(report.results[0].message.contains("no card connected"), "{report:?}");
+        // Saved anyway: the start-up apply or the next Apply now writes it once the card is there.
+        assert!(f.shared.settings().oc_power_enabled);
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn saving_other_settings_never_touches_the_gpu() {
+        let f = fake_service(test_marker("other"), Settings::default());
+        let changes = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        let Response::Applied { failures } = f.shared.handle(Request::Apply { changes }) else {
+            panic!("not an apply answer")
+        };
+        assert!(failures.is_empty(), "{failures:?}");
+        // Even an oc_* key saved through the Settings path only saves.
+        let Response::Applied { failures } = f.shared.handle(Request::Apply { changes: power_520() }) else {
+            panic!("not an apply answer")
+        };
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0, "the GPU was not even opened");
+    }
+
+    fn status(shared: &Shared) -> OcStatus {
+        let Response::OverclockStatus { status } = shared.handle(Request::OverclockStatus) else {
+            panic!("not a status answer")
+        };
+        status
+    }
+
+    #[test]
+    fn the_status_request_opens_the_gpu_once_per_card() {
+        let f = fake_service(test_marker("status"), Settings::default());
+        f.shared.update(|l| l.card_subsystem = None);
+        let st = status(&f.shared);
+        assert!(!st.available);
+        assert!(st.reason.contains("no card connected"), "{st:?}");
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+
+        f.shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        let st = status(&f.shared);
+        assert!(st.available, "{st:?}");
+        assert_eq!(st.power_w, Some(600));
+        status(&f.shared);
+        assert_eq!(f.opened.load(Ordering::SeqCst), 1, "kept open for the same card");
+
+        // Another card after a reconnect gets its own overclocker.
+        f.shared.update(|l| l.card_subsystem = Some(0x12345678));
+        status(&f.shared);
+        assert_eq!(f.opened.load(Ordering::SeqCst), 2);
+        assert!(f.gpu.calls().is_empty(), "a status only reads: {:?}", f.gpu.calls());
+    }
+
+    #[test]
+    fn a_gpu_that_will_not_open_is_reported_not_fatal() {
+        let marker = test_marker("noopen");
+        let shared = Shared::with_overclock_factory(
+            Settings::default(),
+            marker,
+            Box::new(|_| Err("NVML not found".to_string())),
+        );
+        shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        let st = status(&shared);
+        assert!(!st.available && st.reason == "NVML not found", "{st:?}");
+        let report = apply_now(&shared, power_520());
+        assert!(report.results[0].message.contains("NVML not found"), "{report:?}");
+    }
+
+    #[test]
+    fn a_slow_overclock_call_on_the_monitor_thread_is_noted() {
+        assert_eq!(slow_call_note("Apply now", std::time::Duration::from_millis(250)), None);
+        let note = slow_call_note("the start-up apply", std::time::Duration::from_millis(1830)).unwrap();
+        assert!(note.contains("the start-up apply") && note.contains("1830 ms"), "{note}");
+    }
+
+    #[test]
+    fn a_failed_open_is_logged_once_per_error() {
+        let f = fake_service(test_marker("openlog"), Settings::default());
+        assert!(f.shared.note_open_result(Some("NVML not found")));
+        assert!(!f.shared.note_open_result(Some("NVML not found")), "the same error again: quiet");
+        assert!(f.shared.note_open_result(Some("no GPU with subsystem 0x89E31043")), "a new error is logged");
+        f.shared.note_open_result(None);
+        assert!(f.shared.note_open_result(Some("NVML not found")), "an open in between re-arms it");
+    }
+
+    /// Fresh marker and config.ini paths for `name`.
+    fn oc_files(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cfg = std::env::temp_dir().join(format!("ag-svc-oc-{}-{name}.ini", std::process::id()));
+        let _ = fs::remove_file(&cfg);
+        (test_marker(name), cfg)
+    }
+
+    /// A service whose overclocker reads and writes the driver checks in `cfg`, as the real one
+    /// does in config.ini; the undervolt ticked.
+    fn service_on(gpu: &FakeGpu, marker: &std::path::Path, cfg: &std::path::Path) -> Arc<Shared> {
+        let (g, m, c) = (gpu.clone(), marker.to_path_buf(), cfg.to_path_buf());
+        let factory = move |_: u32| -> Result<Box<dyn OcDriver + Send>, String> {
+            let (verified, failed) = (config::load_oc_verified(&c), config::load_oc_vf_failed(&c));
+            Ok(Box::new(Overclocker::new(g.clone(), m.clone(), verified, failed)))
+        };
+        let settings = Settings { oc_uv_enabled: true, ..Settings::default() };
+        let shared =
+            Shared::with_overclock_config(settings, marker.to_path_buf(), Box::new(factory), cfg.to_path_buf());
+        shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        shared
+    }
+
+    fn apply_on_the_loop(shared: &Shared) -> OcReport {
+        let s = shared.settings();
+        match shared.try_overclock("test", |d| d.apply(&s, false)) {
+            OcAccess::Ran(r) => r,
+            _ => panic!("the overclocker did not run"),
+        }
+    }
+
+    #[test]
+    fn a_probe_mismatch_is_saved_and_a_later_run_does_not_probe_again() {
+        let gpu = FakeGpu::owners();
+        gpu.state().driver = "621.01".into();
+        gpu.state().delta_not_effective = true;
+        let (marker, cfg) = oc_files("failed-saved");
+        let shared = service_on(&gpu, &marker, &cfg);
+        assert!(apply_on_the_loop(&shared).results.iter().all(|r| !r.ok));
+        assert_eq!(config::load_oc_vf_failed(&cfg).as_deref(), Some("621.01"));
+        assert_eq!(config::load_oc_verified(&cfg), None);
+        // A restart: a new service on the same config.ini.
+        let shared = service_on(&gpu, &marker, &cfg);
+        gpu.clear_calls();
+        let r = apply_on_the_loop(&shared);
+        assert!(r.results.iter().all(|r| !r.ok), "{r:?}");
+        assert!(gpu.calls().is_empty(), "no test write on a known-bad driver: {:?}", gpu.calls());
+        let _ = fs::remove_file(&cfg);
+        let _ = fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn a_probe_call_error_is_not_saved() {
+        let gpu = FakeGpu::owners();
+        gpu.state().driver = "621.01".into();
+        gpu.state().curve_write_error = true;
+        let (marker, cfg) = oc_files("failed-call");
+        let shared = service_on(&gpu, &marker, &cfg);
+        assert!(apply_on_the_loop(&shared).results.iter().all(|r| !r.ok));
+        assert_eq!(config::load_oc_vf_failed(&cfg), None);
+        let _ = fs::remove_file(&cfg);
+        let _ = fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn managed_settings_come_from_the_marker_without_opening_the_gpu() {
+        let marker = test_marker("managed");
+        let gpu = FakeGpu::owners();
+        Overclocker::new(gpu.clone(), marker.clone(), None, None)
+            .apply(&Settings { oc_power_enabled: true, ..Settings::default() }, false);
+        let f = fake_service(marker, Settings::default());
+        assert_eq!(f.shared.overclock_managed(), vec!["power".to_string()]);
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+        f.shared.update(|l| l.card_subsystem = Some(0x12345678));
+        assert!(f.shared.overclock_managed().is_empty(), "another card's marker says nothing here");
     }
 }

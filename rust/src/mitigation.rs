@@ -230,6 +230,25 @@ impl Nvml {
         Ok((o.clock_offset_mhz, o.min_clock_offset_mhz, o.max_clock_offset_mhz))
     }
 
+    /// The highest memory clock of P0 (the clock at full load), MHz, offset included.
+    /// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): the max of
+    /// `nvmlDeviceGetMinMaxClockOfPState` reads 14001 stock and 16001 with an NVML memory
+    /// offset of +4000.
+    pub(crate) fn p0_max_mem_clock_mhz(&self, h: Handle) -> Result<u32, String> {
+        let (mut lo, mut hi) = (0u32, 0u32);
+        call!(
+            self,
+            "nvmlDeviceGetMinMaxClockOfPState",
+            unsafe extern "C" fn(Handle, i32, i32, *mut u32, *mut u32) -> i32,
+            h,
+            NVML_CLOCK_MEM,
+            NVML_PSTATE_0,
+            &mut lo,
+            &mut hi
+        );
+        Ok(hi)
+    }
+
     pub(crate) fn set_clock_offset(&self, h: Handle, clock_type: i32, mhz: i32) -> Result<(), String> {
         let mut o = NvmlClockOffset::request(clock_type);
         o.clock_offset_mhz = mhz;

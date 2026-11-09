@@ -41,6 +41,7 @@ session alive. It **shuts the machine down** only if that is not enough.
 - [How it protects](#how-it-protects)
 - [Architecture](#architecture)
 - [The dashboard and tray](#the-dashboard-and-tray)
+- [Overclock](#overclock)
 - [Configuration](#configuration)
 - [Files, logs and events](#files-logs-and-events)
 - [Command line](#command-line)
@@ -285,14 +286,15 @@ documented driver API.
 ## The dashboard and tray
 
 <p align="center">
-  <img src="docs/screenshots/imu.png" width="49%" alt="IMU tab: bubble level, tilt per axis, sag">
+  <img src="docs/screenshots/imu.png" width="49%" alt="Anti-sag tab: bubble level, tilt per axis, sag">
   <img src="docs/screenshots/settings.png" width="49%" alt="Settings tab">
 </p>
 
-- **Live**: a thermal-camera style view of the plug (colour = current, scaled to the
+- **Overview**: a thermal-camera style view of the plug (colour = current, scaled to the
   thresholds), max / min / delta / total power, average voltage, response state,
   imbalance and sag, and five minutes of history.
-- **IMU**: bubble level, the card's angle on each axis, sag against the calibrated
+- **Overclock**: an optional undervolt, power limit and memory offset ([below](#overclock)).
+- **Anti-sag**: bubble level, the card's angle on each axis, sag against the calibrated
   position, and a minute of history. **Calibrate** sets the reference.
 - **Settings**: every protection value (checked, and confirmed when it weakens
   protection), response mode, autostart, theme, window behaviour, update check.
@@ -301,6 +303,56 @@ documented driver API.
 The **tray icon** is a dot in the status colour. Its menu: **Open Dashboard**, **Open
 Log**, **Pause / Resume** monitoring, **Exit**. Pausing is visible everywhere and reminds
 you every 30 minutes.
+
+## Overclock
+
+The **Overclock** tab is optional and separate from protection. It can set three things, each
+with its own tick box: an **undervolt** (the clock the card runs at a range of voltages), a
+**power limit** in watts, and a **memory offset**. A setting that is not ticked is never
+touched.
+
+- **Undervolt**: raises the V/F curve between two voltages so the card reaches the target
+  clock at a lower voltage. It uses NVIDIA's undocumented NVAPI curve calls. Before the first
+  curve write on each driver version, AstralGuard writes 15 MHz to one point in
+  the middle of the curve, reads the whole curve back (the offsets and, separately, the clocks the driver
+  reports), checks that only that point moved, and restores it. If that check fails, only the
+  undervolt is switched off, and it stays off on that driver version. Any
+  per-point offset beyond ±1000 MHz is refused, not clamped. It is also refused while a core
+  clock offset is set outside AstralGuard. The probe writes 15 MHz because the driver does not
+  apply a 5 MHz offset. The driver applies the target exactly in its reported curve (2827 MHz
+  reported on the owner's card). With the owner's undervolt applied, the driver also raised the
+  two points just below From to smooth the jump (810 mV and 815 mV) while their offsets stayed 0.
+- **Power limit**: the board power limit in watts, through NVML.
+- **Memory offset**: in Afterburner units. AstralGuard sends twice the number to the driver,
+  so `2000` here is what the driver calls `4000`.
+
+AstralGuard records what it changed, the value it applied and the value from before in
+`overclock.active`, next to `mitigation.active`. Unticking a setting puts back the value from
+before, only for a setting AstralGuard applied itself, and only while the card still runs the
+value AstralGuard applied: after a reboot, or a change by another tool, the card's current
+value is left as is. A marker written for another card is ignored.
+
+**Apply now** saves and writes in one step, and it changes only the overclock settings. While
+the guard is limiting the GPU it is refused and nothing is saved; if the guard starts limiting
+between the save and the write, the settings stay saved and are applied when the guard releases
+the GPU. It runs on the service's monitor thread, so it never overlaps the guard's own limit.
+At start the saved settings are applied once, after `oc_apply_delay_seconds`; if the GPU is
+limited by then, or cannot be opened, the service waits and retries every 30 s. After every
+release from limiting, the saved settings are applied again (values already in effect are not
+rewritten). The same goes for a resume from sleep, after the same delay: the driver puts the
+power limit back to stock when the machine wakes up. With nothing ticked and nothing managed, AstralGuard makes no NVML or NVAPI calls
+for the overclock at all, and the tab reads the GPU only while it is open.
+
+Because these calls run on the monitor thread, the pin reads wait for them. Every overclock
+call there that takes longer than 250 ms is logged as a warning with its duration, and the
+dashboard shows **Guard loop not responding** when the monitor loop has not moved for more
+than 5 s.
+
+Quitting AstralGuard leaves the overclock in place; the driver drops it at reboot. If the
+guard trips while an overclock is active, the log and the flight dump say so.
+
+The NVAPI curve layouts were verified on Linux (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06). The
+Windows overclock path is **unverified**.
 
 ## Configuration
 
@@ -329,9 +381,21 @@ hand, stop the guard first.
 | `sag_sustained_seconds` | `60` | How long the tilt must hold |
 | `sag_card_length_mm` | `0` | For the mm figure; `0` = the detected card's spec |
 | `sensor_auto_scan` | `false` | Linux: scan for the pin monitor by itself when the card is found but its pins stop reading, once each time (not at every start) |
+| `oc_uv_enabled` | `false` | Overclock: apply the undervolt |
+| `oc_uv_from_mv` / `oc_uv_to_mv` | `820` / `895` | Voltage range the undervolt covers (mV) |
+| `oc_uv_target_mhz` | `2827` | Clock the card should reach across that range |
+| `oc_power_enabled` | `false` | Overclock: apply the power limit |
+| `oc_power_w` | `520` | The power limit (W) |
+| `oc_mem_enabled` | `false` | Overclock: apply the memory offset |
+| `oc_mem_offset_mhz` | `2000` | Memory offset in Afterburner units (the driver gets twice this) |
+| `oc_apply_delay_seconds` | `30` | Wait after the service starts, or the machine wakes up, before applying the overclock |
 
 The sag baseline (`sag_baseline`, `sag_baseline_subsystem`) is written by **Calibrate** and
-re-taken automatically when a different card is installed.
+re-taken automatically when a different card is installed. `oc_vf_verified_driver` is written
+by the service after the undervolt's compatibility check passes, so the check runs again only
+after a driver update. `oc_vf_failed_driver` is written when the check finds a write landing
+in the wrong place: on that driver version the check does not run again and the undervolt stays
+off until a driver update (or until the key is removed).
 
 Window preferences (theme, size, which tab, pin order) are kept per user in
 `%APPDATA%\AstralGuard\ui.json` / `~/.config/astralguard/ui.json`.
@@ -360,6 +424,7 @@ source *AstralGuard*):
 | 3001 / 3002 | Pin over the threshold / still over |
 | 4001 | Load cleared, timer reset |
 | 6001 | Critical current (tier 2) |
+| 9001 | Error: the monitor loop or an overclock step panicked (the guard carries on) |
 | 5090 | Emergency shutdown |
 | 5091 | The last shutdown was an emergency stop (reported at the next start) |
 
