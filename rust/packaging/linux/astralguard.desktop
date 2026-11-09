@@ -1,0 +1,13 @@
+[Desktop Entry]
+# Wayland gives a window its icon through the .desktop file named like its app id
+# ("astralguard", set in ui/mod.rs); without this file KDE shows a generic icon.
+# Hidden from menus: the tray (autostart) opens the dashboard.
+Type=Application
+Name=AstralGuard
+Comment=Dashboard for the AstralGuard 12V-2x6 current guard
+Exec=/usr/bin/astralguard ui --show
+Icon=astralguard
+Terminal=false
+Categories=System;Monitor;
+StartupWMClass=astralguard
+NoDisplay=true

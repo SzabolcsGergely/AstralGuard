@@ -1,13 +1,19 @@
-//! The tray icon. It lives on its own thread with its own message loop (Win32 on Windows,
-//! GTK on Linux), so it keeps working while the dashboard window is hidden and eframe is
-//! not running frames. It reads the worker's snapshot and talks to the window through
-//! the action queue plus a direct show (Windows) and a repaint request.
+//! The tray icon. It lives on its own thread, so it keeps working while the dashboard
+//! window is hidden or closed. It reads the worker's snapshot and talks to the window
+//! through the action queue plus a direct show (Windows) and a repaint request.
+//!
+//! Windows: tray-icon with a Win32 message loop. Linux: a StatusNotifierItem over D-Bus
+//! (ksni), because tray-icon's Linux backend (libayatana-appindicator) has no left-click
+//! event: any click opened the menu. SNI's Activate is the left click (open the
+//! dashboard), its ContextMenu the right click. VERIFIED (2026-11-09, KDE Plasma 6.8).
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+#[cfg(windows)]
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+#[cfg(windows)]
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::backend::{Job, Link};
@@ -140,6 +146,7 @@ pub fn dot_rgba(rgb: [u8; 3], size: u32) -> Vec<u8> {
     out
 }
 
+#[cfg(windows)]
 fn icon_for(status: Status) -> Option<Icon> {
     Icon::from_rgba(dot_rgba(status.color(), 32), 32, 32).ok()
 }
@@ -163,6 +170,7 @@ pub fn spawn(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) -> TrayH
     TrayHandle { thread }
 }
 
+#[cfg(windows)]
 struct Items {
     tray: TrayIcon,
     pause: MenuItem,
@@ -172,6 +180,7 @@ struct Items {
     ticks: u32,
 }
 
+#[cfg(windows)]
 fn build(link: &Arc<Link>, actions: &Actions, hwnd: &Arc<AtomicIsize>) -> Option<Items> {
     let menu = Menu::new();
     let version = MenuItem::new(format!("{APP_NAME} v{APP_VERSION}"), false, None);
@@ -253,6 +262,7 @@ fn open_log(link: &Link, actions: &Actions, hwnd: &AtomicIsize) {
 }
 
 /// Once per tick: icon, tooltip and the Pause/Resume label from the latest snapshot.
+#[cfg(windows)]
 fn refresh(link: &Link, it: &mut Items) {
     let (live, connected) = link.live();
     let status = icon_status(live.as_deref(), connected);
@@ -313,28 +323,132 @@ fn run(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) {
     drop(items); // removes the icon
 }
 
-/// Linux: tray-icon needs GTK initialised and its main loop running on this thread.
-/// Not built or tested on Linux yet.
+/// Linux: the StatusNotifierItem. Left click opens the dashboard, right click the menu.
 #[cfg(target_os = "linux")]
-fn run(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) {
-    use gtk::glib;
-    if gtk::init().is_err() {
-        return;
+struct Sni {
+    link: Arc<Link>,
+    actions: Actions,
+    status: Status,
+    tip: String,
+    paused: bool,
+    connected: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Sni {
+    fn act(&self, a: TrayAction) {
+        act(&self.link, &self.actions, &AtomicIsize::new(0), a);
     }
-    let Some(items) = build(&link, &actions, &hwnd) else { return };
-    let items = std::rc::Rc::new(std::cell::RefCell::new(items));
-    glib::timeout_add_local(std::time::Duration::from_millis(1000), move || {
-        if link.quit.load(Ordering::Relaxed) {
-            gtk::main_quit();
-            return glib::ControlFlow::Break;
+
+    /// The snapshot's view, so `update` only redraws on a change.
+    fn state(link: &Link) -> (Status, String, bool, bool) {
+        let (live, connected) = link.live();
+        let status = icon_status(live.as_deref(), connected);
+        let tip = tray_tooltip(live.as_deref(), connected);
+        (status, tip, live.as_ref().is_some_and(|l| l.paused), connected)
+    }
+}
+
+/// RGBA -> the ARGB32 (network byte order) SNI wants.
+#[cfg(target_os = "linux")]
+fn argb(rgba: Vec<u8>) -> Vec<u8> {
+    let mut data = rgba;
+    for px in data.as_chunks_mut::<4>().0 {
+        px.rotate_right(1);
+    }
+    data
+}
+
+#[cfg(target_os = "linux")]
+impl ksni::Tray for Sni {
+    fn id(&self) -> String {
+        "astralguard".into()
+    }
+
+    fn title(&self) -> String {
+        APP_NAME.into()
+    }
+
+    fn category(&self) -> ksni::Category {
+        ksni::Category::Hardware
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        [22u32, 32, 48]
+            .iter()
+            .map(|&s| ksni::Icon { width: s as i32, height: s as i32, data: argb(dot_rgba(self.status.color(), s)) })
+            .collect()
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip { title: APP_NAME.into(), description: self.tip.clone(), ..Default::default() }
+    }
+
+    /// Left click.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.act(TrayAction::Open);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        let item = |label: &str, enabled: bool, f: fn(&mut Sni)| -> ksni::MenuItem<Self> {
+            StandardItem { label: label.into(), enabled, activate: Box::new(f), ..Default::default() }.into()
+        };
+        vec![
+            item(&format!("{APP_NAME} v{APP_VERSION}"), false, |_| {}),
+            ksni::MenuItem::Separator,
+            item("Open Dashboard", true, |t| t.act(TrayAction::Open)),
+            item("Open Log", true, |t| open_log(&t.link, &t.actions, &AtomicIsize::new(0))),
+            ksni::MenuItem::Separator,
+            item(if self.paused { "Resume" } else { "Pause" }, self.connected, |t| {
+                if t.paused {
+                    t.link.send(Job::SetPaused(false));
+                } else {
+                    t.act(TrayAction::ConfirmPause);
+                }
+            }),
+            item("Exit", true, |t| t.act(TrayAction::ConfirmExit)),
+        ]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run(link: Arc<Link>, actions: Actions, _hwnd: Arc<AtomicIsize>) {
+    use ksni::blocking::TrayMethods;
+    let (status, tip, paused, connected) = Sni::state(&link);
+    let sni = Sni { link: link.clone(), actions, status, tip, paused, connected };
+    // The tray process may start before the desktop's tray host does (autostart).
+    let handle = match sni.assume_sni_available(true).spawn() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("astralguard ui: no tray icon ({e})");
+            return;
         }
-        refresh(&link, &mut items.borrow_mut());
-        glib::ControlFlow::Continue
-    });
-    gtk::main();
+    };
+    while !link.quit.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let now = Sni::state(&link);
+        handle.update(|t| {
+            if (t.status, &t.tip, t.paused, t.connected) != (now.0, &now.1, now.2, now.3) {
+                (t.status, t.tip, t.paused, t.connected) = now.clone();
+            }
+        });
+    }
+    handle.shutdown().wait();
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn run(_link: Arc<Link>, _actions: Actions, _hwnd: Arc<AtomicIsize>) {
     // TODO: macOS needs the tray on the main thread; not a target for now.
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sni_pixels_are_argb() {
+        // red, half transparent -> alpha first
+        assert_eq!(argb(vec![0xFF, 0x00, 0x00, 0x80, 1, 2, 3, 4]), vec![0x80, 0xFF, 0x00, 0x00, 4, 1, 2, 3]);
+    }
 }

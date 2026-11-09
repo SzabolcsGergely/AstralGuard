@@ -10,7 +10,7 @@ repository = "https://github.com/SzabolcsGergely/AstralGuard"
 [features]
 default = ["ui"]
 # The tray and dashboard. Off builds a headless service only (e.g. a Linux server).
-ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:gtk", "dep:ureq", "dep:native-tls"]
+ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:ksni", "dep:ureq", "dep:native-tls"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,7 +19,6 @@ libloading = "0.8"
 chrono = "0.4"
 interprocess = "2.2"
 eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow"] }
-tray-icon = { version = "0.19", optional = true }
 # the dashboard's PNG screenshots (--screenshot) and the window handle for the tray
 png = { version = "0.18", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
@@ -29,6 +28,8 @@ ureq = { version = "2.12", optional = true, default-features = false, features =
 native-tls = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+# The tray on Windows. Linux uses ksni instead (see ui/tray.rs).
+tray-icon = { version = "0.19", optional = true }
 # Not tauri-winrt-notification: linking it made every binary crash at startup on the
 # GNU toolchain. Toasts go through the windows crate's WinRT bindings instead.
 windows = { version = "0.58", features = [
@@ -53,12 +54,15 @@ libc = "0.2"
 
 # UI on Linux: the service there cannot reach the desktop, so the UI shows its notices
 # (on Windows notify-rust would pull in tauri-winrt-notification, which crashes the GNU
-# build; the service raises toasts itself there). The tray needs GTK, eframe X11/Wayland.
+# build; the service raises toasts itself there). eframe needs X11/Wayland.
 [target.'cfg(not(windows))'.dependencies]
 notify-rust = { version = "4", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = { version = "0.18", optional = true }
+# The tray on Linux: StatusNotifierItem over D-Bus directly. tray-icon goes through
+# libayatana-appindicator, which has no left-click event (any click opens the menu);
+# SNI has Activate (left click) and ContextMenu (right click).
+ksni = { version = "0.3", optional = true, default-features = false, features = ["blocking", "async-io"] }
 eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 
 [profile.release]
@@ -80,8 +84,8 @@ and shuts the machine down as a last resort. Runs as a root systemd service with
 icon and dashboard for the desktop user."""
 section = "admin"
 priority = "optional"
-# libayatana-appindicator3 is loaded at runtime by the tray, so dpkg-shlibdeps cannot see it.
-depends = "$auto, libayatana-appindicator3-1"
+# The window's libraries are loaded at runtime (winit, glutin), so dpkg-shlibdeps cannot see them.
+depends = "$auto, libxkbcommon0, libwayland-client0, libegl1"
 recommends = "kmod"
 # The astralguard group is created in postinst (works on releases without systemd-sysusers).
 maintainer-scripts = "packaging/linux/debian/"
@@ -90,6 +94,7 @@ assets = [
     ["target/release/astralguard", "usr/bin/", "755"],
     ["packaging/linux/modules-load.conf", "usr/lib/modules-load.d/astralguard.conf", "644"],
     ["packaging/linux/astralguard-ui.desktop", "etc/xdg/autostart/astralguard-ui.desktop", "644"],
+    ["packaging/linux/astralguard.desktop", "usr/share/applications/astralguard.desktop", "644"],
     ["assets/icon/astralguard.svg", "usr/share/icons/hicolor/scalable/apps/astralguard.svg", "644"],
     ["assets/icon/astralguard-256.png", "usr/share/icons/hicolor/256x256/apps/astralguard.png", "644"],
     ["../README.md", "usr/share/doc/astralguard/README.md", "644"],

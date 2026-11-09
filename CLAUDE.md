@@ -28,7 +28,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
     flight.rs             last minute of samples, dumped when the guard acts
     crosscheck.rs         observational comparison with HWiNFO, never decides anything
   src/platform/           windows.rs / linux.rs: elevation, toasts, event log, shutdown, autostart
-  src/ui/                 tray + egui dashboard (feature "ui"); demo.rs = simulated service
+  src/ui/                 tray + egui dashboard (feature "ui"); demo.rs = simulated service;
+                          host.rs = Linux tray process that starts the window as `ui --window`
   build.rs                Windows: embeds the icon + version info (writes a .res itself)
   assets/icon/            icon sources (SVG), render.py, the generated .ico / PNGs
   packaging/windows/      Inno Setup script for the setup .exe
@@ -48,15 +49,14 @@ Install Rust from <https://rustup.rs>, then the system libraries the tray and wi
 Debian / Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libssl-dev libgtk-3-dev libxdo-dev \
-  libayatana-appindicator3-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev \
+sudo apt install build-essential pkg-config libssl-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev \
   libxcb-xfixes0-dev libwayland-dev
 ```
 
 Arch:
 
 ```sh
-sudo pacman -S --needed base-devel rust pkgconf gtk3 libayatana-appindicator xdotool openssl
+sudo pacman -S --needed base-devel rust pkgconf openssl libxkbcommon wayland libglvnd
 ```
 
 Then:

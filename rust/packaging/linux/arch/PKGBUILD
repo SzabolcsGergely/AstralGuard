@@ -9,7 +9,8 @@ pkgdesc="Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs (service, tray i
 arch=('x86_64')
 url="https://github.com/SzabolcsGergely/AstralGuard"
 license=('MIT')
-depends=('gcc-libs' 'glibc' 'gtk3' 'libayatana-appindicator' 'openssl' 'xdotool')
+# The window's libraries are loaded at runtime (winit, glutin), so name them here.
+depends=('gcc-libs' 'glibc' 'openssl' 'libxkbcommon' 'wayland' 'libglvnd')
 makedepends=('cargo' 'pkgconf')
 optdepends=('nvidia-utils: NVML clock and power limits (mitigation)')
 install=astralguard.install
@@ -44,6 +45,7 @@ package() {
     install -Dm644 "$lin/sysusers.conf" "$pkgdir/usr/lib/sysusers.d/astralguard.conf"
     install -Dm644 "$lin/modules-load.conf" "$pkgdir/usr/lib/modules-load.d/astralguard.conf"
     install -Dm644 "$lin/astralguard-ui.desktop" "$pkgdir/etc/xdg/autostart/astralguard-ui.desktop"
+    install -Dm644 "$lin/astralguard.desktop" "$pkgdir/usr/share/applications/astralguard.desktop"
     install -Dm644 rust/assets/icon/astralguard.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/astralguard.svg"
     install -Dm644 rust/assets/icon/astralguard-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/astralguard.png"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

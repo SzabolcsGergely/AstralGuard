@@ -17,6 +17,8 @@
 
 mod backend;
 mod demo;
+#[cfg(target_os = "linux")]
+mod host;
 mod imu;
 mod live;
 mod log;
@@ -94,6 +96,10 @@ struct Opts {
     demo: bool,
     offline: bool,
     no_sensor: bool,
+    /// Linux: this process is the dashboard window only (see host.rs).
+    window: bool,
+    /// The tray click that opened this window (host.rs `action_key`).
+    action: Option<String>,
     phase: Option<f64>,
     screenshot: Option<String>,
     tab: Option<String>,
@@ -113,6 +119,8 @@ impl Opts {
                 "--demo" => o.demo = true,
                 "--offline" => o.offline = true,
                 "--no-sensor" => o.no_sensor = true,
+                "--window" => o.window = true,
+                "--action" => o.action = it.next().cloned(),
                 "--phase" => o.phase = it.next().and_then(|v| v.parse().ok()),
                 "--screenshot" => o.screenshot = it.next().cloned(),
                 "--tab" => o.tab = it.next().cloned(),
@@ -189,6 +197,13 @@ fn app_icon_rgba(size: u32) -> Option<Vec<u8>> {
 pub fn run(args: &[String]) -> i32 {
     let opts = Opts::parse(args);
     let shot = opts.screenshot.is_some();
+    // Linux: the tray process, which starts the window as its own process when wanted.
+    #[cfg(target_os = "linux")]
+    if !opts.window && !opts.demo && !shot {
+        return host::run(opts.show);
+    }
+    // The window process: closing it ends it, the tray process carries on.
+    let window_process = opts.window;
 
     // `--show` is a user asking for the window: bring up the running one at once. Without
     // it this is the watchdog's dashboard, and a running one may just be still exiting.
@@ -207,9 +222,12 @@ pub fn run(args: &[String]) -> i32 {
     if let Some(tab) = &opts.tab {
         prefs.last_tab = tab.clone();
     }
-    let visible = shot || opts.show || opts.demo || prefs.show_on_start;
+    let visible = shot || opts.show || opts.demo || window_process || prefs.show_on_start;
 
     let link = Link::new();
+    if window_process {
+        link.notices.store(false, Ordering::Relaxed);
+    }
     let backend: Box<dyn Backend> = if opts.demo {
         Box::new(demo::Demo::new(opts.phase.unwrap_or(52.0), opts.offline, opts.no_sensor))
     } else {
@@ -265,13 +283,24 @@ pub fn run(args: &[String]) -> i32 {
             }
             backend::start(link2.clone(), backend);
             let actions: tray::Actions = Arc::new(Mutex::new(Vec::new()));
-            if !shot {
+            if window_process {
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(a) = opts.action.as_deref().and_then(host::parse_action) {
+                        actions.lock().unwrap().push(a);
+                    }
+                    host::listen_for_actions(link2.clone(), actions.clone());
+                }
+            } else if !shot {
                 *th.lock().unwrap() = Some(tray::spawn(link2.clone(), actions.clone(), hwnd.clone()));
             }
             let check = prefs.check_updates && !opts.demo && !shot;
-            let updates = update::Updates::spawn(ctx.clone(), check, notify_update);
+            // In a window process the tray process notifies; the banner still shows here.
+            let notify: fn(&str) = if window_process { |_| {} } else { notify_update };
+            let updates = update::Updates::spawn(ctx.clone(), check, notify);
             let mut app = App::new(ctx, link2, actions, hwnd, prefs, opts, visible, saved_pos);
             app.updates = Some(updates);
+            app.close_quits = window_process;
             Ok(Box::new(app))
         }),
     );
@@ -280,6 +309,8 @@ pub fn run(args: &[String]) -> i32 {
         t.join();
     }
     match result {
+        #[cfg(target_os = "linux")]
+        Ok(()) if link.guard_stopped.load(Ordering::Relaxed) => host::EXIT_GUARD_STOPPED,
         Ok(()) => 0,
         Err(e) => {
             eprintln!("astralguard ui: {e}");
@@ -341,6 +372,8 @@ struct App {
     scanning: bool,
     /// The scan popup's "scan automatically next time" toggle.
     scan_auto: bool,
+    /// This process is only the window (Linux): closing it quits instead of hiding.
+    close_quits: bool,
     shot: Option<Shot>,
     live: Option<Arc<Live>>,
     connected: bool,
@@ -409,6 +442,7 @@ impl App {
             flash: None,
             scanning: false,
             scan_auto: false,
+            close_quits: false,
             shot: opts.screenshot.map(|path| Shot { path, ready_frames: 0, requested: false }),
             live: None,
             connected: false,
@@ -511,7 +545,10 @@ impl App {
             }
             self.log.on_done(&job, &result);
             match (&job, &result) {
-                (Job::Exit, _) => self.quit(ctx),
+                (Job::Exit, _) => {
+                    self.link.guard_stopped.store(true, Ordering::Relaxed);
+                    self.quit(ctx);
+                }
                 (Job::SetPaused(_) | Job::ImuFast(_) | Job::Calibrate, Err(e)) => {
                     self.flash = Some((e.clone(), Instant::now()));
                 }
@@ -576,12 +613,18 @@ impl App {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.prefs.close_action == "exit" {
                 self.confirm = Some(Confirm::Exit);
+            } else if self.close_quits {
+                self.quit(ctx);
             } else if self.shot.is_none() {
                 self.hide_window(ctx);
             }
         }
         if self.prefs.minimize_to_tray && self.shown && ctx.input(|i| i.viewport().minimized) == Some(true) {
-            self.hide_window(ctx);
+            if self.close_quits {
+                self.quit(ctx);
+            } else {
+                self.hide_window(ctx);
+            }
         }
         self.link.window_visible.store(self.shown, Ordering::Relaxed);
         self.link.fast.store(self.tab == Tab::Imu, Ordering::Relaxed);
