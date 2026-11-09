@@ -27,7 +27,37 @@ pub struct Demo {
     baseline: [f64; 3],
     autostart: bool,
     rng: u64,
+    oc: DemoOc,
 }
+
+/// The simulated GPU's overclock state: what AstralGuard has written.
+struct DemoOc {
+    managed: Vec<String>,
+    deltas_khz: Vec<i32>,
+    power_w: u32,
+    mem_ab: i32,
+}
+
+/// The owner's stock V/F curve, (mV, MHz).
+const OC_STOCK: [(f32, f32); 13] = [
+    (700.0, 225.0),
+    (770.0, 247.0),
+    (800.0, 675.0),
+    (810.0, 757.0),
+    (815.0, 847.0),
+    (820.0, 930.0),
+    (850.0, 1365.0),
+    (895.0, 1965.0),
+    (900.0, 2047.0),
+    (950.0, 2655.0),
+    (1000.0, 2820.0),
+    (1100.0, 3022.0),
+    (1240.0, 3232.0),
+];
+const OC_STOCK_W: u32 = 600;
+const OC_POWER_RANGE: (u32, u32) = (400, 600);
+const OC_MEM_RANGE: (i32, i32) = (-1000, 3000);
+const OC_LIVE_MV: f32 = 940.0;
 
 fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -50,7 +80,13 @@ impl Demo {
             baseline: [-0.00929, -0.00806, 0.99992],
             autostart: true,
             rng: 0x9E37_79B9_7F4A_7C15,
+            oc: DemoOc { managed: Vec::new(), deltas_khz: Vec::new(), power_w: OC_STOCK_W, mem_ab: 0 },
         };
+        // the owner's profile, ticked and already applied, so the Overclock tab has something to show
+        d.settings.oc_uv_enabled = true;
+        d.settings.oc_power_enabled = true;
+        d.settings.oc_mem_enabled = true;
+        let _ = d.oc_apply();
         // five minutes of history, so the chart is not empty
         for i in 0..600 {
             let ts = t - 300.0 + i as f64 * 0.5;
@@ -64,6 +100,139 @@ impl Demo {
             d.imu.push_back((d.imu_last, xyz[0], xyz[1], xyz[2]));
         }
         d
+    }
+
+    fn oc_points() -> Vec<crate::overclock::curve::RawPoint> {
+        OC_STOCK
+            .iter()
+            .map(|&(mv, mhz)| crate::overclock::curve::RawPoint {
+                volt_uv: (mv * 1000.0).round() as u32,
+                freq_khz: (mhz * 1000.0).round() as u32,
+                delta_khz: 0,
+                memory: false,
+            })
+            .collect()
+    }
+
+    /// Write the ticked settings to the simulated GPU and put the unticked ones back.
+    fn oc_apply(&mut self) -> OcReport {
+        let s = self.settings.clone();
+        let mut results = Vec::new();
+        let mut res = |setting: &str, ok: bool, message: String| {
+            results.push(OcResult { setting: setting.into(), ok, message });
+        };
+        let managed = |oc: &DemoOc, k: &str| oc.managed.iter().any(|m| m == k);
+        if s.oc_uv_enabled {
+            match crate::overclock::curve::plan_undervolt(
+                &Self::oc_points(),
+                s.oc_uv_from_mv,
+                s.oc_uv_to_mv,
+                s.oc_uv_target_mhz,
+                1000,
+            ) {
+                Ok(plan) => {
+                    self.oc.deltas_khz = plan.deltas_khz.iter().map(|d| d.1).collect();
+                    if !managed(&self.oc, "undervolt") {
+                        self.oc.managed.push("undervolt".into());
+                    }
+                    res(
+                        "undervolt",
+                        true,
+                        format!(
+                            "Undervolt written: {:+} MHz on {}-{} mV",
+                            plan.offset_mhz,
+                            config::g(s.oc_uv_from_mv),
+                            config::g(s.oc_uv_to_mv)
+                        ),
+                    );
+                }
+                Err(e) => res("undervolt", false, e),
+            }
+        } else if managed(&self.oc, "undervolt") {
+            self.oc.deltas_khz.clear();
+            self.oc.managed.retain(|m| m != "undervolt");
+            res("undervolt", true, "Stock curve restored".into());
+        }
+        if s.oc_power_enabled {
+            let w = s.oc_power_w.round();
+            if w >= OC_POWER_RANGE.0 as f64 && w <= OC_POWER_RANGE.1 as f64 {
+                self.oc.power_w = w as u32;
+                if !managed(&self.oc, "power") {
+                    self.oc.managed.push("power".into());
+                }
+                res("power", true, format!("Power limit set to {w} W"));
+            } else {
+                res(
+                    "power",
+                    false,
+                    format!("{w} W is outside the card's range {}-{} W", OC_POWER_RANGE.0, OC_POWER_RANGE.1),
+                );
+            }
+        } else if managed(&self.oc, "power") {
+            self.oc.power_w = OC_STOCK_W;
+            self.oc.managed.retain(|m| m != "power");
+            res("power", true, format!("Power limit back to {OC_STOCK_W} W"));
+        }
+        if s.oc_mem_enabled {
+            let m = s.oc_mem_offset_mhz.round();
+            if m >= OC_MEM_RANGE.0 as f64 && m <= OC_MEM_RANGE.1 as f64 {
+                self.oc.mem_ab = m as i32;
+                if !managed(&self.oc, "memory") {
+                    self.oc.managed.push("memory".into());
+                }
+                res("memory", true, format!("Memory offset set to {m:+} MHz"));
+            } else {
+                res(
+                    "memory",
+                    false,
+                    format!("{m:+} MHz is outside the card's range {}..{} MHz", OC_MEM_RANGE.0, OC_MEM_RANGE.1),
+                );
+            }
+        } else if managed(&self.oc, "memory") {
+            self.oc.mem_ab = 0;
+            self.oc.managed.retain(|m| m != "memory");
+            res("memory", true, "Memory offset back to +0 MHz".into());
+        }
+        OcReport { results, deferred: false }
+    }
+
+    fn oc_status(&self) -> OcStatus {
+        let current: Vec<(f32, f32)> = OC_STOCK
+            .iter()
+            .enumerate()
+            .map(|(i, &(mv, mhz))| (mv, mhz + self.oc.deltas_khz.get(i).copied().unwrap_or(0) as f32 / 1000.0))
+            .collect();
+        let live_mhz = current.windows(2).find(|w| w[0].0 <= OC_LIVE_MV && OC_LIVE_MV <= w[1].0).map(|w| {
+            let f = (OC_LIVE_MV - w[0].0) / (w[1].0 - w[0].0);
+            w[0].1 + (w[1].1 - w[0].1) * f
+        });
+        let s = &self.settings;
+        let uv_offset_mhz = crate::overclock::curve::plan_undervolt(
+            &Self::oc_points(),
+            s.oc_uv_from_mv,
+            s.oc_uv_to_mv,
+            s.oc_uv_target_mhz,
+            1000,
+        )
+        .ok()
+        .map(|p| p.offset_mhz);
+        OcStatus {
+            available: true,
+            reason: String::new(),
+            power_w: Some(self.oc.power_w),
+            power_range_w: Some(OC_POWER_RANGE),
+            mem_ab: Some(self.oc.mem_ab),
+            mem_range_ab: Some(OC_MEM_RANGE),
+            mem_clock_mhz: Some((14001 + self.oc.mem_ab) as u32),
+            uv_offset_mhz,
+            foreign_core_offset_mhz: 0,
+            curve_compatible: Some(true),
+            stock_curve: OC_STOCK.to_vec(),
+            current_curve: current,
+            live_mv: Some(OC_LIVE_MV),
+            live_mhz,
+            managed: self.oc.managed.clone(),
+        }
     }
 
     fn rand(&mut self) -> f64 {
@@ -120,6 +289,7 @@ impl Demo {
             sensor_scan_suggested: true,
             sensor_problem:
                 "sensor chip did not answer: implausible sample: no pin shows the 12 V rail (highest 0.056 V)".into(),
+            loop_at: now(),
             ..Default::default()
         }
     }
@@ -238,6 +408,7 @@ impl Demo {
             log_path: String::new(),
             sensor_scan_suggested: false,
             sensor_problem: String::new(),
+            loop_at: t,
         }
     }
 
@@ -339,6 +510,22 @@ impl Backend for Demo {
             Request::ReadFlight { .. } => Response::Text { text: self.flight_csv() },
             Request::Events { .. } => Response::Events { notices: Vec::new() },
             Request::ScanSensor => Response::Scan { report: self.scan_report() },
+            // Saves like the real service, then writes to the simulated GPU. Nothing is written
+            // while the guard is limiting the GPU.
+            Request::ApplyOverclock { changes } => {
+                let (errors, _) = config::check(&self.settings, changes);
+                if !errors.is_empty() {
+                    return Ok(Response::Error { message: errors.join("; ") });
+                }
+                self.settings = config::merged(&self.settings, changes);
+                thread::sleep(Duration::from_millis(600));
+                if (65.0..75.0).contains(&self.phase(now())) {
+                    Response::Overclock { report: OcReport { results: Vec::new(), deferred: true } }
+                } else {
+                    Response::Overclock { report: self.oc_apply() }
+                }
+            }
+            Request::OverclockStatus => Response::OverclockStatus { status: self.oc_status() },
         })
     }
 }

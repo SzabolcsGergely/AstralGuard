@@ -1,4 +1,4 @@
-//! Live tab: the connector, the numbers that matter, five minutes of history.
+//! Overview tab: the connector, the numbers that matter, five minutes of history.
 
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 

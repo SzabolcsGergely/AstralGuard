@@ -16,6 +16,8 @@ pub trait OcGpu {
     /// (current, min, max) memory clock offset, NVML MHz.
     fn mem_offset(&mut self) -> Result<(i32, i32, i32), String>;
     fn set_mem_offset(&mut self, nvml_mhz: i32) -> Result<(), String>;
+    /// The memory clock at full load (P0 max), MHz, with the offset included.
+    fn mem_clock_mhz(&mut self) -> Result<u32, String>;
     /// NVML's graphics clock offset (set by another tool; AstralGuard never writes it).
     fn core_offset_mhz(&mut self) -> Result<i32, String>;
     fn curve(&mut self) -> Result<Vec<RawPoint>, String>;
@@ -91,9 +93,17 @@ impl OcGpu for RealGpu {
         self.nvml.get_clock_offset(h, NVML_CLOCK_MEM)
     }
 
+    /// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): a memory offset set
+    /// on P0 reads back on every P-state (P8 included); +4000 NVML raised the P0 memory clock
+    /// 14001 -> 16001 MHz (= +2000 in Afterburner units).
     fn set_mem_offset(&mut self, nvml_mhz: i32) -> Result<(), String> {
         let h = self.nvml_handle()?;
         self.nvml.set_clock_offset(h, NVML_CLOCK_MEM, nvml_mhz)
+    }
+
+    fn mem_clock_mhz(&mut self) -> Result<u32, String> {
+        let h = self.nvml_handle()?;
+        self.nvml.p0_max_mem_clock_mhz(h)
     }
 
     fn core_offset_mhz(&mut self) -> Result<i32, String> {

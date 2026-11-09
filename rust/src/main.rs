@@ -6,12 +6,7 @@ mod crash;
 mod ipc;
 mod logger;
 mod mitigation;
-// The V/F calls are for the Overclock tab (later tasks), and on Linux nothing else uses the
-// binding yet; the tests cover only the pure buffer functions. Allow until Task 4 calls it.
-#[allow(dead_code)]
 mod nvapi;
-// Later tasks (NVAPI glue, Overclock tab) call into this; allow until then.
-#[cfg_attr(not(test), allow(dead_code))]
 mod overclock;
 mod platform;
 mod protocol;

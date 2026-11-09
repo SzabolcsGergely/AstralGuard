@@ -22,6 +22,7 @@ mod host;
 mod imu;
 mod live;
 mod log;
+mod overclock;
 mod prefs;
 mod settings;
 mod theme;
@@ -54,29 +55,39 @@ enum Tab {
     Live,
     Imu,
     Settings,
+    Overclock,
     Log,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Live, Tab::Imu, Tab::Settings, Tab::Log];
+    const ALL: [Tab; 5] = [Tab::Live, Tab::Overclock, Tab::Imu, Tab::Settings, Tab::Log];
     fn key(self) -> &'static str {
         match self {
             Tab::Live => "live",
             Tab::Imu => "imu",
             Tab::Settings => "settings",
+            Tab::Overclock => "overclock",
             Tab::Log => "log",
         }
     }
     fn label(self) -> &'static str {
         match self {
-            Tab::Live => "Live",
-            Tab::Imu => "IMU",
+            Tab::Live => "Overview",
+            Tab::Imu => "Anti-sag",
             Tab::Settings => "Settings",
+            Tab::Overclock => "Overclock",
             Tab::Log => "Log",
         }
     }
     fn parse(s: &str) -> Tab {
-        Tab::ALL.into_iter().find(|t| t.key() == s.to_ascii_lowercase()).unwrap_or(Tab::Live)
+        // The stored keys stay as they were (saved prefs, --tab); the new names are aliases.
+        let s = s.to_ascii_lowercase();
+        let s = match s.as_str() {
+            "overview" => "live",
+            "anti-sag" => "imu",
+            other => other,
+        };
+        Tab::ALL.into_iter().find(|t| t.key() == s).unwrap_or(Tab::Live)
     }
 }
 
@@ -151,6 +162,14 @@ pub(crate) fn open_path(path: &str) {
 }
 
 const DEFAULT_SIZE: Vec2 = Vec2::new(800.0, 820.0);
+/// The monitor loop iterates every 0.5 s (3 s at most while it waits for a sensor): a stamp
+/// older than this means it is stuck, in a driver call say.
+const LOOP_STALE_SEC: f64 = 5.0;
+
+/// The service answers, but its monitor loop has not started an iteration for `LOOP_STALE_SEC`.
+fn loop_stalled(l: &Live, now: f64) -> bool {
+    now - l.loop_at > LOOP_STALE_SEC
+}
 const MIN_SIZE: Vec2 = Vec2::new(660.0, 560.0);
 
 /// The window (taskbar) icon: the app icon with a status dot in the corner, so the taskbar
@@ -358,6 +377,7 @@ struct App {
     tab: Tab,
     thermal: thermal::Thermal,
     settings: SettingsView,
+    overclock: overclock::OverclockView,
     log: log::LogView,
     confirm: Option<Confirm>,
     frame: u64,
@@ -430,6 +450,7 @@ impl App {
             tab,
             thermal: Default::default(),
             settings: SettingsView::default(),
+            overclock: Default::default(),
             log: Default::default(),
             confirm,
             frame: 0,
@@ -543,6 +564,7 @@ impl App {
             if let Some(ask) = self.settings.on_done(&job, &result) {
                 self.handle_ask(ask);
             }
+            self.overclock.on_done(&job, &result);
             self.log.on_done(&job, &result);
             match (&job, &result) {
                 (Job::Exit, _) => {
@@ -700,6 +722,10 @@ impl eframe::App for App {
         self.ui(ctx);
         self.modals(ctx);
         self.screenshot(ctx);
+        // the GPU's state is read only while this tab is on screen
+        if self.tab == Tab::Overclock && self.shown && self.connected && self.overclock.poll_due() {
+            self.send(Job::OverclockStatus);
+        }
         if self.tab == Tab::Log && self.shown {
             let link = self.link.clone();
             self.log.tick(&mut |j| link.send(j));
@@ -799,6 +825,16 @@ impl App {
                         if let Some(u) = &self.updates {
                             u.set_enabled(self.prefs.check_updates);
                         }
+                    }
+                }
+                Tab::Overclock => {
+                    let job = egui::ScrollArea::vertical()
+                        .id_salt("overclock")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.overclock.ui(ui, &t, l))
+                        .inner;
+                    if let Some(job) = job {
+                        self.send(job);
                     }
                 }
                 Tab::Log => {
@@ -943,6 +979,8 @@ impl App {
             Some(l) if self.connected => {
                 if l.status == Status::Shutdown {
                     list.push((t.danger, "Shutting down".into(), ""));
+                } else if loop_stalled(l, w::now()) {
+                    list.push((t.danger, "Guard loop not responding".into(), "protection may be stalled"));
                 }
                 if l.paused {
                     list.push((w::rgb(Status::Paused.color()), "Paused".into(), "the connector is not protected"));
@@ -1032,6 +1070,7 @@ impl App {
                 self.prefs.last_tab = tab.key().into();
                 match tab {
                     Tab::Settings => self.settings.autostart = settings::Autostart::Unknown,
+                    Tab::Overclock => self.overclock.opened(),
                     Tab::Log => self.log.force_refresh(),
                     _ => {}
                 }
@@ -1167,5 +1206,19 @@ impl App {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_guard_loop_counts_as_stalled_after_five_seconds() {
+        let live = |loop_at: f64| Live { loop_at, ..Live::default() };
+        assert!(!loop_stalled(&live(1000.0), 1000.4));
+        assert!(!loop_stalled(&live(1000.0), 1005.0), "exactly 5 s is not yet stalled");
+        assert!(loop_stalled(&live(1000.0), 1005.1));
+        assert!(loop_stalled(&live(1000.0), 1600.0));
     }
 }

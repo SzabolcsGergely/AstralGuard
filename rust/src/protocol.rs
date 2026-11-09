@@ -319,6 +319,11 @@ pub struct Live {
     pub sensor_scan_suggested: bool,
     /// Why the sensor cannot be read, "" while it can.
     pub sensor_problem: String,
+    /// Unix seconds: when the monitor loop last started an iteration (paused and waiting for a
+    /// sensor included). The dashboard warns when it stops moving: a stalled loop means the
+    /// pins are not being watched, whatever the rest of this snapshot says.
+    #[serde(default)]
+    pub loop_at: f64,
 }
 
 /// What a sensor scan found, one line per I2C adapter.
@@ -384,6 +389,14 @@ pub enum Request {
     /// Find the card's pin monitor on its I2C adapters and save the one that passes.
     /// Refused while the sensor is reading fine, so it can never interrupt protection.
     ScanSensor,
+    /// Apply now: save the overclock keys, then write them to the GPU. Refused while the
+    /// guard is limiting it.
+    ApplyOverclock {
+        changes: SettingsPatch,
+    },
+    /// The overclock state read from the driver, for the Overclock tab while it is visible.
+    /// Only this, an apply or a release opens the GPU for the overclock.
+    OverclockStatus,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -400,6 +413,8 @@ pub enum Response {
     Text { text: String },
     Events { notices: Vec<Notice> },
     Scan { report: ScanReport },
+    Overclock { report: OcReport },
+    OverclockStatus { status: OcStatus },
     Error { message: String },
 }
 
@@ -434,6 +449,8 @@ pub struct OcStatus {
     /// Memory offset in effect, Afterburner units.
     pub mem_ab: Option<i32>,
     pub mem_range_ab: Option<(i32, i32)>,
+    /// Memory clock at full load (P0 max) with the offset included, MHz.
+    pub mem_clock_mhz: Option<u32>,
     /// The offset the configured From/To/Target gives on this card's curve (None if it is refused).
     pub uv_offset_mhz: Option<i32>,
     /// NVML's graphics clock offset; non-zero means another tool set one and the undervolt is refused.

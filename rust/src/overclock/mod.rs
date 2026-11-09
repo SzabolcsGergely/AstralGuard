@@ -9,6 +9,9 @@
 //! - The value from before is recorded in the `overclock.active` marker (next to
 //!   `mitigation.active`) before the first write, and only then: a second apply, or a restart
 //!   with the overclock still in place, must not record AstralGuard's own value as "before".
+//! - Next to each value from before, the value AstralGuard applied. An untick writes the value
+//!   from before only while the card still runs the applied one: after a reboot, or another
+//!   tool's change, the card runs something AstralGuard did not set, and that is left alone.
 //! - Nothing is written while the guard is limiting the GPU. The mitigator saved the power
 //!   limit it found and restores exactly that, so a power limit written under it would be
 //!   lost or, worse, restored over.
@@ -31,8 +34,17 @@ use curve::{ab_to_nvml_mem, nvml_to_ab_mem, plan_undervolt, stock_mhz, RawPoint}
 /// The driver's per-point offset range. ClkDomainsGetInfo reports it, but the constant is what
 /// the owner's card reports (±1000 MHz, see the design) and the design allows using it.
 const MAX_CURVE_DELTA_MHZ: i32 = 1000;
-/// The compatibility check's test write on the highest core point: +5 MHz, as nvcurve does.
-const PROBE_KHZ: i32 = 5000;
+/// The compatibility check's test write on the middle core point: 15 MHz.
+/// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): a small per-point
+/// delta is not applied by the driver. A +5 MHz delta reads back in ClkVfPointsGetControl but
+/// does not move the effective clock in ClkVfPointsGetStatus, while +15, +30 and +862 MHz move
+/// it exactly (895 mV: 1965 + 862 = 2827.0 MHz reported). The threshold below which deltas are
+/// ignored is not known; 15 MHz is a safe probe. The probe checks that the effective clock
+/// moves by the probe delta, so it must be large enough to be applied.
+const PROBE_DELTA_KHZ: i32 = 15_000;
+/// How far an effective frequency may be off and still count as "moved by the probe delta" or
+/// "did not move": 1 MHz.
+const PROBE_FREQ_TOLERANCE_KHZ: i64 = 1000;
 
 const UNDERVOLT: &str = "undervolt";
 const POWER: &str = "power";
@@ -54,12 +66,44 @@ struct Marker {
     /// Every core point's delta before the undervolt (the undervolt writes them all).
     #[serde(default)]
     curve_before_khz: Option<Vec<(usize, i32)>>,
+    /// What AstralGuard last wrote (or found already in place), saved before the write. Missing
+    /// (a marker from an older build) means "not known": an untick then writes nothing.
+    #[serde(default)]
+    power_applied_w: Option<u32>,
+    #[serde(default)]
+    mem_applied_nvml: Option<i32>,
+    #[serde(default)]
+    curve_applied_khz: Option<Vec<(usize, i32)>>,
 }
 
 impl Marker {
     fn is_empty(&self) -> bool {
         self.power_before_w.is_none() && self.mem_before_nvml.is_none() && self.curve_before_khz.is_none()
     }
+
+    /// "undervolt", "power", "memory": what AstralGuard applied and restores on untick.
+    fn managed(&self) -> Vec<String> {
+        [
+            (UNDERVOLT, self.curve_before_khz.is_some()),
+            (POWER, self.power_before_w.is_some()),
+            (MEMORY, self.mem_before_nvml.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| name.to_string())
+        .collect()
+    }
+}
+
+/// What the marker says AstralGuard manages on this card, without opening the GPU and without
+/// touching the file (a marker from another card is left for `Overclocker::new` to judge).
+pub fn managed_in_marker(path: &std::path::Path, subsystem: u32) -> Vec<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Marker>(&b).ok())
+        .filter(|m| m.subsystem == subsystem)
+        .map(|m| m.managed())
+        .unwrap_or_default()
 }
 
 /// The marker for this card. A marker from another card describes a GPU that is not here
@@ -112,10 +156,17 @@ fn core_points(points: &[RawPoint]) -> &[RawPoint] {
     &points[..points.iter().position(|p| p.memory).unwrap_or(points.len())]
 }
 
-/// A setting that went through fine: written, or already as configured (no call made).
+/// A setting that went through fine: written, already as configured (no call made), or not
+/// restored because the card no longer runs what AstralGuard applied (no call made).
 enum Done {
     Wrote(String),
     InEffect(String),
+    LeftAsIs(String),
+}
+
+/// The untick's answer when the live value is not the one AstralGuard applied.
+fn left_as_is(what: &str) -> Done {
+    Done::LeftAsIs(format!("{what} changed since AstralGuard applied it; left as is"))
 }
 
 /// The result, and whether anything happened (a write, or a failure worth reporting).
@@ -123,6 +174,7 @@ fn outcome(setting: &str, r: Result<Done, String>) -> (OcResult, bool) {
     let (ok, message, acted) = match r {
         Ok(Done::Wrote(m)) => (true, m, true),
         Ok(Done::InEffect(m)) => (true, format!("{m} (already in effect)"), false),
+        Ok(Done::LeftAsIs(m)) => (true, m, true),
         Err(m) => (false, m, true),
     };
     (OcResult { setting: setting.into(), ok, message }, acted)
@@ -133,8 +185,20 @@ enum Probe {
     Pass,
     /// A call failed, and the curve was read back unchanged: worth trying again later.
     Error(String),
-    /// The write landed wrong, or the curve did not come back as it was: never again on this driver.
-    Broken(String),
+    /// The write landed wrong, or the curve did not come back as it was: never again on this
+    /// driver (`mismatch`, persisted as `oc_vf_failed_driver`). Without `mismatch` the curve could
+    /// not be read back at the end: not trusted for this run, but not remembered either.
+    Broken {
+        why: String,
+        mismatch: bool,
+    },
+}
+
+/// A driver the check failed on, and why. `persist`: a wrong landing, for the service to save.
+struct FailedDriver {
+    version: String,
+    why: String,
+    persist: bool,
 }
 
 /// Every curve index, memory-domain points included, whose delta differs between `was` and
@@ -144,6 +208,20 @@ fn changed_points(was: &[RawPoint], now: &[RawPoint]) -> Vec<usize> {
     (0..was.len().max(now.len()))
         .filter(|&i| was.get(i).map(|p| p.delta_khz) != now.get(i).map(|p| p.delta_khz))
         .collect()
+}
+
+/// The probe's independent check, from GetStatus rather than the control table it wrote:
+/// the effective frequency at `probed` moved by the probe delta and no other point's moved
+/// (each within 1 MHz). None when it did; otherwise the points that are off. Only points present
+/// on both sides are compared; a length change is the delta comparison's to report.
+fn effective_mismatch(was: &[RawPoint], now: &[RawPoint], probed: usize) -> Option<Vec<usize>> {
+    let off: Vec<usize> = (0..was.len().min(now.len()))
+        .filter(|&i| {
+            let expect = was[i].freq_khz as i64 + if i == probed { PROBE_DELTA_KHZ as i64 } else { 0 };
+            (now[i].freq_khz as i64 - expect).abs() > PROBE_FREQ_TOLERANCE_KHZ
+        })
+        .collect();
+    (!off.is_empty()).then_some(off)
 }
 
 /// "point(s) 4, 6", plus the length change when there is one.
@@ -177,18 +255,41 @@ pub struct Overclocker<G: OcGpu> {
     marker: Marker,
     /// The driver version the compatibility check last passed on (persisted by the caller).
     verified_driver: Option<String>,
-    /// The driver version the check failed on, and why: not probed again on that driver.
-    failed_driver: Option<(String, String)>,
+    /// The driver version the check failed on: not probed again on that driver.
+    failed_driver: Option<FailedDriver>,
 }
 
 impl<G: OcGpu> Overclocker<G> {
-    pub fn new(gpu: G, marker: PathBuf, verified_driver: Option<String>) -> Self {
+    /// `verified_driver` and `failed_driver`: the driver versions the check passed and failed on
+    /// before (persisted by the caller as `oc_vf_verified_driver` / `oc_vf_failed_driver`).
+    pub fn new(gpu: G, marker: PathBuf, verified_driver: Option<String>, failed_driver: Option<String>) -> Self {
         let m = load_marker(&marker, gpu.subsystem());
-        Overclocker { gpu, marker_path: marker, marker: m, verified_driver, failed_driver: None }
+        let failed_driver = failed_driver.map(|version| FailedDriver {
+            why: format!(
+                "the V/F curve write check failed on driver {version} before; undervolt disabled until a driver update"
+            ),
+            version,
+            persist: true,
+        });
+        Overclocker { gpu, marker_path: marker, marker: m, verified_driver, failed_driver }
     }
 
     pub fn verified_driver(&self) -> Option<&str> {
         self.verified_driver.as_deref()
+    }
+
+    /// The driver version the check failed on with a wrong landing (for the caller to persist).
+    pub fn failed_driver(&self) -> Option<&str> {
+        self.failed_driver.as_ref().filter(|f| f.persist).map(|f| f.version.as_str())
+    }
+
+    pub fn subsystem(&self) -> u32 {
+        self.gpu.subsystem()
+    }
+
+    /// What AstralGuard applied (from the marker in memory; no driver call).
+    pub fn managed(&self) -> Vec<String> {
+        self.marker.managed()
     }
 
     /// Write the ticked settings, restore the unticked ones AstralGuard applied. Writes nothing
@@ -205,7 +306,11 @@ impl<G: OcGpu> Overclocker<G> {
 
     /// After the guard released the GPU: the same as `apply`, so an apply deferred during the
     /// trip (a new tick, an untick) takes effect now, and anything the release cleared is
-    /// written again (whether a release clears curve or memory offsets is not known yet).
+    /// written again.
+    ///
+    /// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux):
+    /// nvmlDeviceSetGpuLockedClocks(180, 180) held for 2 s, then nvmlDeviceResetGpuLockedClocks,
+    /// left all curve offsets and the memory offset unchanged. The re-apply here is a safety net.
     /// Reports only what was written or failed; a setting already as configured is not listed.
     pub fn after_release(&mut self, s: &Settings) -> OcReport {
         let mut results: Vec<OcResult> = self.run(s).into_iter().filter(|(_, acted)| *acted).map(|(r, _)| r).collect();
@@ -223,17 +328,59 @@ impl<G: OcGpu> Overclocker<G> {
         if s.oc_power_enabled {
             results.push(outcome(POWER, self.apply_power(s)));
         } else if let Some(before) = self.marker.power_before_w {
-            results.push(outcome(POWER, self.restore_power(before)));
+            results.push(outcome(POWER, self.restore_power(before, self.marker.power_applied_w)));
         }
-        if s.oc_mem_enabled {
-            results.push(outcome(MEMORY, self.apply_memory(s)));
-        } else if let Some(before) = self.marker.mem_before_nvml {
-            results.push(outcome(MEMORY, self.restore_memory(before)));
+        // VERIFIED (2026-11-10, ROG Astral RTX 5090 OC, driver 621.14, Windows): a memory offset
+        // write resets every V/F curve delta to 0. So the curve is restored before the memory
+        // step and applied after it, and a restored curve that had offsets of its own (another
+        // tool's) is written again when the memory step wrote.
+        let restored_curve = match self.marker.curve_before_khz.clone() {
+            Some(before) if !s.oc_uv_enabled => {
+                let applied = self.marker.curve_applied_khz.clone();
+                let r = self.restore_curve(&before, applied.as_deref());
+                let wrote = matches!(r, Ok(Done::Wrote(_)));
+                results.push(outcome(UNDERVOLT, r));
+                wrote.then_some(before)
+            }
+            _ => None,
+        };
+        // The curve from before the undervolt is recorded ahead of a memory write that would
+        // wipe it (apply_undervolt keeps an entry already there).
+        let mut prerecorded = false;
+        if s.oc_uv_enabled && s.oc_mem_enabled && self.marker.curve_before_khz.is_none() {
+            if let Ok(points) = self.gpu.curve() {
+                let before: Vec<(usize, i32)> =
+                    core_points(&points).iter().enumerate().map(|(i, pt)| (i, pt.delta_khz)).collect();
+                match self.record(|m| m.curve_before_khz = Some(before)) {
+                    Ok(()) => prerecorded = true,
+                    Err(e) => logger::warn(format!("Overclock: {e}")),
+                }
+            }
+        }
+        let mem = if s.oc_mem_enabled {
+            Some(self.apply_memory(s))
+        } else {
+            self.marker.mem_before_nvml.map(|before| self.restore_memory(before, self.marker.mem_applied_nvml))
+        };
+        let mem_wrote = matches!(mem, Some(Ok(Done::Wrote(_))));
+        if let Some(r) = mem {
+            results.push(outcome(MEMORY, r));
         }
         if s.oc_uv_enabled {
-            results.push(outcome(UNDERVOLT, self.apply_undervolt(s)));
-        } else if let Some(before) = self.marker.curve_before_khz.clone() {
-            results.push(outcome(UNDERVOLT, self.restore_curve(&before)));
+            let r = self.apply_undervolt(s);
+            // Failed before it recorded what it applies (the check, say): nothing of the curve
+            // is AstralGuard's, so the early entry goes again.
+            if r.is_err() && prerecorded && self.marker.curve_applied_khz.is_none() {
+                self.forget(|m| m.curve_before_khz = None);
+            }
+            results.push(outcome(UNDERVOLT, r));
+        } else if let Some(before) = restored_curve.filter(|b| mem_wrote && b.iter().any(|&(_, d)| d != 0)) {
+            if let Err(e) = self.gpu.set_curve(&before) {
+                results.push(outcome(
+                    UNDERVOLT,
+                    Err(format!("could not restore the V/F curve after the memory change ({e})")),
+                ));
+            }
         }
         results
     }
@@ -251,6 +398,7 @@ impl<G: OcGpu> Overclocker<G> {
             st.mem_ab = Some(nvml_to_ab_mem(cur));
             st.mem_range_ab = Some((nvml_to_ab_mem(min), nvml_to_ab_mem(max)));
         }
+        st.mem_clock_mhz = self.gpu.mem_clock_mhz().ok();
         st.foreign_core_offset_mhz = self.gpu.core_offset_mhz().unwrap_or(0);
         st.live_mv = self.gpu.core_voltage_mv().ok().map(|v| v as f32);
         if let Ok(points) = self.gpu.curve() {
@@ -267,21 +415,13 @@ impl<G: OcGpu> Overclocker<G> {
         if let Ok(d) = &driver {
             st.curve_compatible = if self.verified_driver.as_deref() == Some(d.as_str()) {
                 Some(true)
-            } else if self.failed_driver.as_ref().is_some_and(|(v, _)| v == d) {
+            } else if self.failed_driver.as_ref().is_some_and(|f| f.version == *d) {
                 Some(false)
             } else {
                 None
             };
         }
-        for (name, on) in [
-            (UNDERVOLT, self.marker.curve_before_khz.is_some()),
-            (POWER, self.marker.power_before_w.is_some()),
-            (MEMORY, self.marker.mem_before_nvml.is_some()),
-        ] {
-            if on {
-                st.managed.push(name.into());
-            }
-        }
+        st.managed = self.marker.managed();
         st
     }
 
@@ -312,8 +452,11 @@ impl<G: OcGpu> Overclocker<G> {
             return Err(format!("{w} W is outside the card's range {lo}-{hi} W"));
         }
         let live = self.gpu.power_limit_w().map_err(|e| format!("could not read the power limit ({e})"))?;
-        if self.marker.power_before_w.is_none() {
-            self.record(|m| m.power_before_w = Some(live))?;
+        if self.marker.power_before_w.is_none() || self.marker.power_applied_w != Some(w) {
+            self.record(|m| {
+                m.power_before_w.get_or_insert(live);
+                m.power_applied_w = Some(w);
+            })?;
         }
         if live == w {
             return Ok(Done::InEffect(format!("power limit {w} W")));
@@ -324,9 +467,14 @@ impl<G: OcGpu> Overclocker<G> {
         Ok(Done::Wrote(format!("power limit {w} W")))
     }
 
-    fn restore_power(&mut self, before: u32) -> Result<Done, String> {
+    fn restore_power(&mut self, before: u32, applied: Option<u32>) -> Result<Done, String> {
+        let live = self.gpu.power_limit_w().map_err(|e| format!("could not read the power limit ({e})"))?;
+        if applied != Some(live) {
+            self.forget(|m| (m.power_before_w, m.power_applied_w) = (None, None));
+            return Ok(left_as_is(&format!("power limit ({live} W now)")));
+        }
         self.gpu.set_power_limit_w(before).map_err(|e| format!("could not restore the power limit ({e})"))?;
-        self.forget(|m| m.power_before_w = None);
+        self.forget(|m| (m.power_before_w, m.power_applied_w) = (None, None));
         Ok(Done::Wrote(format!("power limit restored to {before} W")))
     }
 
@@ -341,8 +489,11 @@ impl<G: OcGpu> Overclocker<G> {
                 nvml_to_ab_mem(max)
             ));
         }
-        if self.marker.mem_before_nvml.is_none() {
-            self.record(|m| m.mem_before_nvml = Some(cur))?;
+        if self.marker.mem_before_nvml.is_none() || self.marker.mem_applied_nvml != Some(want) {
+            self.record(|m| {
+                m.mem_before_nvml.get_or_insert(cur);
+                m.mem_applied_nvml = Some(want);
+            })?;
         }
         let msg = format!("memory offset {:+} MHz", nvml_to_ab_mem(want));
         if cur == want {
@@ -352,15 +503,23 @@ impl<G: OcGpu> Overclocker<G> {
         Ok(Done::Wrote(msg))
     }
 
-    fn restore_memory(&mut self, before: i32) -> Result<Done, String> {
+    fn restore_memory(&mut self, before: i32, applied: Option<i32>) -> Result<Done, String> {
+        let (live, _, _) = self.gpu.mem_offset().map_err(|e| format!("could not read the memory offset ({e})"))?;
+        if applied != Some(live) {
+            self.forget(|m| (m.mem_before_nvml, m.mem_applied_nvml) = (None, None));
+            return Ok(left_as_is(&format!("memory offset ({:+} MHz now)", nvml_to_ab_mem(live))));
+        }
         self.gpu.set_mem_offset(before).map_err(|e| format!("could not restore the memory offset ({e})"))?;
-        self.forget(|m| m.mem_before_nvml = None);
+        self.forget(|m| (m.mem_before_nvml, m.mem_applied_nvml) = (None, None));
         Ok(Done::Wrote(format!("memory offset restored to {:+} MHz", nvml_to_ab_mem(before))))
     }
 
     fn apply_undervolt(&mut self, s: &Settings) -> Result<Done, String> {
         // Not subtracted and not zeroed: how it stacks with the curve is unverified, and
         // zeroing it would change a value the user did not ask AstralGuard to touch.
+        // VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): with the curve
+        // applied through NVAPI per-point deltas, NVML's graphics clock offset still reads +0 on
+        // every P-state, so AstralGuard's own curve is not mistaken for a foreign offset.
         let core = self.gpu.core_offset_mhz().map_err(|e| format!("could not read the core clock offset ({e})"))?;
         if core != 0 {
             return Err(format!("a core clock offset of {core:+} MHz is set outside AstralGuard; remove it first"));
@@ -375,10 +534,14 @@ impl<G: OcGpu> Overclocker<G> {
         if !in_place {
             self.check_curve_writes(&points)?;
         }
-        if self.marker.curve_before_khz.is_none() {
+        if self.marker.curve_before_khz.is_none() || self.marker.curve_applied_khz.as_ref() != Some(&p.deltas_khz) {
             let before: Vec<(usize, i32)> =
                 core_points(&points).iter().enumerate().map(|(i, pt)| (i, pt.delta_khz)).collect();
-            self.record(|m| m.curve_before_khz = Some(before))?;
+            let applied = p.deltas_khz.clone();
+            self.record(|m| {
+                m.curve_before_khz.get_or_insert(before);
+                m.curve_applied_khz = Some(applied);
+            })?;
         }
         if in_place {
             return Ok(Done::InEffect(msg));
@@ -387,12 +550,30 @@ impl<G: OcGpu> Overclocker<G> {
         Ok(Done::Wrote(msg))
     }
 
-    fn restore_curve(&mut self, before: &[(usize, i32)]) -> Result<Done, String> {
+    fn restore_curve(&mut self, before: &[(usize, i32)], applied: Option<&[(usize, i32)]>) -> Result<Done, String> {
         let points = self.gpu.curve().map_err(|e| format!("could not read the V/F curve ({e})"))?;
+        let core = core_points(&points).len();
+        let drop_entry = |m: &mut Marker| (m.curve_before_khz, m.curve_applied_khz) = (None, None);
+        // The recorded indices mean the curve as it was then. A curve whose core part has another
+        // length (a driver update, say) may put a memory point at one of them: never written.
+        let recorded = before.len();
+        if recorded != core || before.iter().chain(applied.unwrap_or_default()).any(|&(i, _)| i >= core) {
+            self.forget(drop_entry);
+            return Err(format!(
+                "the V/F curve now has {core} core points, {recorded} when AstralGuard applied the undervolt; \
+                 not restored (the offsets stay until the next reboot or driver reset)"
+            ));
+        }
+        let still_applied =
+            applied.is_some_and(|a| a.iter().all(|&(i, d)| points.get(i).is_some_and(|pt| pt.delta_khz == d)));
+        if !still_applied {
+            self.forget(drop_entry);
+            return Ok(left_as_is("V/F curve"));
+        }
         // A restore is a curve write too: on a driver whose layout changed it could land anywhere.
         self.check_curve_writes(&points)?;
         self.gpu.set_curve(before).map_err(|e| format!("could not restore the V/F curve ({e})"))?;
-        self.forget(|m| m.curve_before_khz = None);
+        self.forget(drop_entry);
         Ok(Done::Wrote("V/F curve restored".into()))
     }
 
@@ -405,10 +586,8 @@ impl<G: OcGpu> Overclocker<G> {
         if self.verified_driver.as_deref() == Some(driver.as_str()) {
             return Ok(());
         }
-        if let Some((v, why)) = &self.failed_driver {
-            if *v == driver {
-                return Err(why.clone());
-            }
+        if let Some(f) = self.failed_driver.as_ref().filter(|f| f.version == driver) {
+            return Err(f.why.clone());
         }
         match self.probe(points) {
             Probe::Pass => {
@@ -417,73 +596,86 @@ impl<G: OcGpu> Overclocker<G> {
                 Ok(())
             }
             Probe::Error(e) => Err(format!("the V/F curve write check could not run ({e})")),
-            Probe::Broken(why) => {
+            Probe::Broken { why, mismatch } => {
                 let why = format!("the V/F curve write check failed on driver {driver}: {why}; undervolt disabled");
                 logger::error(format!("Overclock: {why}"));
-                self.failed_driver = Some((driver, why.clone()));
+                self.failed_driver = Some(FailedDriver { version: driver, why: why.clone(), persist: mismatch });
                 Err(why)
             }
         }
     }
 
-    /// +5 MHz on the highest core point, read back, the original delta written back; then, in
+    /// One driver step (15 MHz) on the middle core point, read back, the original delta written back; then, in
     /// every case, the whole curve is compared with `points` (the curve before the probe).
     /// The check exists for writes that land in the wrong place, and the undo lands in the
-    /// same wrong place, so the undo alone proves nothing.
+    /// same wrong place, so the undo alone proves nothing. The read-back must show the delta in
+    /// the control table AND the effective frequency (GetStatus, another structure) moved, at
+    /// that point only: a write that lands in a field that merely reads back as the delta fails.
+    /// The middle point, not the top one: the top may sit at a clock ceiling that hides the step.
     fn probe(&mut self, points: &[RawPoint]) -> Probe {
-        let Some(top) = core_points(points).len().checked_sub(1) else {
+        let core = core_points(points).len();
+        if core == 0 {
             return Probe::Error("the curve has no core points".into());
-        };
-        let orig = points[top].delta_khz;
+        }
+        let probed = core / 2;
+        let orig = points[probed].delta_khz;
         let mut problem: Option<String> = None;
         let mut landed_wrong = false;
         // A failed write gets no undo of its own: it may have half happened, and the
         // comparison below repairs whatever it did.
-        match self.gpu.set_curve(&[(top, orig + PROBE_KHZ)]) {
+        match self.gpu.set_curve(&[(probed, orig + PROBE_DELTA_KHZ)]) {
             Err(e) => problem = Some(format!("test write failed ({e})")),
             Ok(()) => {
                 match self.gpu.curve() {
                     Err(e) => problem = Some(format!("test read-back failed ({e})")),
                     Ok(after) => {
                         let mut expect = points.to_vec();
-                        expect[top].delta_khz = orig + PROBE_KHZ;
+                        expect[probed].delta_khz = orig + PROBE_DELTA_KHZ;
                         let wrong = changed_points(&expect, &after);
                         if !wrong.is_empty() {
                             landed_wrong = true;
                             problem = Some(format!(
-                                "a +{PROBE_KHZ} kHz write to point {top} read back wrong at {}",
+                                "a +{PROBE_DELTA_KHZ} kHz write to point {probed} read back wrong at {}",
                                 describe_change(&expect, &after, &wrong)
+                            ));
+                        } else if let Some(off) = effective_mismatch(points, &after, probed) {
+                            landed_wrong = true;
+                            problem = Some(format!(
+                                "a +{PROBE_DELTA_KHZ} kHz write to point {probed} read back as written, but the effective \
+                                 clock did not move by it at point {probed} only (off at point(s) {})",
+                                list(&off)
                             ));
                         }
                     }
                 }
-                if let Err(e) = self.gpu.set_curve(&[(top, orig)]) {
+                if let Err(e) = self.gpu.set_curve(&[(probed, orig)]) {
                     problem.get_or_insert(format!("could not undo the test write ({e})"));
                 }
             }
         }
-        match self.restore_probe_points(points, top) {
+        match self.restore_probe_points(points, probed) {
             None => match problem {
                 None => Probe::Pass,
-                Some(p) if landed_wrong => Probe::Broken(p),
+                Some(why) if landed_wrong => Probe::Broken { why, mismatch: true },
                 Some(p) => Probe::Error(p),
             },
-            Some(damage) => {
+            Some((damage, mismatch)) => {
                 let p = problem.unwrap_or_else(|| "the test write did not undo cleanly".into());
-                Probe::Broken(format!("{p}; {damage}"))
+                Probe::Broken { why: format!("{p}; {damage}"), mismatch: mismatch || landed_wrong }
             }
         }
     }
 
     /// Make the curve what it was before the probe. None if it already was; otherwise which
-    /// points differed and whether writing their original deltas back fixed them.
-    fn restore_probe_points(&mut self, points: &[RawPoint], top: usize) -> Option<String> {
+    /// points differed and whether writing their original deltas back fixed them, and whether a
+    /// difference was seen (false: the curve could not be read back at all).
+    fn restore_probe_points(&mut self, points: &[RawPoint], probed: usize) -> Option<(String, bool)> {
         let now = match self.gpu.curve() {
             Ok(c) => c,
             Err(e) => {
-                return Some(format!(
-                    "the curve could not be read back ({e}): point {top} MAY STILL CARRY the +5 MHz test offset"
-                ))
+                return Some((format!(
+                    "the curve could not be read back ({e}): point {probed} MAY STILL CARRY the +{PROBE_DELTA_KHZ} kHz test offset"
+                ), false))
             }
         };
         let diff = changed_points(points, &now);
@@ -507,7 +699,7 @@ impl<G: OcGpu> Overclocker<G> {
                 .push_str(&format!("; point(s) {} exist on one side only and cannot be written back", list(&one_side)));
         }
         logger::error(format!("Overclock: {damage}"));
-        Some(damage)
+        Some((damage, true))
     }
 }
 
@@ -550,6 +742,13 @@ pub(crate) mod fake {
         pub misroute: Option<(usize, usize)>,
         /// A driver whose layout changes under a write: the next curve write also drops the last point.
         pub drop_last_point_on_next_write: bool,
+        /// A driver whose control layout moved: the write lands in a field that reads back as the
+        /// delta, but the effective frequency (GetStatus) does not change.
+        pub delta_not_effective: bool,
+        /// Every curve write fails with an error and changes nothing (a plain call error).
+        pub curve_write_error: bool,
+        /// The Windows driver: a memory offset write resets every curve delta to 0.
+        pub mem_write_resets_curve: bool,
         pub live_mv: f64,
         /// Every set call, e.g. "set_power_limit_w(520)".
         pub calls: Vec<String>,
@@ -583,6 +782,9 @@ pub(crate) mod fake {
                 ignore_curve_writes: false,
                 misroute: None,
                 drop_last_point_on_next_write: false,
+                delta_not_effective: false,
+                curve_write_error: false,
+                mem_write_resets_curve: false,
                 live_mv: 880.0,
                 calls: Vec::new(),
             })))
@@ -639,7 +841,17 @@ pub(crate) mod fake {
             let mut s = self.state();
             s.calls.push(format!("set_mem_offset({nvml_mhz})"));
             s.mem.0 = nvml_mhz;
+            if s.mem_write_resets_curve {
+                for p in s.curve.iter_mut().filter(|p| !p.memory) {
+                    p.freq_khz = (p.freq_khz as i64 - p.delta_khz as i64) as u32;
+                    p.delta_khz = 0;
+                }
+            }
             Ok(())
+        }
+        fn mem_clock_mhz(&mut self) -> Result<u32, String> {
+            // stock 14001 MHz; the offset is NVML units, the clock moves by half of it
+            Ok((14001 + self.state().mem.0 / 2) as u32)
         }
         fn core_offset_mhz(&mut self) -> Result<i32, String> {
             Ok(self.state().core_offset_mhz)
@@ -650,6 +862,9 @@ pub(crate) mod fake {
         fn set_curve(&mut self, deltas_khz: &[(usize, i32)]) -> Result<(), String> {
             let mut s = self.state();
             s.calls.push(format!("set_curve({deltas_khz:?})"));
+            if s.curve_write_error {
+                return Err("NVAPI_ERROR".into());
+            }
             if std::mem::take(&mut s.drop_last_point_on_next_write) {
                 s.curve.pop();
             }
@@ -661,8 +876,11 @@ pub(crate) mod fake {
                     Some((from, to)) if from == i => to,
                     _ => i,
                 };
+                let effective = !s.delta_not_effective;
                 let p = s.curve.get_mut(i).ok_or_else(|| format!("no curve point {i}"))?;
-                p.freq_khz = (p.freq_khz as i64 - p.delta_khz as i64 + d as i64) as u32;
+                if effective {
+                    p.freq_khz = (p.freq_khz as i64 - p.delta_khz as i64 + d as i64) as u32;
+                }
                 p.delta_khz = d;
             }
             Ok(())
@@ -685,7 +903,7 @@ mod tests {
     }
 
     fn oc(gpu: &FakeGpu, marker: &std::path::Path) -> Overclocker<FakeGpu> {
-        Overclocker::new(gpu.clone(), marker.to_path_buf(), Some(OWNERS_DRIVER.into()))
+        Overclocker::new(gpu.clone(), marker.to_path_buf(), Some(OWNERS_DRIVER.into()), None)
     }
 
     /// The owner's profile (the defaults: 820-895 mV to 2827 MHz, 520 W, +2000) with the given ticks.
@@ -695,6 +913,15 @@ mod tests {
 
     fn result<'a>(r: &'a OcReport, setting: &str) -> &'a crate::protocol::OcResult {
         r.results.iter().find(|x| x.setting == setting).unwrap_or_else(|| panic!("no {setting} result in {r:?}"))
+    }
+
+    #[test]
+    fn status_reports_the_memory_clock_with_the_offset() {
+        let (gpu, m) = (FakeGpu::owners(), marker("mem-clock"));
+        let mut o = oc(&gpu, &m);
+        assert_eq!(o.status(&settings(false, false, false)).mem_clock_mhz, Some(14001));
+        o.apply(&settings(false, false, true), false);
+        assert_eq!(o.status(&settings(false, false, true)).mem_clock_mhz, Some(16001));
     }
 
     #[test]
@@ -798,8 +1025,11 @@ mod tests {
         let mut o = oc(&gpu, &m);
         let r = o.apply(&settings(true, false, false), false);
         assert!(!result(&r, "undervolt").ok, "{r:?}");
-        // The probe (+5 MHz on the highest core point) and its restore, nothing else.
-        assert_eq!(gpu.calls(), vec!["set_curve([(5, 5000)])".to_string(), "set_curve([(5, 0)])".to_string()]);
+        // The probe (one driver step on the middle core point) and its restore, nothing else.
+        assert_eq!(
+            gpu.calls(),
+            vec![format!("set_curve([(3, {PROBE_DELTA_KHZ})])"), "set_curve([(3, 0)])".to_string()]
+        );
         assert_eq!(o.verified_driver(), Some(OWNERS_DRIVER));
         assert_eq!(o.status(&settings(true, false, false)).curve_compatible, Some(false));
         assert!(!m.exists(), "a refused undervolt records nothing");
@@ -814,7 +1044,7 @@ mod tests {
         assert!(result(&r, "undervolt").ok, "{r:?}");
         assert_eq!(o.verified_driver(), Some("621.01"));
         let calls = gpu.calls();
-        assert_eq!(calls[..2], ["set_curve([(5, 5000)])".to_string(), "set_curve([(5, 0)])".to_string()]);
+        assert_eq!(calls[..2], [format!("set_curve([(3, {PROBE_DELTA_KHZ})])"), "set_curve([(3, 0)])".to_string()]);
         assert_eq!(calls.len(), 3, "{calls:?}");
         assert_eq!(gpu.delta_khz(3), 862_000);
         // Already in place: no call at all.
@@ -836,7 +1066,7 @@ mod tests {
             st.driver = "621.01".into();
             st.curve[4].delta_khz = 20_000; // another tool's offset, so the misrouted undo cannot fix it by luck
             st.curve[4].freq_khz += 20_000;
-            st.misroute = Some((5, 4));
+            st.misroute = Some((3, 4));
         }
         let before = gpu.state().curve.clone();
         let mut o = oc(&gpu, &m);
@@ -862,7 +1092,7 @@ mod tests {
             st.driver = "621.01".into();
             st.curve[6].delta_khz = 50_000; // the memory-domain point, with its own offset
             st.curve[6].freq_khz += 50_000;
-            st.misroute = Some((5, 6)); // off by one: the highest core point's writes hit the memory point
+            st.misroute = Some((3, 6)); // the probed point's writes hit the memory point
         }
         let before = gpu.state().curve.clone();
         let mut o = oc(&gpu, &m);
@@ -873,6 +1103,76 @@ mod tests {
         assert_eq!(gpu.state().curve, before, "the memory point has its own delta back");
         assert_eq!(o.status(&settings(true, false, false)).curve_compatible, Some(false));
         assert!(!m.exists());
+    }
+
+    /// The control read-back looks right, but the driver did not apply it: GetStatus's effective
+    /// frequency did not move. The same-structure read-back alone cannot see this.
+    #[test]
+    fn a_probe_whose_write_does_not_change_the_effective_clock_fails() {
+        let (gpu, m) = (FakeGpu::owners(), marker("not-effective"));
+        gpu.state().driver = "621.01".into();
+        gpu.state().delta_not_effective = true;
+        let before = gpu.state().curve.clone();
+        let mut o = oc(&gpu, &m);
+        let uv = o.apply(&settings(true, false, true), false).results.into_iter().find(|r| r.setting == UNDERVOLT);
+        let uv = uv.expect("an undervolt result");
+        assert!(!uv.ok, "{uv:?}");
+        assert!(uv.message.contains("effective"), "says what did not move: {uv:?}");
+        let curve_calls: Vec<String> = gpu.calls().into_iter().filter(|c| c.starts_with("set_curve")).collect();
+        assert_eq!(
+            curve_calls,
+            vec![format!("set_curve([(3, {PROBE_DELTA_KHZ})])"), "set_curve([(3, 0)])".to_string()]
+        );
+        assert_eq!(gpu.state().curve, before);
+        assert_eq!(o.status(&settings(true, false, false)).curve_compatible, Some(false));
+        assert_eq!(o.managed(), vec![MEMORY.to_string()], "only the memory offset applied");
+        let _ = std::fs::remove_file(&m);
+    }
+
+    /// Another point's effective clock moving under the probe is a wrong landing too.
+    #[test]
+    fn a_probe_that_moves_another_points_clock_fails() {
+        assert_eq!(effective_mismatch(&fake::owners_curve(), &fake::owners_curve(), 3), Some(vec![3]));
+        let mut after = fake::owners_curve();
+        after[3].freq_khz += PROBE_DELTA_KHZ as u32;
+        assert_eq!(effective_mismatch(&fake::owners_curve(), &after, 3), None);
+        after[3].freq_khz += 1000; // within the 1 MHz tolerance
+        assert_eq!(effective_mismatch(&fake::owners_curve(), &after, 3), None);
+        after[5].freq_khz += 15_000;
+        assert_eq!(effective_mismatch(&fake::owners_curve(), &after, 3), Some(vec![5]));
+    }
+
+    /// A wrong landing is reported for persisting (`oc_vf_failed_driver`); a plain call error is not.
+    #[test]
+    fn only_a_wrong_landing_marks_the_driver_failed() {
+        let (gpu, m) = (FakeGpu::owners(), marker("failed-persist"));
+        gpu.state().driver = "621.01".into();
+        gpu.state().curve_write_error = true;
+        let mut o = oc(&gpu, &m);
+        assert!(!result(&o.apply(&settings(true, false, false), false), UNDERVOLT).ok);
+        assert_eq!(o.failed_driver(), None, "a call error is retried later, not remembered");
+        gpu.state().curve_write_error = false;
+        gpu.state().delta_not_effective = true;
+        assert!(!result(&o.apply(&settings(true, false, false), false), UNDERVOLT).ok);
+        assert_eq!(o.failed_driver(), Some("621.01"));
+    }
+
+    /// A driver the check failed on in an earlier run: no test write at all, undervolt refused.
+    #[test]
+    fn a_persisted_failed_driver_skips_the_probe_and_refuses_the_undervolt() {
+        let (gpu, m) = (FakeGpu::owners(), marker("failed-loaded"));
+        gpu.state().driver = "621.01".into();
+        let mut o = Overclocker::new(gpu.clone(), m.clone(), Some(OWNERS_DRIVER.into()), Some("621.01".into()));
+        let uv = result(&o.apply(&settings(true, false, false), false), UNDERVOLT).clone();
+        assert!(!uv.ok && uv.message.contains("621.01"), "{uv:?}");
+        assert!(gpu.calls().is_empty(), "no probe: {:?}", gpu.calls());
+        assert_eq!(o.status(&settings(true, false, false)).curve_compatible, Some(false));
+        assert!(!m.exists());
+        // A driver update clears it: the probe runs again.
+        gpu.state().driver = "622.00".into();
+        assert!(result(&o.apply(&settings(true, false, false), false), UNDERVOLT).ok);
+        assert_eq!(o.verified_driver(), Some("622.00"));
+        let _ = std::fs::remove_file(&m);
     }
 
     #[test]
@@ -887,7 +1187,7 @@ mod tests {
         assert!(uv.message.contains("point(s) 6"), "{uv:?}");
         assert!(uv.message.contains("cannot be written back"), "{uv:?}");
         assert!(!uv.message.contains("point(s) ;"), "never an empty point list: {uv:?}");
-        assert_eq!(gpu.delta_khz(5), 0, "the probe's +5 MHz is undone");
+        assert_eq!(gpu.delta_khz(3), 0, "the probe's step is undone");
         assert_eq!(o.status(&settings(true, false, false)).curve_compatible, Some(false));
         assert!(!m.exists());
     }
@@ -905,6 +1205,44 @@ mod tests {
         assert!(r.results.is_empty(), "{r:?}");
     }
 
+    /// The Windows driver resets the curve on every memory offset write. Ticking all three
+    /// still ends with the undervolt in place, and unticking all three ends exactly at stock,
+    /// with the curve restored, not "changed since AstralGuard applied it".
+    #[test]
+    fn memory_write_that_resets_the_curve_keeps_apply_and_untick_exact() {
+        let (gpu, m) = (FakeGpu::owners(), marker("mem-resets-curve"));
+        gpu.state().mem_write_resets_curve = true;
+        let stock = gpu.state().curve.clone();
+        let mut o = oc(&gpu, &m);
+        o.apply(&settings(true, true, true), false);
+        assert_ne!(gpu.delta_khz(3), 0, "undervolt in place after the memory write");
+        let r = o.apply(&settings(false, false, false), false);
+        let uv = result(&r, "undervolt");
+        assert!(uv.ok && uv.message.contains("restored"), "{r:?}");
+        assert_eq!(gpu.state().curve, stock);
+        assert_eq!(gpu.state().mem.0, 0);
+        assert!(!m.exists());
+    }
+
+    /// Another tool's curve offsets from before the undervolt survive an untick that also
+    /// restores the memory offset (whose write wipes the curve on Windows).
+    #[test]
+    fn untick_restores_another_tools_curve_after_the_memory_write() {
+        let (gpu, m) = (FakeGpu::owners(), marker("mem-resets-foreign"));
+        {
+            let mut st = gpu.state();
+            st.mem_write_resets_curve = true;
+            st.curve[0].delta_khz = 15_000;
+            st.curve[0].freq_khz += 15_000;
+        }
+        let mut o = oc(&gpu, &m);
+        o.apply(&settings(true, true, true), false);
+        let r = o.apply(&settings(false, false, false), false);
+        assert!(r.results.iter().all(|x| x.ok), "{r:?}");
+        assert_eq!(gpu.delta_khz(0), 15_000);
+        assert_eq!(gpu.delta_khz(3), 0);
+    }
+
     #[test]
     fn untick_undervolt_restores_the_curve_before() {
         let (gpu, m) = (FakeGpu::owners(), marker("untick-uv"));
@@ -917,6 +1255,97 @@ mod tests {
         assert!(result(&r, "undervolt").ok, "{r:?}");
         assert_eq!(gpu.delta_khz(0), 15_000);
         assert_eq!(gpu.delta_khz(3), 0);
+        assert!(!m.exists());
+    }
+
+    /// A reboot (a new Overclocker on the same marker) after which another tool changed every
+    /// setting AstralGuard had applied: an untick writes nothing and drops the entries.
+    #[test]
+    fn untick_after_another_tool_changed_the_value_leaves_it() {
+        let (gpu, m) = (FakeGpu::owners(), marker("changed-since"));
+        oc(&gpu, &m).apply(&settings(true, true, true), false);
+        {
+            let mut st = gpu.state();
+            st.power_w = 550;
+            st.mem.0 = 1000;
+            st.curve[3].delta_khz = 100_000;
+        }
+        gpu.clear_calls();
+        let mut o = oc(&gpu, &m);
+        let r = o.apply(&settings(false, false, false), false);
+        assert!(gpu.calls().is_empty(), "nothing written: {:?}", gpu.calls());
+        assert_eq!(r.results.len(), 3, "{r:?}");
+        for x in &r.results {
+            assert!(x.message.contains("changed since AstralGuard applied it; left as is"), "{x:?}");
+        }
+        assert!(o.managed().is_empty());
+        assert!(!m.exists(), "every entry dropped");
+        assert_eq!(gpu.state().power_w, 550);
+    }
+
+    /// The same reboot with the values untouched: restored as before.
+    #[test]
+    fn untick_after_a_restart_with_the_value_unchanged_restores() {
+        let (gpu, m) = (FakeGpu::owners(), marker("unchanged-since"));
+        oc(&gpu, &m).apply(&settings(true, true, true), false);
+        gpu.clear_calls();
+        let mut o = oc(&gpu, &m);
+        let r = o.apply(&settings(false, false, false), false);
+        assert!(r.results.iter().all(|x| x.ok && x.message.contains("restored")), "{r:?}");
+        let calls = gpu.calls();
+        assert!(calls.contains(&"set_power_limit_w(600)".to_string()), "{calls:?}");
+        assert!(calls.contains(&"set_mem_offset(0)".to_string()), "{calls:?}");
+        assert_eq!(gpu.delta_khz(3), 0);
+        assert!(!m.exists());
+    }
+
+    /// A marker from before the applied values were recorded: nothing to compare with, so
+    /// treated as changed since.
+    #[test]
+    fn an_old_marker_without_applied_values_is_never_written_back() {
+        let (gpu, m) = (FakeGpu::owners(), marker("old-marker"));
+        let old = format!(
+            r#"{{"subsystem":{},"power_before_w":450,"mem_before_nvml":1000,"curve_before_khz":[[0,0],[1,0],[2,0],[3,0],[4,0],[5,0]]}}"#,
+            super::fake::OWNERS_SUBSYSTEM
+        );
+        std::fs::write(&m, old).unwrap();
+        let r = oc(&gpu, &m).apply(&settings(false, false, false), false);
+        assert!(gpu.calls().is_empty(), "{:?}", gpu.calls());
+        assert_eq!(r.results.len(), 3, "{r:?}");
+        assert!(r.results.iter().all(|x| x.message.contains("left as is")), "{r:?}");
+        assert!(!m.exists());
+    }
+
+    #[test]
+    fn the_marker_records_the_applied_values() {
+        let (gpu, m) = (FakeGpu::owners(), marker("applied"));
+        oc(&gpu, &m).apply(&settings(true, true, true), false);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&m).unwrap()).unwrap();
+        assert_eq!(saved["power_applied_w"], 520);
+        assert_eq!(saved["mem_applied_nvml"], 4000);
+        assert_eq!(saved["curve_applied_khz"][3], serde_json::json!([3, 862_000]));
+        let _ = std::fs::remove_file(&m);
+    }
+
+    /// A driver update shortened the core curve: the recorded indices no longer mean the same
+    /// points, and one of them may now be a memory point. Refused, entry dropped, nothing written.
+    #[test]
+    fn restore_curve_refuses_a_curve_whose_core_length_changed() {
+        let (gpu, m) = (FakeGpu::owners(), marker("short-core"));
+        let mut o = oc(&gpu, &m);
+        o.apply(&settings(true, false, false), false);
+        {
+            // The highest core point is gone; index 5 is now the memory point.
+            let mut st = gpu.state();
+            st.curve.remove(5);
+        }
+        gpu.clear_calls();
+        let r = o.apply(&settings(false, false, false), false);
+        let uv = result(&r, "undervolt");
+        assert!(!uv.ok, "{uv:?}");
+        assert!(uv.message.contains("6") && uv.message.contains("5"), "names both lengths: {uv:?}");
+        assert!(gpu.calls().is_empty(), "nothing written: {:?}", gpu.calls());
+        assert!(o.managed().is_empty(), "entry dropped");
         assert!(!m.exists());
     }
 

@@ -15,6 +15,7 @@ use super::imbalance::ImbalanceMonitor;
 use super::response::{Tick, TieredResponse, CLEAR_HYSTERESIS_AMPS};
 use super::sag::SagMonitor;
 use super::Shared;
+use super::{oc_ticked, OcAccess};
 use crate::config;
 use crate::logger;
 use crate::mitigation::GpuMitigator;
@@ -31,6 +32,8 @@ const CLEAR_STABLE_SECONDS: f64 = 1.0;
 /// A paused guard protects nothing; remind at a noticeable but bearable cadence.
 const PAUSE_REMINDER_EVERY_SEC: f64 = 1800.0;
 const RECONNECT_EVERY_SEC: f64 = 3.0;
+/// How often a start-up apply whose GPU would not open is tried again.
+const OC_OPEN_RETRY_SEC: f64 = 30.0;
 
 fn sleep(sec: f64) {
     std::thread::sleep(Duration::from_secs_f64(sec));
@@ -120,6 +123,165 @@ fn startup_recovery(shared: &Shared) {
     m.close();
 }
 
+/// What the overclock should do this loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcAction {
+    None,
+    /// The start-up apply, once per service start.
+    Apply,
+    /// The guard released the GPU: put the saved overclock back where the release changed it.
+    AfterRelease,
+}
+
+/// When the overclock runs: once per service start after the configured delay, again the same
+/// delay after each resume from sleep, never while the guard limits the GPU, and after each
+/// release once the start-up apply has run.
+struct OcTimer {
+    due: f64,
+    applied: bool,
+    release_pending: bool,
+}
+
+impl OcTimer {
+    fn new(start: f64, delay: f64) -> Self {
+        OcTimer { due: start + delay, applied: false, release_pending: false }
+    }
+
+    /// The start-up apply could not open the GPU: try again in `OC_OPEN_RETRY_SEC` (a driver
+    /// that comes up late), not every iteration. Release checks are not retried this way; the
+    /// next release tries again.
+    fn open_failed(&mut self, now: f64) {
+        self.applied = false;
+        self.due = now + OC_OPEN_RETRY_SEC;
+    }
+
+    /// The action could not run (no GPU yet, or an Apply now held it): ask again next time.
+    /// The machine slept: the driver puts the power limit back to stock on resume (VERIFIED
+    /// 2026-11-10, ROG Astral RTX 5090 OC, driver 620.70.06, Linux; the memory offset and the
+    /// curve survived that resume), so the full apply runs again after the configured delay,
+    /// which also lets the driver settle. Values still in effect are only logged as such.
+    fn resumed(&mut self, now: f64, delay: f64) {
+        self.applied = false;
+        self.due = now + delay;
+    }
+
+    fn retry(&mut self, action: OcAction) {
+        match action {
+            OcAction::None => {}
+            OcAction::Apply => self.applied = false,
+            OcAction::AfterRelease => self.release_pending = true,
+        }
+    }
+}
+
+fn oc_step(t: &mut OcTimer, now: f64, engaged: bool, released_now: bool) -> OcAction {
+    if released_now {
+        t.release_pending = true;
+    }
+    if engaged {
+        // Limited again before a pending check ran: the next release asks for it again.
+        t.release_pending = false;
+        return OcAction::None;
+    }
+    if !t.applied {
+        // Before the start-up apply a release has nothing to put back; that apply is the full one.
+        t.release_pending = false;
+        if now >= t.due {
+            t.applied = true;
+            return OcAction::Apply;
+        }
+        return OcAction::None;
+    }
+    if std::mem::take(&mut t.release_pending) {
+        return OcAction::AfterRelease;
+    }
+    OcAction::None
+}
+
+/// The overclock's bookkeeping in the monitor loop.
+struct OcLoop {
+    timer: OcTimer,
+    was_engaged: bool,
+    /// When this step last ran. The loop runs it every iteration, sensor or not, so a gap longer
+    /// than `RESUME_GRACE_SEC` means the machine slept (or the loop stalled; re-applying is
+    /// harmless then).
+    last_step: Option<f64>,
+}
+
+/// After the pin decision of an iteration: a pending Apply now, the start-up apply and the
+/// check after a release. Nothing in the overclock may end the protection loop, so a panic in
+/// it is caught and logged here (and returned, for the tests); a waiting Apply now then gets a
+/// failure, its reply channel being dropped.
+fn overclock_step(shared: &Shared, oc: &mut OcLoop, engaged: bool) -> Option<String> {
+    let result = catch_unwind(AssertUnwindSafe(|| overclock_step_inner(shared, oc, engaged)));
+    // From the end of the step: its own driver calls are not a sleep either.
+    oc.last_step = Some(crate::now());
+    let panic = result.err()?;
+    let what = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown panic".into());
+    let msg = format!("Overclock error (protection carries on): {what}");
+    logger::error(&msg);
+    shared.event(EventKind::Error, 9001, &msg);
+    Some(what)
+}
+
+/// The GPU is touched only for Apply now (asked for), and for the start-up apply and the release
+/// check only when an overclock setting is ticked or AstralGuard still manages one (an untick to
+/// restore); otherwise no NVML or NVAPI call at all. Never waits for the overclocker.
+fn overclock_step_inner(shared: &Shared, oc: &mut OcLoop, engaged: bool) {
+    // With this loop's own `engaged`: the write is ordered against the ladder's decisions.
+    shared.serve_apply_now(engaged);
+    let released_now = oc.was_engaged && !engaged;
+    oc.was_engaged = engaged;
+    let now = crate::now();
+    if oc.last_step.is_some_and(|last| now - last > RESUME_GRACE_SEC) {
+        let delay = shared.settings().oc_apply_delay_seconds;
+        if oc_ticked(&shared.settings()) {
+            logger::info(format!("Overclock: resume from sleep detected, applying again in {delay:.0} s."));
+        }
+        oc.timer.resumed(now, delay);
+    }
+    oc.last_step = Some(now);
+    let action = oc_step(&mut oc.timer, now, engaged, released_now);
+    if action == OcAction::None {
+        return;
+    }
+    let s = shared.settings();
+    if !oc_ticked(&s) && shared.overclock_managed().is_empty() {
+        return;
+    }
+    // The overclocker logs its own results; a failed open is logged once by `Shared`.
+    let access = match action {
+        OcAction::None => return,
+        // "start-up apply" covers its retries (no GPU yet, or one that would not open).
+        OcAction::Apply => shared.try_overclock("the start-up/after-resume apply", |d| d.apply(&s, engaged)).ran(),
+        OcAction::AfterRelease => shared.try_overclock("the after-release apply", |d| d.after_release(&s)).ran(),
+    };
+    match access {
+        // A status read holds it, or the card is not found yet: cheap to ask again next time.
+        OcAccess::Busy | OcAccess::NoCard => oc.timer.retry(action),
+        OcAccess::Unavailable(_) if action == OcAction::Apply => oc.timer.open_failed(crate::now()),
+        OcAccess::Unavailable(_) | OcAccess::Ran(()) => {}
+    }
+}
+
+/// The log line for a trip while AstralGuard has overclock settings applied.
+fn trip_note(managed: &[String]) -> Option<String> {
+    (!managed.is_empty()).then(|| format!("overclock active: {}", managed.join(", ")))
+}
+
+/// The flight dump's event (its file name says why it was written), with the overclock noted.
+fn flight_event(base: &str, managed: &[String]) -> String {
+    if managed.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}-overclock-{}", managed.join("-"))
+    }
+}
+
 /// Timers that restart from scratch on a new connection or after a resume gap.
 #[derive(Default)]
 struct Tier1 {
@@ -195,10 +357,14 @@ pub fn run(shared: &Arc<Shared>) -> bool {
     let mut paused_since: Option<f64> = None;
     let mut last_pause_reminder = 0.0;
     let mut shutting_down = false;
+    let mut oc =
+        OcLoop { timer: OcTimer::new(crate::now(), s.oc_apply_delay_seconds), was_engaged: false, last_step: None };
 
     while !shared.stop.load(Ordering::Relaxed) {
         let now = crate::now();
         let s = shared.settings();
+        // Every iteration, before any path that `continue`s: the dashboard's "loop not responding".
+        shared.update(|l| l.loop_at = now);
 
         if shared.paused.load(Ordering::Relaxed) {
             // Checked before connecting so a paused guard stays quiet about missing sensors.
@@ -373,7 +539,8 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                     l.last_message = "Shutting down...".into();
                 });
                 shutting_down = true;
-                flight.dump("shutdown");
+                // From the marker, like the engage dump: no driver call on the way down.
+                flight.dump(&flight_event("shutdown", &shared.overclock_managed()));
                 shutdown_system(shared, &reason);
                 break;
             }
@@ -391,6 +558,14 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                 });
                 sleep(1.0);
             }
+        }
+        // Catches and logs its own panics. Its driver calls run on this thread, so the time they
+        // take is not a gap between samples: a slow call (over RESUME_GRACE_SEC) must delay the
+        // tier timers, never reset them as if the machine had slept.
+        let started = crate::now();
+        let _ = overclock_step(shared, &mut oc, response.engaged);
+        if let Some(t) = last_sample.as_mut() {
+            *t += crate::now() - started;
         }
     }
 
@@ -576,10 +751,17 @@ fn tick(
             l.status = Status::Mitigated;
             l.last_message = format!("GPU limited: {} {:.2}A", max.name, max.amps);
         });
-        // The minute leading up to the engagement is the evidence. When engage and
-        // shutdown land in the same tick, the shutdown dump carries the same data.
-        if !was_engaged && shutdown.is_none() {
-            flight.dump("engaged");
+        if !was_engaged {
+            // From the overclocker's marker: no driver call in the pin path, and never waits.
+            let managed = shared.overclock_managed();
+            if let Some(note) = trip_note(&managed) {
+                logger::warn(format!("GPU limited with {note}"));
+            }
+            // The minute leading up to the engagement is the evidence. When engage and
+            // shutdown land in the same tick, the shutdown dump carries the same data.
+            if shutdown.is_none() {
+                flight.dump(&flight_event("engaged", &managed));
+            }
         }
     }
     if let Some(reason) = shutdown {
@@ -592,4 +774,290 @@ fn tick(
     // reading the accelerometer, still in this thread.
     sag.idle(Some(sensor), POLL_INTERVAL_SEC, response.engaged, &s);
     TickOutcome::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Service started at t=100 with a 30 s delay.
+    fn timer() -> OcTimer {
+        OcTimer::new(100.0, 30.0)
+    }
+
+    #[test]
+    fn a_resume_applies_again_after_the_delay() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        t.resumed(1000.0, 30.0);
+        assert_eq!(oc_step(&mut t, 1000.0, false, false), OcAction::None, "waits for the driver");
+        assert_eq!(oc_step(&mut t, 1029.9, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 1030.0, false, false), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 1030.5, false, false), OcAction::None);
+    }
+
+    #[test]
+    fn a_resume_while_limited_applies_after_the_release() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        t.resumed(1000.0, 30.0);
+        assert_eq!(oc_step(&mut t, 1040.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 1050.0, false, true), OcAction::Apply, "the full apply, not AfterRelease");
+    }
+
+    #[test]
+    fn waits_for_the_delay_then_applies_once() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 100.0, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 129.9, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 130.5, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 5000.0, false, false), OcAction::None);
+    }
+
+    #[test]
+    fn a_delay_ending_while_limited_applies_after_release() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 125.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 140.0, true, false), OcAction::None, "pending while limited");
+        // The release tick runs the start-up apply (it is the full apply), once.
+        assert_eq!(oc_step(&mut t, 150.0, false, true), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 150.5, false, false), OcAction::None);
+    }
+
+    #[test]
+    fn every_release_after_the_first_apply_checks_again() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 200.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 210.0, false, true), OcAction::AfterRelease);
+        assert_eq!(oc_step(&mut t, 210.5, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 300.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 310.0, false, true), OcAction::AfterRelease);
+    }
+
+    #[test]
+    fn a_release_before_the_delay_does_not_apply_early() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 105.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 110.0, false, true), OcAction::None);
+        assert_eq!(oc_step(&mut t, 129.0, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 131.0, false, false), OcAction::None, "no stale after-release");
+    }
+
+    #[test]
+    fn an_action_that_could_not_run_is_tried_again() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        t.retry(OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 130.5, false, false), OcAction::Apply);
+        assert_eq!(oc_step(&mut t, 200.0, false, true), OcAction::AfterRelease);
+        t.retry(OcAction::AfterRelease);
+        assert_eq!(oc_step(&mut t, 200.5, false, false), OcAction::AfterRelease);
+        // Limited again before the retry got through: the next release checks instead.
+        t.retry(OcAction::AfterRelease);
+        assert_eq!(oc_step(&mut t, 201.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 201.5, false, false), OcAction::None);
+    }
+
+    /// Already due: started long ago with no delay.
+    fn due() -> OcLoop {
+        OcLoop { timer: OcTimer::new(0.0, 0.0), was_engaged: false, last_step: None }
+    }
+
+    #[test]
+    fn the_loop_applies_once_due_rechecks_after_release_and_never_waits() {
+        use crate::protocol::Settings;
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(
+            test_marker("loop"),
+            Settings { oc_power_enabled: true, oc_power_w: 520.0, ..Settings::default() },
+        );
+        let mut oc = due();
+
+        overclock_step(&f.shared, &mut oc, true);
+        assert!(f.gpu.calls().is_empty(), "nothing while limited: {:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+
+        // An Apply now holds the overclocker: the loop moves on and tries next time.
+        {
+            let _held = super::super::lock(&f.shared.overclock);
+            overclock_step(&f.shared, &mut oc, false);
+        }
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        overclock_step(&f.shared, &mut oc, false);
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()]);
+
+        // Something reset the limit while the guard held the GPU: the release puts it back.
+        f.gpu.clear_calls();
+        overclock_step(&f.shared, &mut oc, true);
+        f.gpu.state().power_w = 600;
+        overclock_step(&f.shared, &mut oc, false);
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()]);
+        f.gpu.clear_calls();
+        overclock_step(&f.shared, &mut oc, false);
+        assert!(f.gpu.calls().is_empty(), "once per release: {:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nothing_ticked_and_nothing_managed_never_opens_the_gpu() {
+        use crate::protocol::Settings;
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(test_marker("untouched"), Settings::default());
+        // The delay has ended (the timing itself is `oc_step`'s tests); then a trip and a release.
+        let mut oc = due();
+        overclock_step(&f.shared, &mut oc, false);
+        overclock_step(&f.shared, &mut oc, true);
+        overclock_step(&f.shared, &mut oc, false);
+        overclock_step(&f.shared, &mut oc, false);
+        assert!(oc.timer.applied, "the start-up apply came due");
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0, "no NVML or NVAPI at all");
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+    }
+
+    #[test]
+    fn an_untick_left_from_the_last_run_is_restored_at_start_up() {
+        use crate::overclock::fake::FakeGpu;
+        use crate::overclock::Overclocker;
+        use crate::protocol::Settings;
+        use crate::service::tests::{fake_service, test_marker};
+        let marker = test_marker("untick-at-start");
+        // The last run applied 520 W; it was unticked in config.ini before this start.
+        let before = FakeGpu::owners();
+        Overclocker::new(before.clone(), marker.clone(), None, None)
+            .apply(&Settings { oc_power_enabled: true, ..Settings::default() }, false);
+        let f = fake_service(marker, Settings::default());
+        f.gpu.state().power_w = before.state().power_w;
+        overclock_step(&f.shared, &mut due(), false);
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(600)".to_string()]);
+    }
+
+    #[test]
+    fn a_start_up_apply_whose_gpu_would_not_open_is_retried_every_30_s() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        t.open_failed(130.0);
+        assert_eq!(oc_step(&mut t, 130.5, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 159.9, false, false), OcAction::None, "not before 30 s");
+        assert_eq!(oc_step(&mut t, 160.0, false, false), OcAction::Apply);
+        // Opened this time: no more attempts, and releases check as usual.
+        assert_eq!(oc_step(&mut t, 160.5, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 500.0, false, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 510.0, false, true), OcAction::AfterRelease);
+    }
+
+    #[test]
+    fn a_retry_that_comes_due_while_limited_waits_for_the_release() {
+        let mut t = timer();
+        assert_eq!(oc_step(&mut t, 130.0, false, false), OcAction::Apply);
+        t.open_failed(130.0);
+        assert_eq!(oc_step(&mut t, 165.0, true, false), OcAction::None);
+        assert_eq!(oc_step(&mut t, 170.0, false, true), OcAction::Apply);
+    }
+
+    #[test]
+    fn the_loop_retries_a_failed_open_for_the_start_up_apply_only() {
+        use crate::overclock::fake::OWNERS_SUBSYSTEM;
+        use crate::protocol::Settings;
+        use crate::service::tests::test_marker;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let tries = Arc::new(AtomicUsize::new(0));
+        let t2 = Arc::clone(&tries);
+        let shared = Shared::with_overclock_factory(
+            Settings { oc_power_enabled: true, ..Settings::default() },
+            test_marker("open-retry"),
+            Box::new(move |_| {
+                t2.fetch_add(1, O::SeqCst);
+                Err("NVML not found".to_string())
+            }),
+        );
+        shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        let mut oc = due();
+        overclock_step(&shared, &mut oc, false);
+        assert_eq!(tries.load(O::SeqCst), 1);
+        overclock_step(&shared, &mut oc, false);
+        assert_eq!(tries.load(O::SeqCst), 1, "not every iteration");
+        assert!(!oc.timer.applied && oc.timer.due > crate::now() + 29.0, "next try in 30 s");
+    }
+
+    /// An overclocker whose every write panics (a bug in the binding, say).
+    struct Panicking;
+
+    impl crate::service::OcDriver for Panicking {
+        fn apply(&mut self, _: &crate::protocol::Settings, _: bool) -> crate::protocol::OcReport {
+            panic!("driver binding bug")
+        }
+        fn after_release(&mut self, _: &crate::protocol::Settings) -> crate::protocol::OcReport {
+            panic!("driver binding bug")
+        }
+        fn status(&mut self, _: &crate::protocol::Settings) -> crate::protocol::OcStatus {
+            crate::protocol::OcStatus::default()
+        }
+        fn verified_driver(&self) -> Option<String> {
+            None
+        }
+        fn failed_driver(&self) -> Option<String> {
+            None
+        }
+        fn subsystem(&self) -> u32 {
+            crate::overclock::fake::OWNERS_SUBSYSTEM
+        }
+        fn managed(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    fn panicking_service() -> Arc<Shared> {
+        use crate::protocol::Settings;
+        let shared = Shared::with_overclock_factory(
+            Settings { oc_power_enabled: true, ..Settings::default() },
+            crate::service::tests::test_marker("panics"),
+            Box::new(|_| Ok(Box::new(Panicking))),
+        );
+        shared.update(|l| l.card_subsystem = Some(crate::overclock::fake::OWNERS_SUBSYSTEM));
+        shared
+    }
+
+    #[test]
+    fn a_panic_in_the_overclock_does_not_end_the_loop() {
+        let shared = panicking_service();
+        let mut oc = due();
+        let panic = overclock_step(&shared, &mut oc, false);
+        assert_eq!(panic.as_deref(), Some("driver binding bug"), "caught and reported");
+        // The loop carries on, and so does the overclock bookkeeping.
+        assert_eq!(overclock_step(&shared, &mut oc, false), None);
+        overclock_step(&shared, &mut oc, true);
+        assert_eq!(overclock_step(&shared, &mut oc, false).as_deref(), Some("driver binding bug"));
+    }
+
+    #[test]
+    fn a_panic_during_apply_now_still_answers_the_request() {
+        use crate::protocol::{Request, Response, SettingsPatch};
+        let shared = panicking_service();
+        let ipc = Arc::clone(&shared);
+        let request = std::thread::spawn(move || {
+            ipc.handle(Request::ApplyOverclock {
+                changes: SettingsPatch { oc_power_w: Some(520.0), ..Default::default() },
+            })
+        });
+        crate::service::tests::wait_for_mailbox(&shared);
+        // Not due yet: only the Apply now runs (and panics).
+        let mut oc = OcLoop { timer: OcTimer::new(crate::now(), 3600.0), was_engaged: false, last_step: None };
+        assert!(overclock_step(&shared, &mut oc, false).is_some());
+        let Response::Overclock { report } = request.join().unwrap() else { panic!("not an overclock answer") };
+        assert!(report.results.iter().all(|r| !r.ok) && !report.results.is_empty(), "{report:?}");
+        assert!(report.results[0].message.contains("internal error"), "{report:?}");
+    }
+
+    #[test]
+    fn the_trip_note_names_what_is_managed() {
+        assert_eq!(trip_note(&[]), None);
+        let managed = vec!["power".to_string(), "memory".to_string()];
+        assert_eq!(trip_note(&managed).as_deref(), Some("overclock active: power, memory"));
+        assert_eq!(flight_event("engaged", &managed), "engaged-overclock-power-memory");
+        assert_eq!(flight_event("engaged", &[]), "engaged");
+        assert_eq!(flight_event("shutdown", &managed), "shutdown-overclock-power-memory");
+    }
 }

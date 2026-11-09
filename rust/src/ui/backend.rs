@@ -39,6 +39,10 @@ pub enum Job {
     FlightDumps,
     ReadFlight(String),
     ScanSensor,
+    /// Apply now: the overclock keys saved and written to the GPU (can take ~10 s).
+    ApplyOverclock(SettingsPatch),
+    /// The overclock state from the driver; only sent while the Overclock tab is visible.
+    OverclockStatus,
 }
 
 impl Job {
@@ -57,6 +61,8 @@ impl Job {
             Job::FlightDumps => Request::FlightDumps,
             Job::ReadFlight(n) => Request::ReadFlight { name: n.clone() },
             Job::ScanSensor => Request::ScanSensor,
+            Job::ApplyOverclock(c) => Request::ApplyOverclock { changes: c.clone() },
+            Job::OverclockStatus => Request::OverclockStatus,
         }
     }
 
@@ -64,7 +70,13 @@ impl Job {
     fn mutates(&self) -> bool {
         matches!(
             self,
-            Job::SetPaused(_) | Job::Apply(_) | Job::ResetDefaults | Job::Calibrate | Job::ImuFast(_) | Job::ScanSensor
+            Job::SetPaused(_)
+                | Job::Apply(_)
+                | Job::ResetDefaults
+                | Job::Calibrate
+                | Job::ImuFast(_)
+                | Job::ScanSensor
+                | Job::ApplyOverclock(_)
         )
     }
 }
