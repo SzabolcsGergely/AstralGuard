@@ -71,24 +71,40 @@ const SHOW_EVENT: PCWSTR = w!("Local\\AstralGuardShowDashboard");
 
 /// One dashboard per session: true (after bringing the other one up) if a UI is already
 /// running. The mutex is held until this process exits.
-pub fn another_instance_running() -> bool {
-    unsafe {
-        let running = match CreateMutexW(None, true, w!("Local\\AstralGuardUI")) {
-            Ok(h) => {
-                let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-                let _: HANDLE = h; // never closed: the OS releases it when the process ends
-                exists
+///
+/// `wait`: started by the watchdog (not by the user), so another dashboard is most likely
+/// one that is still exiting after a restart: wait for it a while before giving up,
+/// rather than leaving the session with no tray icon at all.
+pub fn another_instance_running(wait: std::time::Duration) -> bool {
+    let give_up = std::time::Instant::now() + wait;
+    loop {
+        let running = unsafe {
+            match CreateMutexW(None, true, w!("Local\\AstralGuardUI")) {
+                Ok(h) if GetLastError() == ERROR_ALREADY_EXISTS => {
+                    // Closed, or this handle alone would keep the name alive.
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                    true
+                }
+                // Kept: the OS releases it when the process ends.
+                Ok(_) => false,
+                // Access denied: it exists, created by the elevated dashboard.
+                Err(e) => e.code() == windows::Win32::Foundation::E_ACCESSDENIED,
             }
-            // Access denied: it exists, created by the elevated dashboard.
-            Err(e) => e.code() == windows::Win32::Foundation::E_ACCESSDENIED,
         };
-        if running && !signal_show() {
-            if let Ok(other) = FindWindowW(PCWSTR::null(), w!("AstralGuard")) {
-                show_window(other.0 as isize);
-            }
+        if !running {
+            return false;
         }
-        running
+        if std::time::Instant::now() >= give_up {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    if wait.is_zero() && !signal_show() {
+        if let Ok(other) = unsafe { FindWindowW(PCWSTR::null(), w!("AstralGuard")) } {
+            show_window(other.0 as isize);
+        }
+    }
+    true
 }
 
 /// Ask the running dashboard to show itself. Works from a non-elevated process (the Start

@@ -22,6 +22,7 @@ use crate::protocol::APP_NAME;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Held by the service: two guards would mean two shutdown commands.
 const SINGLE_INSTANCE_MUTEX: &str = "Local\\AstralGuard_SingleInstance";
+const WATCHDOG_MUTEX: &str = "Local\\AstralGuard_Watchdog";
 pub const TASK_NAME: &str = "AstralGuard";
 
 fn system32(exe: &str) -> PathBuf {
@@ -55,15 +56,36 @@ pub fn is_elevated() -> bool {
 /// Held for the process lifetime. False when another guard already runs.
 pub fn acquire_single_instance() -> bool {
     static HANDLE_KEEP: OnceLock<usize> = OnceLock::new();
+    // cannot tell: running twice beats not running at all
+    acquire_named(SINGLE_INSTANCE_MUTEX, &HANDLE_KEEP).unwrap_or(true)
+}
+
+/// Held by the watchdog for its lifetime. Separate from the service's lock: when the task
+/// is stopped the watchdog dies at once, while its service may take seconds to exit, and
+/// a new start in that window must not mistake the exiting service for a running guard.
+pub fn acquire_watchdog_lock() -> bool {
+    static HANDLE_KEEP: OnceLock<usize> = OnceLock::new();
+    acquire_named(WATCHDOG_MUTEX, &HANDLE_KEEP).unwrap_or(false)
+}
+
+/// A named mutex as a "who is running" marker: Some(true) if this process now holds it,
+/// Some(false) if another process does, None if that cannot be told. A failed attempt
+/// closes its handle, otherwise the handle alone would keep the name alive and every later
+/// attempt would fail too.
+fn acquire_named(name: &str, keep: &OnceLock<usize>) -> Option<bool> {
     unsafe {
-        let name = HSTRING::from(SINGLE_INSTANCE_MUTEX);
-        match CreateMutexW(None, false, &name) {
-            Ok(h) => {
-                let already = GetLastError() == ERROR_ALREADY_EXISTS;
-                let _ = HANDLE_KEEP.set(h.0 as usize);
-                !already
+        match CreateMutexW(None, false, &HSTRING::from(name)) {
+            Ok(h) if GetLastError() == ERROR_ALREADY_EXISTS => {
+                let _ = CloseHandle(h);
+                Some(false)
             }
-            Err(_) => true, // cannot tell; running twice beats not running at all
+            Ok(h) => {
+                let _ = keep.set(h.0 as usize);
+                Some(true)
+            }
+            // Created by an elevated process: it exists, this one may just not open it.
+            Err(e) if e.code() == windows::Win32::Foundation::E_ACCESSDENIED => Some(false),
+            Err(_) => None,
         }
     }
 }
@@ -209,11 +231,11 @@ pub fn set_autostart(enable: bool) -> bool {
     ok && autostart() == Some(enable)
 }
 
-/// True when a guard already holds the single-instance lock in this session.
-pub fn guard_running() -> bool {
+/// True when a watchdog is running in this session (checked without taking the lock).
+pub fn watchdog_running() -> bool {
     use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
     unsafe {
-        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(SINGLE_INSTANCE_MUTEX)) {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(WATCHDOG_MUTEX)) {
             Ok(h) => {
                 let _ = CloseHandle(h);
                 true
@@ -225,9 +247,41 @@ pub fn guard_running() -> bool {
 }
 
 /// Run the logon task now: starts the guard elevated without a UAC prompt. False when
-/// there is no enabled task.
+/// there is no enabled task, or it is the all-users task (Windows only lets an elevated
+/// caller run a "highest privileges" task that is not the caller's own).
 pub fn start_task() -> bool {
     autostart() == Some(true) && schtasks(&["/run", "/tn", TASK_NAME])
+}
+
+/// Start this program again, elevated: the UAC prompt. False if that did not happen
+/// (declined, or no UAC). Used when there is no task this user may run.
+pub fn relaunch_elevated() -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let exe = HSTRING::from(exe.as_os_str());
+    let r = unsafe {
+        ShellExecuteW(
+            windows::Win32::Foundation::HWND::default(),
+            w!("runas"),
+            &exe,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    r.0 as isize > 32
+}
+
+/// Who the logon task starts the guard for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskScope {
+    /// The user running `register`.
+    CurrentUser,
+    /// Whoever signs in (the installer's "Install for all users"): the BUILTIN\Users group,
+    /// so every account gets its own guard in its own session, elevated where the
+    /// account is an administrator.
+    AllUsers,
 }
 
 /// Task names this app had before: registering or unregistering clears them too.
@@ -245,8 +299,15 @@ fn schtasks(args: &[&str]) -> bool {
 /// The logon task: this user, elevated, never time-limited (the default 72 h limit would
 /// stop the guard after three days, and a time-limit stop is not a "failure" that the
 /// restart setting covers), restarted by Task Scheduler if the watchdog itself fails.
-fn task_xml(exe: &std::path::Path, user: &str) -> String {
+fn task_xml(exe: &std::path::Path, user: &str, scope: TaskScope) -> String {
     let dir = exe.parent().map(|p| p.display().to_string()).unwrap_or_default();
+    let (principal, trigger) = match scope {
+        TaskScope::CurrentUser => (
+            format!("<UserId>{}</UserId>\n      <LogonType>InteractiveToken</LogonType>", xml_escape(user)),
+            format!("<LogonTrigger>\n      <UserId>{}</UserId>\n    </LogonTrigger>", xml_escape(user)),
+        ),
+        TaskScope::AllUsers => ("<GroupId>S-1-5-32-545</GroupId>".to_string(), "<LogonTrigger />".to_string()),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -255,8 +316,7 @@ fn task_xml(exe: &std::path::Path, user: &str) -> String {
   </RegistrationInfo>
   <Principals>
     <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
+      {principal}
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
   </Principals>
@@ -272,9 +332,7 @@ fn task_xml(exe: &std::path::Path, user: &str) -> String {
     <Enabled>true</Enabled>
   </Settings>
   <Triggers>
-    <LogonTrigger>
-      <UserId>{user}</UserId>
-    </LogonTrigger>
+    {trigger}
   </Triggers>
   <Actions Context="Author">
     <Exec>
@@ -284,15 +342,15 @@ fn task_xml(exe: &std::path::Path, user: &str) -> String {
   </Actions>
 </Task>
 "#,
-        user = xml_escape(user),
         exe = xml_escape(&exe.display().to_string()),
         dir = xml_escape(&dir),
     )
 }
 
-/// `astralguard register`: the logon task for this executable and the Event Viewer source.
-/// What the installer runs; replaces any earlier task (also under the app's old names).
-pub fn register() -> Result<(), String> {
+/// `astralguard register [--all-users]`: the logon task for this executable and the Event
+/// Viewer source. What the installer runs; replaces any earlier task (also under the
+/// app's old names).
+pub fn register(scope: TaskScope) -> Result<(), String> {
     if !is_elevated() {
         return Err("needs administrator rights".into());
     }
@@ -307,7 +365,7 @@ pub fn register() -> Result<(), String> {
         schtasks(&["/delete", "/tn", name, "/f"]);
     }
     // schtasks wants the XML file in UTF-16 with a byte order mark.
-    let xml = task_xml(&exe, &user);
+    let xml = task_xml(&exe, &user, scope);
     let mut bytes = vec![0xFF, 0xFE];
     bytes.extend(xml.encode_utf16().flat_map(|c| c.to_le_bytes()));
     let file = std::env::temp_dir().join(format!("astralguard-task-{}.xml", std::process::id()));

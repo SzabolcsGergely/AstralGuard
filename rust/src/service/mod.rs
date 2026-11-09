@@ -31,6 +31,8 @@ const PIN_HISTORY_SAMPLES: usize = 600;
 /// 60 s at the fast IMU rate, or ~50 min at the normal one.
 const IMU_HISTORY_SAMPLES: usize = 600;
 const NOTICES_KEPT: usize = 50;
+/// How long a starting service waits for a previous guard to release the lock.
+const SINGLE_INSTANCE_WAIT_SEC: u64 = 15;
 pub const SAG_FAST_MAX_SECONDS: f64 = 300.0;
 
 pub struct State {
@@ -374,10 +376,22 @@ pub fn run(_args: &[String]) -> i32 {
     logger::init(&log_dir.join("astralguard.log"), logger::Level::Info);
     crate::crash::install(&log_dir);
 
-    // Two guards would mean two shutdown commands.
-    if !platform::acquire_single_instance() {
-        logger::info("Another AstralGuard is already running; this copy exits.");
-        return 0;
+    // Two guards would mean two shutdown commands. A guard that was just stopped can take a
+    // few seconds to let go of the lock (a restart of the logon task does exactly that), so
+    // wait before deciding that another guard really is running: giving up too early would
+    // leave no guard at all.
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(SINGLE_INSTANCE_WAIT_SEC);
+    let mut waited = false;
+    while !platform::acquire_single_instance() {
+        if std::time::Instant::now() >= give_up {
+            logger::info("Another AstralGuard is already running; this copy exits.");
+            return 0;
+        }
+        if !waited {
+            logger::info("Another AstralGuard holds the lock; waiting for it to exit.");
+            waited = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     let (settings, baseline) = config::load(&config::config_path());

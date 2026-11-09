@@ -31,7 +31,14 @@ fn main() {
         "probe" => probe(),
         "status" => status(rest),
         #[cfg(windows)]
-        "register" => setup_step("register", platform::register()),
+        "register" => {
+            let scope = if rest.iter().any(|a| a == "--all-users") {
+                platform::TaskScope::AllUsers
+            } else {
+                platform::TaskScope::CurrentUser
+            };
+            setup_step("register", platform::register(scope))
+        }
         #[cfg(windows)]
         "unregister" => setup_step("unregister", platform::unregister()),
         _ => {

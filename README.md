@@ -98,18 +98,26 @@ Get the package for your system from the
 
 ### Windows 10 / 11
 
-Run **`AstralGuard-<version>-setup.exe`**. It asks for administrator rights, installs to
-`C:\Program Files\AstralGuard` and adds a Start menu entry. If you leave **Start
-AstralGuard when I sign in** ticked, it also creates a logon task that starts the guard
-elevated: limiting the GPU needs administrator rights, and the task provides them without
-a UAC prompt at every sign-in.
+Run **`AstralGuard-<version>-setup.exe`**. It first asks who to install for:
+
+| | Install for all users (recommended) | Install for me only |
+|---|---|---|
+| Program | `C:\Program Files\AstralGuard` | `%LOCALAPPDATA%\Programs\AstralGuard` |
+| Start menu | everyone's | yours |
+| Guard starts at sign-in for | every user who signs in, each in their own session | you |
+| Administrator rights | for the whole setup | one UAC prompt, to create the logon task |
+
+Unless you untick **Start AstralGuard when … signs in**, setup creates a logon task that
+starts the guard elevated. Limiting the GPU needs administrator rights, and the task
+provides them without a UAC prompt at every sign-in. Upgrades keep the choice you made
+the first time.
 
 The guard then lives in the tray. Hover the icon: `AstralGuard: Safe (all pins within
 limits) | ...` means it is reading your card. Opening **AstralGuard** from the Start menu
-brings up the dashboard.
+brings up the dashboard, or starts the guard if it isn't running.
 
-Silent install: `AstralGuard-<version>-setup.exe /VERYSILENT` (add `/TASKS=""` to skip
-the logon task).
+Silent install: `AstralGuard-<version>-setup.exe /VERYSILENT /ALLUSERS` (or
+`/CURRENTUSER`; add `/TASKS=""` to skip the logon task).
 
 The program is not code-signed yet, so SmartScreen may warn on first run ("More info" →
 "Run anyway").
@@ -351,7 +359,7 @@ source *AstralGuard*):
 | `astralguard ui --demo` | Dashboard with a simulated card: no hardware, no service |
 | `astralguard probe` | Read the card a few times and print pins, volts and tilt. Read-only, safe next to a running guard. |
 | `astralguard status [--exit]` | Ask the running service for its state, or stop it (elevated / root) |
-| `astralguard register` / `unregister` | Windows: create / remove the logon task and Event Log source (the installer uses these) |
+| `astralguard register [--all-users]` / `unregister` | Windows, elevated: create / remove the logon task (for this user, or for everyone who signs in) and the Event Log source. The installer uses these. |
 
 ## Troubleshooting
 

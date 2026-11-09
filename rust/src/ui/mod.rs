@@ -185,9 +185,14 @@ pub fn run(args: &[String]) -> i32 {
     let opts = Opts::parse(args);
     let shot = opts.screenshot.is_some();
 
+    // `--show` is a user asking for the window: bring up the running one at once. Without
+    // it this is the watchdog's dashboard, and a running one may just be still exiting.
     #[cfg(windows)]
-    if !opts.demo && !shot && win::another_instance_running() {
-        return 0;
+    if !opts.demo && !shot {
+        let wait = if opts.show { Duration::ZERO } else { Duration::from_secs(15) };
+        if win::another_instance_running(wait) {
+            return 0;
+        }
     }
 
     let mut prefs = if shot { Prefs::default() } else { Prefs::load() };
