@@ -72,18 +72,35 @@ pub fn run(args: &[String]) -> i32 {
     // Started again (Start menu, desktop shortcut) while the guard runs: open the dashboard
     // instead. The UI shows the running window, or starts one if it was closed.
     #[cfg(windows)]
-    if crate::platform::guard_running() {
+    let open_dashboard = || {
         if with_ui {
             let _ = Command::new(exe()).args(["ui", "--show"]).spawn();
         }
-        return 0;
+        0
+    };
+    #[cfg(windows)]
+    if crate::platform::watchdog_running() {
+        return open_dashboard();
     }
     // Started without elevation (the Start menu shortcut) while the guard is not running:
-    // start it through the logon task, which runs it elevated, as at sign-in.
+    // start it elevated, through this user's logon task (no prompt) or else with a UAC
+    // prompt. Declined: carry on without elevation, which means shutdown-only.
     #[cfg(windows)]
-    if !crate::platform::is_elevated() && crate::platform::start_task() {
-        logger::info("Not elevated: started the guard through its logon task instead.");
-        return 0;
+    if !crate::platform::is_elevated() {
+        if crate::platform::start_task() {
+            logger::info("Not elevated: started the guard through its logon task instead.");
+            return 0;
+        }
+        if crate::platform::relaunch_elevated() {
+            logger::info("Not elevated: started the guard again with administrator rights.");
+            return 0;
+        }
+        logger::warn("Not elevated and elevation declined: running shutdown-only.");
+    }
+    // Taken only now: the elevated copy started above must not find it held by this one.
+    #[cfg(windows)]
+    if !crate::platform::acquire_watchdog_lock() {
+        return open_dashboard();
     }
     let job = job::create();
     logger::info(format!(

@@ -102,9 +102,16 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
   read-only and safe next to a running guard. A real guard (`astralguard`) needs elevation
   (Windows) or root (Linux) to limit the GPU; without it, it runs shutdown-only and says so.
-- Only one guard runs per session (single-instance lock). If one is installed, stop it
-  (Task Scheduler task `AstralGuard`, or `systemctl stop astralguard`) before running your
-  build, and start it again afterwards.
+- Only one guard runs per session. There are three locks: the watchdog's (a second start opens
+  the dashboard instead), the service's (two guards would mean two shutdown commands) and
+  the UI's. A just-stopped guard can take seconds to exit, so the service and the
+  watchdog-started UI wait up to 15 s for a lock before giving up. Don't shorten that:
+  giving up early once left no guard running. If a guard is installed, stop it (Task
+  Scheduler task `AstralGuard`, or `systemctl stop astralguard`) before running your build,
+  and start it again afterwards.
+- Windows elevation: a non-elevated `astralguard` starts the guard through this user's
+  logon task (no prompt), or relaunches itself with a UAC prompt. Windows lets only an
+  elevated caller run the all-users task (Users group, highest privileges) on demand.
 
 ## Checks (what CI runs)
 
@@ -193,7 +200,7 @@ results are downloadable run artifacts), and `release.yml` runs it for tags.
 
 | Package | Built by | Notes |
 |---|---|---|
-| `AstralGuard-<v>-setup.exe` | Inno Setup, `rust/packaging/windows/astralguard.iss` | Installs to Program Files; the logon task is created by `astralguard register` |
+| `AstralGuard-<v>-setup.exe` | Inno Setup, `rust/packaging/windows/astralguard.iss` | Asks "all users" (Program Files, `astralguard register --all-users`: a task for the Users group) or "just me" (user profile, `astralguard register` via one UAC prompt) |
 | `astralguard_<v>-1_amd64.deb` | cargo-deb, `[package.metadata.deb]` in `rust/Cargo.toml` | Built in a `debian:bookworm` container so it runs on Debian 12+ / Ubuntu 22.04+; install-tested on four distributions |
 | `astralguard-<v>-1-x86_64.pkg.tar.zst` | `makepkg`, `rust/packaging/linux/arch/PKGBUILD` | Built and install-tested in an `archlinux` container |
 

@@ -1,9 +1,14 @@
 ; AstralGuard setup (Inno Setup 6). The release workflow builds it:
 ;   iscc /DAppVersion=2.0.0 /DSourceExe=<path to astralguard.exe> /DRepoRoot=<repo> /O<out> astralguard.iss
 ;
-; Installs astralguard.exe to Program Files and, unless unticked, registers the logon task
-; that starts it elevated (`astralguard register`). Settings and logs live in
-; %ProgramData%\AstralGuard and survive uninstall and upgrades.
+; Setup first asks who to install for (Inno Setup's install mode dialog):
+;   All users  (administrator): Program Files, Start menu for everyone, and a logon task
+;              that starts the guard for whoever signs in (`astralguard register --all-users`).
+;   Just me    : the user's own Programs folder and Start menu, and a logon task for this
+;              user only (`astralguard register`, one UAC prompt: the guard needs
+;              administrator rights to limit the GPU, and so does creating its task).
+; Settings and logs live in %ProgramData%\AstralGuard and survive uninstall and upgrades.
+; An upgrade keeps the mode of the first install.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -28,7 +33,10 @@ DefaultDirName={autopf}\AstralGuard
 DefaultGroupName=AstralGuard
 DisableProgramGroupPage=yes
 LicenseFile={#RepoRoot}\LICENSE
+; "Install for all users" (default, needs administrator) or "Install for me only".
 PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
+UsedUserAreasWarning=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -46,7 +54,8 @@ VersionInfoDescription=AstralGuard setup
 CloseApplications=no
 
 [Tasks]
-Name: "autostart"; Description: "Start AstralGuard when I sign in (recommended: the guard only protects while it runs)"
+Name: "autostart"; Description: "Start AstralGuard when any user signs in (recommended: the guard only protects while it runs)"; Check: IsAdminInstallMode
+Name: "autostartme"; Description: "Start AstralGuard when I sign in (recommended: the guard only protects while it runs)"; Check: not IsAdminInstallMode
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
@@ -55,7 +64,7 @@ Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags:
 Source: "{#RepoRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
-Name: "{commonappdata}\AstralGuard"
+Name: "{commonappdata}\AstralGuard"; Check: IsAdminInstallMode
 
 [Icons]
 Name: "{autoprograms}\AstralGuard"; Filename: "{app}\astralguard.exe"; Comment: "Per-pin 12V-2x6 current guard"
@@ -63,18 +72,30 @@ Name: "{autoprograms}\AstralGuard settings and logs"; Filename: "{commonappdata}
 Name: "{autodesktop}\AstralGuard"; Filename: "{app}\astralguard.exe"; Tasks: desktopicon
 
 [Run]
-; The logon task (elevated, no time limit) or, if unticked, no task at all.
-Filename: "{app}\astralguard.exe"; Parameters: "register"; Tasks: autostart; Flags: runhidden waituntilterminated; StatusMsg: "Registering the logon task..."
-Filename: "{app}\astralguard.exe"; Parameters: "unregister"; Tasks: not autostart; Flags: runhidden waituntilterminated
-; Start it now: through the task when there is one, so it runs exactly as it will at sign-in.
-Filename: "{sys}\schtasks.exe"; Parameters: "/run /tn AstralGuard"; Tasks: autostart; Flags: postinstall runhidden; Description: "Start AstralGuard now"
-Filename: "{app}\astralguard.exe"; Tasks: not autostart; Flags: postinstall nowait; Description: "Start AstralGuard now"
+; All users: setup runs elevated, so everything runs directly.
+Filename: "{app}\astralguard.exe"; Parameters: "register --all-users"; Tasks: autostart; Flags: runhidden waituntilterminated; StatusMsg: "Registering the logon task..."
+Filename: "{app}\astralguard.exe"; Parameters: "unregister"; Check: IsAdminInstallMode and not WizardIsTaskSelected('autostart'); Flags: runhidden waituntilterminated
+; Just me: creating an elevated logon task needs administrator rights (one UAC prompt).
+Filename: "{app}\astralguard.exe"; Parameters: "register"; Tasks: autostartme; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; StatusMsg: "Registering the logon task..."
+; Start it now: through the task when there is one, so it runs exactly as it will at sign-in
+; (this user may run their own task without elevating; setup is elevated for all users).
+Filename: "{sys}\schtasks.exe"; Parameters: "/run /tn AstralGuard"; Tasks: autostart autostartme; Flags: postinstall runhidden; Description: "Start AstralGuard now"
+Filename: "{app}\astralguard.exe"; Check: not WizardIsTaskSelected('autostart') and not WizardIsTaskSelected('autostartme'); Flags: postinstall nowait; Description: "Start AstralGuard now"
 
 [UninstallRun]
-Filename: "{app}\astralguard.exe"; Parameters: "unregister"; Flags: runhidden waituntilterminated; RunOnceId: "Unregister"
+Filename: "{app}\astralguard.exe"; Parameters: "unregister"; Check: IsAdminInstallMode; Flags: runhidden waituntilterminated; RunOnceId: "Unregister"
+Filename: "{app}\astralguard.exe"; Parameters: "unregister"; Check: not IsAdminInstallMode; Verb: "runas"; Flags: shellexec runhidden waituntilterminated; RunOnceId: "UnregisterMe"
 Filename: "{sys}\taskkill.exe"; Parameters: "/f /im astralguard.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopGuard"
 
 [Code]
+function GuardRunning(): Boolean;
+var
+  Code: Integer;
+begin
+  Result := Exec(ExpandConstant('{cmd}'), '/c tasklist /fi "imagename eq astralguard.exe" /nh | find /i "astralguard.exe"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
 procedure StopGuard();
 var
   Code: Integer;
@@ -84,6 +105,9 @@ begin
     hand. }
   Exec(ExpandConstant('{sys}\schtasks.exe'), '/end /tn AstralGuard', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im astralguard.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  { Just me: setup is not elevated and cannot end the elevated guard. One UAC prompt. }
+  if (not IsAdminInstallMode) and GuardRunning() then
+    ShellExec('runas', ExpandConstant('{sys}\taskkill.exe'), '/f /im astralguard.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Sleep(1500);
 end;
 
