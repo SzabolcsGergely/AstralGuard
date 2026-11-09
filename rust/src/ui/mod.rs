@@ -10,9 +10,10 @@
 //!
 //! Options:
 //!   --show                 open the window even if "Open on start" is off
-//!   --demo                 simulated service instead of IPC (--phase <s>, --offline)
+//!   --demo                 simulated service instead of IPC (--phase <s>, --offline,
+//!                          --no-sensor: card found, pin monitor unreadable until Scan)
 //!   --screenshot <png>     render, save a PNG, exit (--tab, --theme, --scale, --size WxH,
-//!                          --confirm pause|exit|reset|calibrate|warnings)
+//!                          --confirm pause|exit|reset|calibrate|warnings|scan|scan-result)
 
 mod backend;
 mod demo;
@@ -44,7 +45,7 @@ use theme::Theme;
 use tray::{TrayAction, TrayHandle};
 use widgets as w;
 
-use crate::protocol::{Live, ResponseMode, SagStatus, SettingsPatch, Status, APP_NAME};
+use crate::protocol::{Live, Response, ResponseMode, SagStatus, ScanReport, SettingsPatch, Status, APP_NAME};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
@@ -83,6 +84,8 @@ enum Confirm {
     Calibrate,
     Reset,
     Warnings(Vec<String>, Box<SettingsPatch>),
+    Scan,
+    ScanResult(ScanReport),
 }
 
 #[derive(Default)]
@@ -90,6 +93,7 @@ struct Opts {
     show: bool,
     demo: bool,
     offline: bool,
+    no_sensor: bool,
     phase: Option<f64>,
     screenshot: Option<String>,
     tab: Option<String>,
@@ -108,6 +112,7 @@ impl Opts {
                 "--show" => o.show = true,
                 "--demo" => o.demo = true,
                 "--offline" => o.offline = true,
+                "--no-sensor" => o.no_sensor = true,
                 "--phase" => o.phase = it.next().and_then(|v| v.parse().ok()),
                 "--screenshot" => o.screenshot = it.next().cloned(),
                 "--tab" => o.tab = it.next().cloned(),
@@ -206,7 +211,7 @@ pub fn run(args: &[String]) -> i32 {
 
     let link = Link::new();
     let backend: Box<dyn Backend> = if opts.demo {
-        Box::new(demo::Demo::new(opts.phase.unwrap_or(52.0), opts.offline))
+        Box::new(demo::Demo::new(opts.phase.unwrap_or(52.0), opts.offline, opts.no_sensor))
     } else {
         Box::new(crate::ipc::Client::new())
     };
@@ -332,6 +337,10 @@ struct App {
     exit_pending: bool,
     icon_status: Option<Status>,
     flash: Option<(String, Instant)>,
+    /// A sensor scan is in flight (the button shows Scanning...).
+    scanning: bool,
+    /// The scan popup's "scan automatically next time" toggle.
+    scan_auto: bool,
     shot: Option<Shot>,
     live: Option<Arc<Live>>,
     connected: bool,
@@ -358,6 +367,15 @@ impl App {
             Some("exit") => Some(Confirm::Exit),
             Some("reset") => Some(Confirm::Reset),
             Some("calibrate") => Some(Confirm::Calibrate),
+            Some("scan") => Some(Confirm::Scan),
+            Some("scan-result") => Some(Confirm::ScanResult(ScanReport {
+                found: true,
+                message: "Pin monitor on /dev/i2c-9 (\"NVIDIA i2c adapter 1 at 1:00.0\"), saved.".into(),
+                lines: vec![
+                    "/dev/i2c-9 NVIDIA i2c adapter 1 at 1:00.0: pin monitor: rail 12.10-12.10 V, 1.00 g".into(),
+                    "/dev/i2c-10 NVIDIA i2c adapter 2 at 1:00.0: nothing at 0x2B".into(),
+                ],
+            })),
             Some("warnings") => Some(Confirm::Warnings(
                 crate::config::check(
                     &Default::default(),
@@ -389,6 +407,8 @@ impl App {
             exit_pending: false,
             icon_status: None,
             flash: None,
+            scanning: false,
+            scan_auto: false,
             shot: opts.screenshot.map(|path| Shot { path, ready_frames: 0, requested: false }),
             live: None,
             connected: false,
@@ -497,6 +517,18 @@ impl App {
                 }
                 (Job::Calibrate, Ok(_)) => {
                     self.flash = Some(("Calibrating · takes about 10 s".into(), Instant::now()));
+                }
+                (Job::ScanSensor, Ok(Response::Scan { report })) => {
+                    self.scanning = false;
+                    self.confirm = Some(Confirm::ScanResult(report.clone()));
+                }
+                (Job::ScanSensor, other) => {
+                    self.scanning = false;
+                    let msg = match other {
+                        Err(e) => e.clone(),
+                        Ok(r) => format!("unexpected answer to the scan: {r:?}"),
+                    };
+                    self.flash = Some((msg, Instant::now()));
                 }
                 _ => {}
             }
@@ -652,6 +684,7 @@ impl App {
             .show(ctx, |ui| {
                 self.header(ui, &t, l);
                 self.banners(ui, &t, l);
+                self.sensor_banner(ui, &t, l);
                 self.update_banner(ui, &t);
                 self.tab_bar(ui, &t);
             });
@@ -789,6 +822,37 @@ impl App {
             });
         });
         ui.add_space(8.0);
+    }
+
+    /// "Pin sensor not reading" with Scan, while the service says a supported card is there
+    /// but its pin monitor gives no valid data. Without it the user only sees Unknown and
+    /// has no way to know a scan would fix it.
+    fn sensor_banner(&mut self, ui: &mut egui::Ui, t: &Theme, l: Option<&Live>) {
+        let Some(l) = l.filter(|l| self.connected && l.sensor_scan_suggested && !l.paused) else { return };
+        let c = t.danger;
+        egui::Frame::new()
+            .fill(t.tint_bg(c))
+            .stroke(Stroke::new(1.0_f32, c.gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin { left: 10, right: 10, top: 4, bottom: 4 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(3.0, 16.0), Sense::hover());
+                    ui.painter().rect_filled(r, 1.5, c);
+                    ui.label(RichText::new("Pin sensor not reading").font(theme::semibold(13.0)).color(t.text));
+                    ui.label(RichText::new("· not protected; press Scan to find it").size(13.0).color(t.muted()))
+                        .on_hover_text(&l.sensor_problem);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if self.scanning { "Scanning..." } else { "Scan" };
+                        if ui.add_enabled(!self.scanning, egui::Button::new(label).small()).clicked() {
+                            self.scan_auto = l.settings.sensor_auto_scan;
+                            self.confirm = Some(Confirm::Scan);
+                        }
+                    });
+                });
+            });
+        ui.add_space(6.0);
     }
 
     /// "Update available" with Download / Skip, unless the user skipped that version.
@@ -936,6 +1000,8 @@ impl App {
     fn modals(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
         let t = self.theme;
+        // Information only (the scan result): one button, nothing to cancel.
+        let info_only = matches!(confirm, Confirm::ScanResult(_));
         let (title, body, ok, danger): (&str, Vec<String>, &str, bool) = match confirm {
             Confirm::Pause => (
                 "Pause protection?",
@@ -962,6 +1028,21 @@ impl App {
                 false,
             ),
             Confirm::Warnings(ws, _) => ("Reduced protection", ws.clone(), "Apply anyway", true),
+            Confirm::Scan => (
+                "Scan for the pin sensor?",
+                vec![
+                    "The guard looks for the card's pin monitor on each of the card's own I2C buses (address 0x2B, reads only) and keeps the one that shows 12 V on every pin and matches the card's power draw.".into(),
+                    "Takes a few seconds.".into(),
+                ],
+                "Scan",
+                false,
+            ),
+            Confirm::ScanResult(r) => (
+                if r.found { "Pin sensor found" } else { "Pin sensor not found" },
+                std::iter::once(r.message.clone()).chain(r.lines.iter().cloned()).collect(),
+                "OK",
+                false,
+            ),
         };
         let mut result: Option<bool> = None;
         let modal = egui::Modal::new(egui::Id::new("confirm"))
@@ -981,6 +1062,11 @@ impl App {
                     ui.label(RichText::new(line).color(t.muted()));
                     ui.add_space(2.0);
                 }
+                if matches!(confirm, Confirm::Scan) {
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.scan_auto, RichText::new("Scan automatically next time").color(t.text));
+                    ui.label(RichText::new(settings::AUTO_SCAN_WHY).size(12.0).color(t.muted()));
+                }
                 ui.add_space(12.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let fill = if danger { t.danger } else { t.accent };
@@ -995,7 +1081,7 @@ impl App {
                     {
                         result = Some(true);
                     }
-                    if ui.add(egui::Button::new("Cancel").min_size(Vec2::new(80.0, 30.0))).clicked() {
+                    if !info_only && ui.add(egui::Button::new("Cancel").min_size(Vec2::new(80.0, 30.0))).clicked() {
                         result = Some(false);
                     }
                 });
@@ -1020,6 +1106,18 @@ impl App {
             }
             Some(Confirm::Calibrate) => self.send(Job::Calibrate),
             Some(Confirm::Reset) => self.send(Job::ResetDefaults),
+            Some(Confirm::Scan) => {
+                let current = self.live.as_ref().is_some_and(|l| l.settings.sensor_auto_scan);
+                if self.scan_auto != current {
+                    self.send(Job::Apply(SettingsPatch {
+                        sensor_auto_scan: Some(self.scan_auto),
+                        ..Default::default()
+                    }));
+                }
+                self.scanning = true;
+                self.send(Job::ScanSensor);
+            }
+            Some(Confirm::ScanResult(_)) => {}
             Some(Confirm::Warnings(_, patch)) => {
                 self.settings.apply_confirmed();
                 self.send(Job::Apply(*patch));

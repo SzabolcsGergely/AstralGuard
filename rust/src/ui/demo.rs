@@ -1,5 +1,6 @@
 //! `astralguard ui --demo`: a simulated service, no hardware and no IPC. Loops through idle,
 //! gaming load, Pin3 dropping out (imbalance) and the response ladder limiting the GPU.
+//! `--no-sensor` starts with the card found but its pin monitor unreadable, until Scan.
 
 use std::collections::VecDeque;
 use std::thread;
@@ -16,6 +17,8 @@ pub struct Demo {
     t0: f64,
     paused: bool,
     offline: bool,
+    /// The card is found but its pin monitor gives no valid data, until a scan.
+    no_sensor: bool,
     settings: Settings,
     history: VecDeque<(f64, Vec<f64>)>,
     imu: VecDeque<(f64, f64, f64, f64)>,
@@ -32,12 +35,13 @@ fn now() -> f64 {
 
 impl Demo {
     /// `phase`: seconds into the cycle to start at (52 = imbalance, 67 = GPU limited).
-    pub fn new(phase: f64, offline: bool) -> Demo {
+    pub fn new(phase: f64, offline: bool, no_sensor: bool) -> Demo {
         let t = now();
         let mut d = Demo {
             t0: t - phase,
             paused: false,
             offline,
+            no_sensor,
             settings: Settings::default(),
             history: VecDeque::new(),
             imu: VecDeque::new(),
@@ -103,7 +107,47 @@ impl Demo {
         [x, y, z]
     }
 
+    /// What the service reports while the card is found but its sensor is unreadable.
+    fn live_no_sensor(&self) -> Live {
+        Live {
+            version: APP_VERSION.into(),
+            status: Status::Error,
+            last_message: "Waiting for pin sensors...".into(),
+            mitigation: "ready".into(),
+            card_length_mm: CARD_MM,
+            settings: self.settings.clone(),
+            watchdog: true,
+            sensor_scan_suggested: true,
+            sensor_problem:
+                "sensor chip did not answer: implausible sample: no pin shows the 12 V rail (highest 0.056 V)".into(),
+            ..Default::default()
+        }
+    }
+
+    fn scan_report(&mut self) -> ScanReport {
+        thread::sleep(Duration::from_millis(1500));
+        self.no_sensor = false;
+        let lines = (1..=7)
+            .map(|n| {
+                let verdict = match n {
+                    1 => "pin monitor: rail 12.10-12.10 V, 1.00 g, pins 67 W of 67 W board power",
+                    6 => "not the pin monitor: sample 1: read failed (Input/output error)",
+                    _ => "nothing at 0x2B",
+                };
+                format!("/dev/i2c-{} NVIDIA i2c adapter {n} at 1:00.0: {verdict}", n + 8)
+            })
+            .collect();
+        ScanReport {
+            found: true,
+            message: "Pin monitor on /dev/i2c-9 (\"NVIDIA i2c adapter 1 at 1:00.0\"), saved (demo).".into(),
+            lines,
+        }
+    }
+
     fn live(&mut self) -> Live {
+        if self.no_sensor {
+            return self.live_no_sensor();
+        }
         let t = now();
         let amps = self.pins(t);
         self.history.push_back((t, amps.clone()));
@@ -192,6 +236,8 @@ impl Demo {
             settings: self.settings.clone(),
             watchdog: true,
             log_path: String::new(),
+            sensor_scan_suggested: false,
+            sensor_problem: String::new(),
         }
     }
 
@@ -292,6 +338,7 @@ impl Backend for Demo {
             Request::LogTail { .. } => Response::Text { text: self.log_text() },
             Request::ReadFlight { .. } => Response::Text { text: self.flight_csv() },
             Request::Events { .. } => Response::Events { notices: Vec::new() },
+            Request::ScanSensor => Response::Scan { report: self.scan_report() },
         })
     }
 }

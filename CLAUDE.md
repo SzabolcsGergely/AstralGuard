@@ -18,7 +18,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
   src/config.rs           config.ini read/write (keeps unknown keys and comments), data_dir()
   src/ipc.rs              local socket: named pipe (Windows) / unix socket (Linux)
   src/watchdog.rs         supervises service + ui, restarts crashes (job object / SIGKILL)
-  src/sensor/             IT8915 per-pin + accelerometer reads: nvapi.rs (Windows), i2cdev.rs (Linux)
+  src/sensor/             IT8915 per-pin + accelerometer reads: nvapi.rs (Windows), i2cdev.rs (Linux),
+                          detect.rs (Linux sensor scan: probe --detect / dashboard Scan)
   src/mitigation.rs       NVML clock lock + power limit, and putting them back
   src/service/            the protection core
     monitor.rs            0.5 s loop: read pins, tier 1 timer, act on the ladder's decision
@@ -94,9 +95,10 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
 - **No hardware needed:** `astralguard ui --demo` runs the dashboard against a simulated
   service that cycles through idle, gaming load, an imbalance and a tier 1 trip (90 s).
   `--phase <s>` starts at a point in the cycle (52 = imbalance, 67 = GPU limited),
-  `--offline` simulates a missing service.
+  `--offline` simulates a missing service, `--no-sensor` a card whose pin monitor reads
+  nothing until Scan is pressed.
 - **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|imu|settings|log
-  [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings]`
+  [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]`
   renders one frame and exits. `docs/screenshots/` is made this way.
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
   read-only and safe next to a running guard. A real guard (`astralguard`) needs elevation
@@ -141,9 +143,15 @@ existing tone of the module doc comments.
 These are not style preferences. A change that breaks one gets rejected.
 
 1. **I2C is read-only.** Every transaction to the IT8915 (device `0x2B`) is "set register
-   pointer, read N bytes". Never write a data register, never probe other I2C addresses or
-   buses: a write to the wrong device on a GPU bus can permanently damage hardware.
-   `NvAPI_I2CWriteEx` is deliberately not bound. Don't bind it.
+   pointer, read N bytes". Never write a data register, never probe other I2C addresses:
+   a write to the wrong device on a GPU bus can permanently damage hardware.
+   `NvAPI_I2CWriteEx` is deliberately not bound. Don't bind it. The one place that touches
+   more than one bus is the sensor scan (`sensor/detect.rs`): only on a person's request
+   or with `sensor_auto_scan` on (off by default; then once per time the pins stop
+   reading, never at every start), only the Astral's own adapters, only address `0x2B`, a pure 1-byte read first, and the
+   pointer+read only where that was acknowledged. The service refuses a scan while a
+   sensor is connected. On Linux, reads go through `I2C_SMBUS` block reads: the NVIDIA
+   driver returns zeros for the same read through `I2C_RDWR`.
 2. **The service makes no network connections.** Anything networked (the update check)
    lives in the UI process.
 3. **Nothing in the UI can stop protection.** The UI is a client of the service over IPC.

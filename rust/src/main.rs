@@ -28,7 +28,7 @@ fn main() {
         #[cfg(feature = "ui")]
         "ui" => ui::run(rest),
         "" | "watchdog" => watchdog::run(rest),
-        "probe" => probe(),
+        "probe" => probe(rest),
         "status" => status(rest),
         #[cfg(windows)]
         "register" => {
@@ -42,7 +42,7 @@ fn main() {
         #[cfg(windows)]
         "unregister" => setup_step("unregister", platform::unregister()),
         _ => {
-            eprintln!("usage: astralguard [watchdog [--no-ui] | service | ui [--demo] | probe | status]");
+            eprintln!("usage: astralguard [watchdog [--no-ui] | service | ui [--demo] | probe [--detect [--dry-run]] | status]");
             2
         }
     };
@@ -122,7 +122,17 @@ fn status(args: &[String]) -> i32 {
 
 /// `astralguard probe`: read the card a few times and print it. Read-only, like the guard;
 /// safe next to a running guard (they only share the I2C bus for a moment).
-fn probe() -> i32 {
+/// `--detect [--dry-run]` (Linux): find and save the adapter that carries the IT8915.
+fn probe(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--detect") {
+        #[cfg(target_os = "linux")]
+        return sensor::detect::run(!args.iter().any(|a| a == "--dry-run"));
+        #[cfg(not(target_os = "linux"))]
+        {
+            println!("--detect is for Linux; on Windows NVAPI addresses the chip's port directly.");
+            return 0;
+        }
+    }
     let mut sensor = match sensor::PinSensor::connect() {
         Ok(s) => s,
         Err(e) => {

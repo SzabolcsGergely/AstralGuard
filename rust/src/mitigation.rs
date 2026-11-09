@@ -38,6 +38,32 @@ const NVML_LIBRARY: &str = "nvml.dll";
 #[cfg(not(windows))]
 const NVML_LIBRARY: &str = "libnvidia-ml.so.1";
 
+/// The card's total board power as NVML reports it. Read-only (no limit or clock call):
+/// `probe --detect` compares it with the pins' sum to tell the IT8915 from another chip.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct BoardPower {
+    nvml: Nvml,
+    handle: Handle,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl BoardPower {
+    pub fn open(subsystem_id: u32) -> Result<BoardPower, String> {
+        let nvml = Nvml::init()?;
+        for i in 0..nvml.device_count()? {
+            let h = nvml.handle(i)?;
+            if nvml.subsystem_id(h)? == subsystem_id {
+                return Ok(BoardPower { nvml, handle: h });
+            }
+        }
+        Err(format!("NVML lists no GPU with subsystem 0x{subsystem_id:08X}"))
+    }
+
+    pub fn watts(&self) -> Result<f64, String> {
+        self.nvml.power_usage_mw(self.handle).map(|mw| mw as f64 / 1000.0)
+    }
+}
+
 pub fn marker_path() -> PathBuf {
     crate::config::data_dir().join("mitigation.active")
 }
@@ -115,6 +141,13 @@ impl Nvml {
     fn power_limit_mw(&self, h: Handle) -> Result<u32, String> {
         let mut v = 0u32;
         call!(self, "nvmlDeviceGetPowerManagementLimit", unsafe extern "C" fn(Handle, *mut u32) -> i32, h, &mut v);
+        Ok(v)
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn power_usage_mw(&self, h: Handle) -> Result<u32, String> {
+        let mut v = 0u32;
+        call!(self, "nvmlDeviceGetPowerUsage", unsafe extern "C" fn(Handle, *mut u32) -> i32, h, &mut v);
         Ok(v)
     }
 

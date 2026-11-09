@@ -51,6 +51,13 @@ pub struct Shared {
     pub paused: AtomicBool,
     pub stop: AtomicBool,
     pub calibrate_request: AtomicBool,
+    /// A sensor scan saved a new adapter: stop waiting and connect now.
+    pub reconnect_now: AtomicBool,
+    /// A scan is running; a second request is refused rather than queued.
+    scanning: AtomicBool,
+    /// Held by a sensor scan for as long as it talks to the adapters, and by the monitor
+    /// (try_lock only) while it connects: the two never touch the bus at the same time.
+    pub bus: Mutex<()>,
     fast_until: Mutex<f64>,
     pub baseline: Mutex<Option<SagBaseline>>,
     /// Tests: no toasts, no Event Log, no config writes.
@@ -83,6 +90,9 @@ impl Shared {
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             calibrate_request: AtomicBool::new(false),
+            reconnect_now: AtomicBool::new(false),
+            scanning: AtomicBool::new(false),
+            bus: Mutex::new(()),
             fast_until: Mutex::new(0.0),
             baseline: Mutex::new(baseline),
             quiet,
@@ -253,6 +263,41 @@ impl Shared {
         failures
     }
 
+    /// The sensor scan, from the dashboard or automatic. Only while no sensor is connected: a working sensor is never
+    /// disturbed. The bus lock keeps the monitor from connecting meanwhile, so the scan is alone on it.
+    pub(crate) fn scan_sensor(&self, origin: &str) -> crate::protocol::ScanReport {
+        use crate::protocol::ScanReport;
+        let refuse = |message: &str| ScanReport { found: false, message: message.into(), lines: Vec::new() };
+        if self.live_field(|l| !l.card.is_empty()) {
+            return refuse("The pin sensor is reading; no scan needed.");
+        }
+        if !platform::is_elevated() {
+            return refuse("The guard is not running as root, so it cannot scan or save the result.");
+        }
+        if self.scanning.swap(true, Ordering::SeqCst) {
+            return refuse("A scan is already running.");
+        }
+        let report = {
+            let _bus = self.bus.lock().unwrap_or_else(|e| e.into_inner());
+            // Checked again under the lock: the monitor may have connected since the check above.
+            if self.live_field(|l| !l.card.is_empty()) {
+                refuse("The pin sensor is reading; no scan needed.")
+            } else {
+                logger::info(format!("Sensor scan started {origin}."));
+                crate::sensor::scan()
+            }
+        };
+        self.scanning.store(false, Ordering::SeqCst);
+        for line in &report.lines {
+            logger::info(format!("Sensor scan: {line}"));
+        }
+        logger::info(format!("Sensor scan: {}", report.message));
+        if report.found {
+            self.reconnect_now.store(true, Ordering::Relaxed);
+        }
+        report
+    }
+
     pub fn handle(&self, req: Request) -> Response {
         match req {
             Request::Live => Response::Live { live: Box::new(self.snapshot()) },
@@ -282,6 +327,7 @@ impl Shared {
                     imbalance_delta_amps: Some(d.imbalance_delta_amps),
                     imbalance_sustained_seconds: Some(d.imbalance_sustained_seconds),
                     imbalance_response: Some(d.imbalance_response),
+                    sensor_auto_scan: Some(d.sensor_auto_scan),
                 };
                 let failures = self.apply(&patch);
                 self.notify(
@@ -294,6 +340,7 @@ impl Shared {
                 self.paused.store(paused, Ordering::Relaxed);
                 Response::Ok
             }
+            Request::ScanSensor => Response::Scan { report: self.scan_sensor("from the dashboard") },
             Request::CalibrateSag => {
                 self.calibrate_request.store(true, Ordering::Relaxed);
                 Response::Ok
@@ -394,4 +441,20 @@ pub fn run(_args: &[String]) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scan_never_runs_while_the_sensor_is_reading() {
+        let shared = Shared::new(Settings::default(), None, true);
+        shared.update(|l| l.card = "ROG Astral RTX 5090 OC".into());
+        let Response::Scan { report } = shared.handle(Request::ScanSensor) else { panic!("not a scan answer") };
+        assert!(!report.found);
+        assert!(report.message.contains("no scan needed"), "{}", report.message);
+        assert!(report.lines.is_empty());
+        assert!(!shared.reconnect_now.load(Ordering::Relaxed));
+    }
 }

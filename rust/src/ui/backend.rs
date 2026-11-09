@@ -38,6 +38,7 @@ pub enum Job {
     LogTail,
     FlightDumps,
     ReadFlight(String),
+    ScanSensor,
 }
 
 impl Job {
@@ -55,12 +56,16 @@ impl Job {
             Job::LogTail => Request::LogTail { max_bytes: 65536 },
             Job::FlightDumps => Request::FlightDumps,
             Job::ReadFlight(n) => Request::ReadFlight { name: n.clone() },
+            Job::ScanSensor => Request::ScanSensor,
         }
     }
 
     /// Changes the service state: poll right after, so the UI catches up at once.
     fn mutates(&self) -> bool {
-        matches!(self, Job::SetPaused(_) | Job::Apply(_) | Job::ResetDefaults | Job::Calibrate | Job::ImuFast(_))
+        matches!(
+            self,
+            Job::SetPaused(_) | Job::Apply(_) | Job::ResetDefaults | Job::Calibrate | Job::ImuFast(_) | Job::ScanSensor
+        )
     }
 }
 
