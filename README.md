@@ -46,6 +46,7 @@ session alive. It **shuts the machine down** only if that is not enough.
 - [Files, logs and events](#files-logs-and-events)
 - [Command line](#command-line)
 - [Troubleshooting](#troubleshooting)
+- [Reporting a bug](#reporting-a-bug)
 - [Building from source](#building-from-source)
 - [Disclaimer](#disclaimer)
 
@@ -65,7 +66,9 @@ session alive. It **shuts the machine down** only if that is not enough.
 - **Built to keep running**: protection runs in its own headless process. A watchdog
   restarts anything that crashes, and the dashboard can't take protection down with it.
 - **Tray icon and dashboard**: live thermal-style view of the plug, five minutes of
-  history, every setting, the log.
+  history, the sag level, every setting, the log.
+- **Optional overclock**: undervolt, power limit and memory offset, recorded and put back
+  exactly, kept apart from protection.
 - **Update check**: the dashboard tells you when a new release is out. It never downloads
   or installs anything by itself.
 - **Windows and Linux**: a setup wizard on Windows, `.deb` and Arch packages on Linux.
@@ -90,7 +93,9 @@ is recognised by its PCI subsystem ID:
 | ROG Astral RTX 5080 | `0x89DF1043` |
 
 Verified on hardware: ROG Astral RTX 5090 OC (readings within 0.06 A of HWiNFO). The
-others share the same monitor chip and are expected to work. Reports welcome.
+others share the same monitor chip and are expected to work. If you have one, a
+[card report](https://github.com/SzabolcsGergely/AstralGuard/issues/new?template=card_report.yml)
+with the output of `astralguard probe` tells us whether it does.
 
 ## Install
 
@@ -156,7 +161,7 @@ Or build it yourself with [`rust/packaging/linux/arch/PKGBUILD`](rust/packaging/
 > 1 g on the accelerometer and a total that matches NVML's board power, and saves it
 > (`i2c_adapter` and `i2c_adapter_subsystem` in `config.ini`, used only while the same card
 > sits at the same PCI address). Tick **Scan automatically next time** in the scan popup
-> (or Settings → System) and the guard does this by itself the next time the pins stop
+> (or Protection → Pin sensor) and the guard does this by itself the next time the pins stop
 > reading, for example after a driver update. `ASTRALGUARD_I2C_BUS=<n>` in a systemd
 > drop-in selects an adapter explicitly and overrides the saved one.
 
@@ -287,18 +292,24 @@ documented driver API.
 ## The dashboard and tray
 
 <p align="center">
-  <img src="docs/screenshots/imu.png" width="49%" alt="Anti-sag tab: bubble level, tilt per axis, sag">
-  <img src="docs/screenshots/settings.png" width="49%" alt="Settings tab">
+  <img src="docs/screenshots/overclock.png" width="49%" alt="Overclock tab: live tiles, the voltage/frequency curve, power limit and memory offset">
+  <img src="docs/screenshots/imu.png" width="49%" alt="Sag tab: bubble level, tilt per axis, sag">
+  <img src="docs/screenshots/protection.png" width="49%" alt="Protection tab: tiers, response, pin imbalance, sag">
+  <img src="docs/screenshots/settings.png" width="49%" alt="Settings tab: window and system preferences">
 </p>
 
 - **Overview**: a thermal-camera style view of the plug (colour = current, scaled to the
   thresholds), max / min / delta / total power, average voltage, response state,
-  imbalance and sag, and five minutes of history.
-- **Overclock**: an optional undervolt, power limit and memory offset ([below](#overclock)).
-- **Anti-sag**: bubble level, the card's angle on each axis, sag against the calibrated
-  position, and a minute of history. **Calibrate** sets the reference.
-- **Settings**: every protection value (checked, and confirmed when it weakens
-  protection), response mode, autostart, theme, window behaviour, update check.
+  imbalance and sag, the protection thresholds in one line, and five minutes of history.
+- **Overclock**: an optional undervolt, power limit and memory offset ([below](#overclock)),
+  with what the card is doing now: power draw, core voltage, memory clock, highest pin.
+- **Sag**: bubble level, the card's angle on each axis, sag against the calibrated
+  position, the sag limits in one line, and a minute of history. **Calibrate** sets the
+  reference.
+- **Protection**: every protection value (checked, and confirmed when it weakens
+  protection) and the response mode, with the ladder they give in words. The one place
+  protection is changed; **Edit…** on Overview and Sag leads here.
+- **Settings**: theme, window behaviour, autostart, update check. These apply at once.
 - **Log**: the guard's log and the flight recorder dumps.
 
 The **tray icon** is a dot in the status colour. Its menu: **Open Dashboard**, **Open
@@ -340,7 +351,7 @@ limited by then, or cannot be opened, the service waits and retries every 30 s. 
 release from limiting, the saved settings are applied again (values already in effect are not
 rewritten). The same goes for a resume from sleep, after the same delay: the driver puts the
 power limit back to stock when the machine wakes up. With nothing ticked and nothing managed, AstralGuard makes no NVML or NVAPI calls
-for the overclock at all, and the tab reads the GPU only while it is open.
+for the overclock at all, and the tab reads the GPU only while it is open (every 2 s).
 
 Because these calls run on the monitor thread, the pin reads wait for them. Every overclock
 call there that takes longer than 250 ms is logged as a warning with its duration, and the
@@ -476,6 +487,26 @@ On Linux the same events go to the journal as `[id] message`.
   Settings → Window → **Mirror connector pin order** flips the drawing. Protection doesn't
   depend on it.
 
+## Reporting a bug
+
+Open an issue with the
+[bug report form](https://github.com/SzabolcsGergely/AstralGuard/issues/new?template=bug_report.yml).
+It asks for what is needed to reproduce the problem:
+
+- the AstralGuard version (dashboard header), how it is installed, the OS, the card and the
+  NVIDIA driver version;
+- what happened and what you expected, with a screenshot of the dashboard if it shows it;
+- the lines around the problem from `astralguard.log`, and `crash_trace.log` after a crash
+  (see [Files, logs and events](#files-logs-and-events));
+- if the guard limited the GPU or shut down: the flight recorder CSV from that moment;
+- for anything about pin readings: the output of `astralguard probe`.
+
+Logs contain file paths with your user name; look through them before attaching. An Astral
+card that is not on the verified list gets a
+[card report](https://github.com/SzabolcsGergely/AstralGuard/issues/new?template=card_report.yml),
+working or not. Ideas go in a
+[feature request](https://github.com/SzabolcsGergely/AstralGuard/issues/new?template=feature_request.yml).
+
 ## Building from source
 
 ```sh
@@ -486,7 +517,7 @@ cargo build --release
 
 [`CLAUDE.md`](CLAUDE.md) is the contributor guide: toolchains for Windows and Linux,
 the Linux build dependencies, tests and lints, the code layout, the safety rules the code
-follows, packaging and how releases are cut.
+follows, packaging and how releases are cut. Pull requests get a checklist of the same.
 
 ## Disclaimer
 

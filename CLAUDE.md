@@ -36,7 +36,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
     flight.rs             last minute of samples, dumped when the guard acts
     crosscheck.rs         observational comparison with HWiNFO, never decides anything
   src/platform/           windows.rs / linux.rs: elevation, toasts, event log, shutdown, autostart
-  src/ui/                 tray + egui dashboard (feature "ui"); overclock.rs = the Overclock tab; demo.rs = simulated service;
+  src/ui/                 tray + egui dashboard (feature "ui"); live.rs = Overview, overclock.rs = Overclock, imu.rs = Sag,
+                          settings.rs = Protection + Settings, log.rs = Log; demo.rs = simulated service;
                           host.rs = Linux tray process that starts the window as `ui --window`
   build.rs                Windows: embeds the icon + version info (writes a .res itself)
   assets/icon/            icon sources (SVG), render.py, the generated .ico / PNGs
@@ -46,6 +47,7 @@ rust/                     the whole program: one crate, one binary (astralguard)
   .cargo/config.toml      Windows GNU toolchain linker settings (see below)
   build.ps1               Windows GNU build helper
 .github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags)
+.github/ISSUE_TEMPLATE/   bug report, card report, feature request forms; PULL_REQUEST_TEMPLATE.md
 docs/screenshots/         README images, rendered with --screenshot
 ```
 
@@ -106,7 +108,7 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
   `--phase <s>` starts at a point in the cycle (52 = imbalance, 67 = GPU limited),
   `--offline` simulates a missing service, `--no-sensor` a card whose pin monitor reads
   nothing until Scan is pressed.
-- **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|overclock|imu|settings|log
+- **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|overclock|imu|protection|settings|log
   [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]`
   renders one frame and exits. `docs/screenshots/` is made this way.
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
@@ -196,13 +198,52 @@ These are not style preferences. A change that breaks one gets rejected.
    limit is released, on resume), on an untick and on status requests. Rule 1
    is unchanged: nothing here writes to I2C.
 
+## Common pitfalls
+
+Things that have gone wrong before, and how to avoid them.
+
+- **Screenshots from a stale binary.** `rust/target/release/astralguard.exe` is not always
+  the newest build: `build.ps1` and other target dirs leave the newest exe elsewhere (the
+  repository root). Build first, then render from the exe you just built, and check the tab
+  bar in the image matches the code. Regenerate `docs/screenshots/` with every UI change:
+
+  ```sh
+  astralguard ui --demo --phase 35 --screenshot docs/screenshots/live.png --tab live
+  astralguard ui --demo --phase 67 --screenshot docs/screenshots/protecting.png --tab live
+  # and overclock, imu, protection, settings at --phase 35
+  ```
+- **A tab that scrolls at the default size.** Every tab must fit the default window
+  (800x820) without scrolling, also with a banner showing (`--phase 67` shows one). The
+  last chart on a tab takes what is left (`ui.available_height()`, clamped) instead of a
+  fixed height; the Overclock curve measures the rest of the tab on the frame before.
+  Check new content with a screenshot at the default size and at `--phase 67`.
+- **Protection settings in more than one place.** `SettingsView` is one form: one diff, one
+  dirty flag, and `sync` skips reloading while anything is edited; **Reset to defaults**
+  resets every protection group together. Protection values are edited only on the
+  Protection tab. Other tabs show a read-only summary with **Edit…**.
+- **Tab keys are stored.** `Tab::key()` is what `ui.json` (`last_tab`) and `--tab` use.
+  Rename a tab's label, never its key; add an alias in `Tab::parse` for an old name.
+- **Polling the GPU faster.** The Overclock tab's status request reads the whole V/F curve
+  over NVAPI, which on Windows shares its lock with the pin reads (rule 9). Keep it at 2 s;
+  a faster live value needs its own NVML-only request.
+- **A new `OcStatus` / `Live` field or request without the demo.** `ui/demo.rs` answers
+  everything the dashboard asks; forget it and `--demo` and the screenshots show dashes.
+- **Overclock write order on Windows.** An NVML memory offset write resets every V/F curve
+  delta to 0 (driver 621.14). `Overclocker::run` restores and applies the curve after the
+  memory step for that reason; keep that order and its tests.
+- **`astralguard status` says "Access is denied".** The named pipe accepts only elevated
+  callers; run it from an elevated shell. That is by design (an ordinary program cannot
+  pause the guard), not a bug.
+- **Coverage on the Windows GNU toolchain.** It ships no profiler runtime, so
+  `cargo llvm-cov` fails there. Measure coverage on Linux or with MSVC.
+
 ## Changing things
 
 - **Service ↔ UI protocol:** both sides live in `protocol.rs` and ship in the same binary,
   so there is no version skew to handle. Add a `Request`/`Response` variant, handle it in
   `service/mod.rs`, call it from `ui/backend.rs`, and teach `ui/demo.rs` to answer it.
 - **A new setting:** add it to `Settings`, its default, `SettingsPatch`, the check/merge in
-  `config.rs` (with validation), the Settings tab, and the README's configuration table.
+  `config.rs` (with validation), the Protection tab (`ui/settings.rs`), and the README's configuration table.
 - **A new supported card:** add its PCI subsystem ID and length to `ASTRAL_CARDS` in
   `sensor/mod.rs`, and to the README table. Only Astral cards have the per-pin monitor.
 - **Logging:** `logger::{info, warn, error, critical}` to `astralguard.log`; user-visible

@@ -1,0 +1,54 @@
+name: Card report
+description: AstralGuard on an Astral card that is not verified yet, working or not.
+labels: ["card report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Only the ROG Astral RTX 5090 OC is verified on hardware. A report from any other
+        Astral card tells us whether its monitor chip reads the same way.
+  - type: input
+    id: card
+    attributes:
+      label: Card
+      placeholder: ROG Astral RTX 5080 OC White
+    validations:
+      required: true
+  - type: input
+    id: subsystem
+    attributes:
+      label: PCI subsystem ID
+      description: Printed by `astralguard probe`, and in the log's "Connected:" line.
+      placeholder: "0x8A2B1043"
+  - type: input
+    id: system
+    attributes:
+      label: AstralGuard version, OS and NVIDIA driver
+      placeholder: v2.0.0, Windows 11, driver 621.14
+    validations:
+      required: true
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe output
+      description: |
+        `astralguard probe` (elevated on Windows, `sudo` on Linux). Run it once at idle and
+        once under load if you can.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: compare
+    attributes:
+      label: Comparison
+      description: Per-pin currents from HWiNFO or GPU Tweak at the same moment, if you have them.
+  - type: dropdown
+    id: result
+    attributes:
+      label: Does it work?
+      options:
+        - Yes, readings look right
+        - Readings are there but look wrong
+        - No readings
+    validations:
+      required: true

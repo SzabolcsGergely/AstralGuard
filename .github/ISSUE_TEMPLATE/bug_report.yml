@@ -1,0 +1,85 @@
+name: Bug report
+description: Something AstralGuard did, or didn't do, that it should have.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If the guard acted (limited the GPU or shut down), the flight
+        recorder CSV from that moment is the most useful thing you can attach.
+
+        Logs contain file paths with your user name. Look through them before attaching.
+  - type: input
+    id: version
+    attributes:
+      label: AstralGuard version
+      description: Shown in the dashboard header, and in the log's "Starting AstralGuard v…" line.
+      placeholder: v2.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it is installed
+      options:
+        - Windows setup, all users
+        - Windows setup, just me
+        - Windows portable (astralguard.exe with config.ini next to it)
+        - Debian / Ubuntu .deb
+        - Arch Linux package
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 24H2 / Ubuntu 24.04 (Wayland, GNOME 46)
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Card and NVIDIA driver
+      description: The card name from the dashboard header, and the driver version (`nvidia-smi`).
+      placeholder: ROG Astral RTX 5090 OC, driver 621.14
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead. Screenshots of the dashboard help.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: Leave empty if you don't know.
+      placeholder: |
+        1. Open the Overclock tab
+        2. Tick Memory offset, enter 2000, press Apply now
+        3. ...
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        The lines around the problem from `astralguard.log`
+        (Windows: `C:\ProgramData\AstralGuard\logs`, Linux: `/var/lib/astralguard/logs`).
+        After a crash, also `crash_trace.log` (and `watchdog.log` on Windows).
+      render: text
+  - type: textarea
+    id: probe
+    attributes:
+      label: Probe output
+      description: |
+        For anything about pin readings: the output of `astralguard probe` (elevated / `sudo`).
+        It is read-only and safe next to a running guard.
+      render: text
+  - type: textarea
+    id: files
+    attributes:
+      label: Attachments
+      description: Drag in the flight recorder CSV (`logs/flight_<time>_<event>.csv`) if the guard acted.
