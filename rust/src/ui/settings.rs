@@ -408,6 +408,9 @@ impl SettingsView {
                             (&mut prefs.always_on_top, "Always on top"),
                             (&mut prefs.connector_mirror, "Mirror connector pin order"),
                         ] {
+                            if text == "Always on top" && !super::always_on_top_supported() {
+                                continue;
+                            }
                             if ui.checkbox(v, text).changed() {
                                 prefs_changed = true;
                             }
