@@ -1,4 +1,4 @@
-//! Settings tab: every protection value the service lets the dashboard change, plus the
+//! Protection and Settings tabs: every protection value the service lets the dashboard change, plus the
 //! window's own preferences. Protection changes go Check -> (confirm warnings) -> Apply.
 
 use std::time::Instant;
@@ -26,7 +26,7 @@ macro_rules! num {
 
 // indexes into NUMS, grouped by card
 /// Why the automatic sensor scan exists and when it runs; shown in the scan popup and as
-/// the Settings checkbox's tooltip.
+/// the Protection tab checkbox's tooltip.
 pub const AUTO_SCAN_WHY: &str = "The card's pin monitor sits on one of its I2C buses. A driver \
 update, a kernel change or a different card can move it to another bus; the pins then stop \
 reading and the connector is not protected. With this on, the guard scans by itself when that \
@@ -41,8 +41,8 @@ const SAG_SERIOUS: usize = 10;
 const SAG_LENGTH: usize = 12;
 
 const NUMS: [Num; 13] = [
-    num!(threshold_amps, "Threshold", "A"),
-    num!(sustained_seconds_required, "Sustained for", "s"),
+    num!(threshold_amps, "Tier 1", "A"),
+    num!(sustained_seconds_required, "Tier 1 for", "s"),
     num!(critical_amps, "Tier 2", "A"),
     num!(critical_seconds, "Tier 2 for", "s"),
     num!(catastrophic_amps, "Tier 3", "A · immediate"),
@@ -159,7 +159,7 @@ impl SettingsView {
         (p, errors)
     }
 
-    fn dirty(&self) -> bool {
+    pub fn dirty(&self) -> bool {
         let (p, e) = self.diff();
         !p.is_empty() || !e.is_empty()
     }
@@ -314,6 +314,7 @@ impl SettingsView {
         prefs: &mut Prefs,
         card_mm: f64,
         updates: Option<&super::update::Updates>,
+        protection: bool,
     ) -> (Option<Ask>, bool) {
         let mut ask = None;
         let mut prefs_changed = false;
@@ -328,169 +329,209 @@ impl SettingsView {
             let (l, r) = (&mut left[0], &mut right[0]);
             // columns are justified; cards lay out their rows left-aligned
             l.with_layout(Layout::top_down(Align::LEFT), |l| {
-                w::card(l, t, "Overcurrent & tiers", |ui| {
-                    for i in OVERCURRENT {
-                        self.num_row(ui, t, &base, i, None);
-                    }
-                    ui.add_space(8.0);
-                    w::caption(ui, t, "Response");
-                    ui.add_space(2.0);
-                    let changed = self.response_mode != base.response_mode;
-                    for (v, text) in [
-                        (ResponseMode::Tiered, "Limit GPU, then shut down"),
-                        (ResponseMode::ShutdownOnly, "Shut down only"),
-                    ] {
-                        let rt = RichText::new(text).color(if changed && self.response_mode == v {
-                            t.accent
-                        } else {
-                            t.text
-                        });
-                        ui.radio_value(&mut self.response_mode, v, rt);
-                    }
-                });
-                l.add_space(w::GAP);
-                w::card(l, t, "Window", |ui| {
-                    label_row(ui, t, "Theme", |ui| {
-                        let label = theme::PRESETS.iter().find(|p| p.0 == prefs.theme).map(|p| p.1).unwrap_or("Dark");
-                        egui::ComboBox::from_id_salt("theme").selected_text(label).width(150.0).show_ui(ui, |ui| {
-                            for (key, name) in theme::PRESETS {
-                                if ui.selectable_label(prefs.theme == key, name).clicked() {
-                                    prefs.theme = key.into();
-                                    prefs_changed = true;
-                                }
-                            }
-                        });
-                    });
-                    label_row(ui, t, "Close button", |ui| {
-                        let label = if prefs.close_action == "exit" { "Exit the guard" } else { "Hide to tray" };
-                        egui::ComboBox::from_id_salt("close").selected_text(label).width(150.0).show_ui(ui, |ui| {
-                            for (key, name) in [("tray", "Hide to tray"), ("exit", "Exit the guard")] {
-                                if ui.selectable_label(prefs.close_action == key, name).clicked() {
-                                    prefs.close_action = key.into();
-                                    prefs_changed = true;
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(2.0);
-                    for (v, text) in [
-                        (&mut prefs.minimize_to_tray, "Minimize to tray"),
-                        (&mut prefs.show_on_start, "Open on start"),
-                        (&mut prefs.always_on_top, "Always on top"),
-                        (&mut prefs.connector_mirror, "Mirror connector pin order"),
-                    ] {
-                        if ui.checkbox(v, text).changed() {
-                            prefs_changed = true;
+                if protection {
+                    w::card(l, t, "Overcurrent & tiers", |ui| {
+                        for i in OVERCURRENT {
+                            self.num_row(ui, t, &base, i, None);
                         }
-                    }
-                });
-            });
-
-            r.with_layout(Layout::top_down(Align::LEFT), |r| {
-                w::card(r, t, "Pin imbalance", |ui| {
-                    let rt = |changed: bool, s: &str| RichText::new(s).color(if changed { t.accent } else { t.text });
-                    let ch = self.imbalance_enabled != base.imbalance_enabled;
-                    ui.checkbox(&mut self.imbalance_enabled, rt(ch, "Check enabled"));
-                    ui.horizontal(|ui| {
-                        let ch = self.imbalance_response != base.imbalance_response;
-                        for (v, s) in
-                            [(ImbalanceResponse::Warn, "Warn only"), (ImbalanceResponse::Act, "Act like overcurrent")]
-                        {
-                            let sel = ch && self.imbalance_response == v;
-                            ui.radio_value(&mut self.imbalance_response, v, rt(sel, s));
-                        }
-                    });
-                    ui.add_space(2.0);
-                    for i in IMBALANCE {
-                        self.num_row(ui, t, &base, i, None);
-                    }
-                });
-                r.add_space(w::GAP);
-                w::card(r, t, "GPU sag", |ui| {
-                    let ch = self.sag_enabled != base.sag_enabled;
-                    ui.checkbox(
-                        &mut self.sag_enabled,
-                        RichText::new("Detection enabled").color(if ch { t.accent } else { t.text }),
-                    );
-                    ui.add_space(2.0);
-                    for i in SAG {
-                        let hint = (i == SAG_WARN || i == SAG_SERIOUS)
-                            .then(|| {
-                                parse(&self.texts[i])
-                                    .map(|d| format!("° → {:.1} mm", crate::protocol::sag_mm(d, card_mm)))
-                            })
-                            .flatten();
-                        self.num_row(ui, t, &base, i, hint);
-                    }
-                    ui.add_space(4.0);
-                    if w::button(ui, "Calibrate baseline…").clicked() {
-                        ask = Some(Ask::ConfirmCalibrate);
-                    }
-                });
-                r.add_space(w::GAP);
-                w::card(r, t, "System", |ui| {
-                    let label = if cfg!(windows) { "Start with Windows" } else { "Start at boot" };
-                    ui.horizontal(|ui| match self.autostart {
-                        Autostart::Known(Some(mut on)) => {
-                            if ui.checkbox(&mut on, label).changed() {
-                                self.autostart = Autostart::Busy;
-                                ask = Some(Ask::Job(Job::AutostartSet(on)));
-                            }
-                        }
-                        Autostart::Known(None) => {
-                            ui.add_enabled(false, egui::Checkbox::new(&mut false, label));
-                            ui.label(RichText::new("· not installed").color(t.muted()).size(12.0));
-                        }
-                        Autostart::Busy | Autostart::Unknown => {
-                            ui.add_enabled(false, egui::Checkbox::new(&mut false, label));
-                            ui.spinner();
-                        }
-                    });
-                    ui.label(RichText::new("Applies at once · needs admin").color(t.muted()).size(12.0));
-                    ui.add_space(6.0);
-                    // Linux only: on Windows the driver addresses the pin monitor directly.
-                    if cfg!(target_os = "linux") {
-                        let ch = self.sensor_auto_scan != base.sensor_auto_scan;
-                        ui.checkbox(
-                            &mut self.sensor_auto_scan,
-                            RichText::new("Scan for the pin sensor automatically").color(if ch {
+                        ui.add_space(8.0);
+                        w::caption(ui, t, "Response");
+                        ui.add_space(2.0);
+                        let changed = self.response_mode != base.response_mode;
+                        for (v, text) in [
+                            (ResponseMode::Tiered, "Limit GPU, then shut down"),
+                            (ResponseMode::ShutdownOnly, "Shut down only"),
+                        ] {
+                            let rt = RichText::new(text).color(if changed && self.response_mode == v {
                                 t.accent
                             } else {
                                 t.text
-                            }),
-                        )
-                        .on_hover_text(AUTO_SCAN_WHY);
-                        ui.label(
-                            RichText::new("Only when it stops reading, once each time").color(t.muted()).size(12.0),
-                        );
-                        ui.add_space(6.0);
-                    }
-                    if ui.checkbox(&mut prefs.check_updates, "Check for updates daily").changed() {
-                        prefs_changed = true;
-                    }
-                    if let Some(u) = updates {
-                        use super::update::UpdateState;
-                        ui.horizontal(|ui| {
-                            if w::button(ui, "Check now").clicked() {
-                                u.check_now();
-                            }
-                            let current = crate::protocol::APP_VERSION;
-                            let (text, color) = match u.state() {
-                                UpdateState::Idle => (format!("v{current}"), t.muted()),
-                                UpdateState::Checking => ("checking…".into(), t.muted()),
-                                UpdateState::UpToDate { checked } => {
-                                    (format!("v{current} is the latest · {}", checked.format("%H:%M")), t.muted())
-                                }
-                                UpdateState::Available { version, .. } => (format!("v{version} available"), t.accent),
-                                UpdateState::Failed { error } => (format!("check failed: {error}"), t.pending),
-                            };
-                            ui.label(RichText::new(text).color(color).size(12.0));
+                            });
+                            ui.radio_value(&mut self.response_mode, v, rt);
+                        }
+                    });
+                    l.add_space(w::GAP);
+                    w::card(l, t, "What this does", |ui| {
+                        for line in self.ladder_text(&base) {
+                            ui.add(egui::Label::new(RichText::new(line).color(t.muted()).size(12.5)).wrap());
+                            ui.add_space(2.0);
+                        }
+                    });
+                    // Linux only: on Windows the driver addresses the pin monitor directly.
+                    if cfg!(target_os = "linux") {
+                        l.add_space(w::GAP);
+                        w::card(l, t, "Pin sensor", |ui| {
+                            let ch = self.sensor_auto_scan != base.sensor_auto_scan;
+                            ui.checkbox(
+                                &mut self.sensor_auto_scan,
+                                RichText::new("Scan for the pin sensor automatically").color(if ch {
+                                    t.accent
+                                } else {
+                                    t.text
+                                }),
+                            )
+                            .on_hover_text(AUTO_SCAN_WHY);
+                            ui.label(
+                                RichText::new("Only when it stops reading, once each time").color(t.muted()).size(12.0),
+                            );
                         });
                     }
-                });
+                } else {
+                    w::card(l, t, "Window", |ui| {
+                        label_row(ui, t, "Theme", |ui| {
+                            let label =
+                                theme::PRESETS.iter().find(|p| p.0 == prefs.theme).map(|p| p.1).unwrap_or("Dark");
+                            egui::ComboBox::from_id_salt("theme").selected_text(label).width(150.0).show_ui(ui, |ui| {
+                                for (key, name) in theme::PRESETS {
+                                    if ui.selectable_label(prefs.theme == key, name).clicked() {
+                                        prefs.theme = key.into();
+                                        prefs_changed = true;
+                                    }
+                                }
+                            });
+                        });
+                        label_row(ui, t, "Close button", |ui| {
+                            let label = if prefs.close_action == "exit" { "Exit the guard" } else { "Hide to tray" };
+                            egui::ComboBox::from_id_salt("close").selected_text(label).width(150.0).show_ui(ui, |ui| {
+                                for (key, name) in [("tray", "Hide to tray"), ("exit", "Exit the guard")] {
+                                    if ui.selectable_label(prefs.close_action == key, name).clicked() {
+                                        prefs.close_action = key.into();
+                                        prefs_changed = true;
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        for (v, text) in [
+                            (&mut prefs.minimize_to_tray, "Minimize to tray"),
+                            (&mut prefs.show_on_start, "Open on start"),
+                            (&mut prefs.always_on_top, "Always on top"),
+                            (&mut prefs.connector_mirror, "Mirror connector pin order"),
+                        ] {
+                            if ui.checkbox(v, text).changed() {
+                                prefs_changed = true;
+                            }
+                        }
+                    });
+                }
+            });
+
+            r.with_layout(Layout::top_down(Align::LEFT), |r| {
+                if protection {
+                    w::card(r, t, "Pin imbalance", |ui| {
+                        let rt =
+                            |changed: bool, s: &str| RichText::new(s).color(if changed { t.accent } else { t.text });
+                        let ch = self.imbalance_enabled != base.imbalance_enabled;
+                        ui.checkbox(&mut self.imbalance_enabled, rt(ch, "Check enabled"));
+                        ui.horizontal(|ui| {
+                            let ch = self.imbalance_response != base.imbalance_response;
+                            for (v, s) in [
+                                (ImbalanceResponse::Warn, "Warn only"),
+                                (ImbalanceResponse::Act, "Act like overcurrent"),
+                            ] {
+                                let sel = ch && self.imbalance_response == v;
+                                ui.radio_value(&mut self.imbalance_response, v, rt(sel, s));
+                            }
+                        });
+                        ui.add_space(2.0);
+                        for i in IMBALANCE {
+                            self.num_row(ui, t, &base, i, None);
+                        }
+                    });
+                    r.add_space(w::GAP);
+                    w::card(r, t, "GPU sag", |ui| {
+                        let ch = self.sag_enabled != base.sag_enabled;
+                        ui.checkbox(
+                            &mut self.sag_enabled,
+                            RichText::new("Detection enabled").color(if ch { t.accent } else { t.text }),
+                        );
+                        ui.add_space(2.0);
+                        for i in SAG {
+                            let hint = (i == SAG_WARN || i == SAG_SERIOUS)
+                                .then(|| {
+                                    parse(&self.texts[i])
+                                        .map(|d| format!("° → {:.1} mm", crate::protocol::sag_mm(d, card_mm)))
+                                })
+                                .flatten();
+                            self.num_row(ui, t, &base, i, hint);
+                        }
+                        ui.add_space(4.0);
+                        if w::button(ui, "Calibrate baseline…").clicked() {
+                            ask = Some(Ask::ConfirmCalibrate);
+                        }
+                    });
+                } else {
+                    w::card(r, t, "System", |ui| {
+                        let label = if cfg!(windows) { "Start with Windows" } else { "Start at boot" };
+                        ui.horizontal(|ui| match self.autostart {
+                            Autostart::Known(Some(mut on)) => {
+                                if ui.checkbox(&mut on, label).changed() {
+                                    self.autostart = Autostart::Busy;
+                                    ask = Some(Ask::Job(Job::AutostartSet(on)));
+                                }
+                            }
+                            Autostart::Known(None) => {
+                                ui.add_enabled(false, egui::Checkbox::new(&mut false, label));
+                                ui.label(RichText::new("· not installed").color(t.muted()).size(12.0));
+                            }
+                            Autostart::Busy | Autostart::Unknown => {
+                                ui.add_enabled(false, egui::Checkbox::new(&mut false, label));
+                                ui.spinner();
+                            }
+                        });
+                        ui.label(RichText::new("Applies at once · needs admin").color(t.muted()).size(12.0));
+                        ui.add_space(6.0);
+                        if ui.checkbox(&mut prefs.check_updates, "Check for updates daily").changed() {
+                            prefs_changed = true;
+                        }
+                        if let Some(u) = updates {
+                            use super::update::UpdateState;
+                            ui.horizontal(|ui| {
+                                if w::button(ui, "Check now").clicked() {
+                                    u.check_now();
+                                }
+                                let current = crate::protocol::APP_VERSION;
+                                let (text, color) = match u.state() {
+                                    UpdateState::Idle => (format!("v{current}"), t.muted()),
+                                    UpdateState::Checking => ("checking…".into(), t.muted()),
+                                    UpdateState::UpToDate { checked } => {
+                                        (format!("v{current} is the latest · {}", checked.format("%H:%M")), t.muted())
+                                    }
+                                    UpdateState::Available { version, .. } => {
+                                        (format!("v{version} available"), t.accent)
+                                    }
+                                    UpdateState::Failed { error } => (format!("check failed: {error}"), t.pending),
+                                };
+                                ui.label(RichText::new(text).color(color).size(12.0));
+                            });
+                        }
+                    });
+                }
             });
         });
         (ask, prefs_changed)
+    }
+
+    /// The response ladder in words, from the values in the form (the saved one where a field
+    /// does not parse), so an edit shows what it will mean before it is applied.
+    fn ladder_text(&self, base: &Settings) -> Vec<String> {
+        let v = |i: usize| parse(&self.texts[i]).unwrap_or((NUMS[i].get)(base));
+        let (t1, t1s, t2, t2s, t3) = (v(0), v(1), v(2), v(3), v(4));
+        if self.response_mode == ResponseMode::Tiered {
+            vec![
+                format!("A pin at {t1} A or more for {t1s} s: the GPU is limited."),
+                format!("{t2} A or more for {t2s} s: the GPU is limited, with less time to recover."),
+                format!("{t3} A or more: the PC shuts down at once."),
+                format!("If limiting does not bring the pin under {t1} A, the PC shuts down."),
+            ]
+        } else {
+            vec![
+                format!("A pin at {t1} A or more for {t1s} s: the PC shuts down."),
+                format!("{t2} A or more for {t2s} s: the PC shuts down."),
+                format!("{t3} A or more: the PC shuts down at once."),
+                "The GPU is never limited.".to_string(),
+            ]
+        }
     }
 
     fn num_row(&mut self, ui: &mut Ui, t: &Theme, base: &Settings, i: usize, hint: Option<String>) {
@@ -528,4 +569,28 @@ fn label_row(ui: &mut Ui, t: &Theme, label: &str, add: impl FnOnce(&mut Ui)) {
         });
         add(ui);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ladder_text_follows_the_form_and_the_response_mode() {
+        let base = Settings::default();
+        let mut v = SettingsView::default();
+        v.load(&base);
+        let lines = v.ladder_text(&base);
+        assert_eq!(lines[0], "A pin at 9.5 A or more for 15 s: the GPU is limited.");
+        assert_eq!(lines[2], "16 A or more: the PC shuts down at once.");
+
+        // an edit shows before it is applied; a field that does not parse keeps the saved value
+        v.texts[0] = "11".into();
+        v.texts[2] = "x".into();
+        v.response_mode = ResponseMode::ShutdownOnly;
+        let lines = v.ladder_text(&base);
+        assert_eq!(lines[0], "A pin at 11 A or more for 15 s: the PC shuts down.");
+        assert_eq!(lines[1], "13 A or more for 3 s: the PC shuts down.");
+        assert!(lines.iter().all(|l| !l.contains("is limited")), "{lines:?}");
+    }
 }

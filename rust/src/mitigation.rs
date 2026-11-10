@@ -186,8 +186,7 @@ impl Nvml {
         Ok(v)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn power_usage_mw(&self, h: Handle) -> Result<u32, String> {
+    pub(crate) fn power_usage_mw(&self, h: Handle) -> Result<u32, String> {
         let mut v = 0u32;
         call!(self, "nvmlDeviceGetPowerUsage", unsafe extern "C" fn(Handle, *mut u32) -> i32, h, &mut v);
         Ok(v)

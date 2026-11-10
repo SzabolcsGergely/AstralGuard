@@ -446,6 +446,8 @@ pub struct OcStatus {
     /// Power limit in effect, W.
     pub power_w: Option<u32>,
     pub power_range_w: Option<(u32, u32)>,
+    /// What the whole card draws right now, W (connector and slot together).
+    pub power_draw_w: Option<u32>,
     /// Memory offset in effect, Afterburner units.
     pub mem_ab: Option<i32>,
     pub mem_range_ab: Option<(i32, i32)>,

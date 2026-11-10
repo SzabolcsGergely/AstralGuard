@@ -394,6 +394,7 @@ impl<G: OcGpu> Overclocker<G> {
         }
         st.power_w = self.gpu.power_limit_w().ok();
         st.power_range_w = self.gpu.power_range_w().ok();
+        st.power_draw_w = self.gpu.power_draw_w().ok();
         if let Ok((cur, min, max)) = self.gpu.mem_offset() {
             st.mem_ab = Some(nvml_to_ab_mem(cur));
             st.mem_range_ab = Some((nvml_to_ab_mem(min), nvml_to_ab_mem(max)));
@@ -827,6 +828,9 @@ pub(crate) mod fake {
         }
         fn power_range_w(&mut self) -> Result<(u32, u32), String> {
             Ok(self.state().power_range_w)
+        }
+        fn power_draw_w(&mut self) -> Result<u32, String> {
+            Ok(self.state().power_w - 20)
         }
         fn set_power_limit_w(&mut self, w: u32) -> Result<(), String> {
             let mut s = self.state();

@@ -1,4 +1,4 @@
-//! Anti-sag tab: bubble level, per-axis angles, sag, a minute of strip chart.
+//! Sag tab: bubble level, per-axis angles, sag, a minute of strip chart.
 
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
@@ -12,6 +12,7 @@ const WINDOW_SEC: f64 = 60.0;
 pub enum ImuAction {
     Fast(f64),
     Calibrate,
+    Edit,
 }
 
 /// Each axis's angle to the horizontal plane, degrees: 0 = level, ±90 = straight down/up.
@@ -121,6 +122,25 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, live: Option<&Live>) -> Option<ImuActi
     });
     ui.add_space(w::GAP);
 
+    let s = &l.settings;
+    let mm = |d: f64| crate::protocol::sag_mm(d, l.card_length_mm);
+    let text = if s.sag_enabled {
+        format!(
+            "warning at {}° ({:.1} mm)  ·  serious at {}° ({:.1} mm)  ·  after {} s",
+            s.sag_warn_degrees,
+            mm(s.sag_warn_degrees),
+            s.sag_serious_degrees,
+            mm(s.sag_serious_degrees),
+            s.sag_sustained_seconds
+        )
+    } else {
+        "detection is off".to_string()
+    };
+    if w::summary_line(ui, t, "Sag limits", &text) {
+        action = Some(ImuAction::Edit);
+    }
+    ui.add_space(w::GAP);
+
     strips(ui, t, l, now);
     action
 }
@@ -203,7 +223,7 @@ fn draw_level(ui: &egui::Ui, t: &Theme, rect: Rect, l: &Live) {
 
 fn strips(ui: &mut egui::Ui, t: &Theme, l: &Live, now: f64) {
     let width = ui.available_width();
-    let height = ui.available_height().max(186.0);
+    let height = ui.available_height().max(150.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let p = ui.painter_at(rect.expand(1.0));
     p.rect(rect, 8.0, t.surface, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);

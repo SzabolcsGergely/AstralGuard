@@ -48,7 +48,8 @@ pub fn amps_color(t: &Theme, amps: f64, s: &Settings) -> Option<Color32> {
     }
 }
 
-pub fn show(ui: &mut egui::Ui, t: &Theme, live: Option<&Live>, mirror: bool, thermal: &mut Thermal) {
+/// Returns true when the person asked to edit the protection settings.
+pub fn show(ui: &mut egui::Ui, t: &Theme, live: Option<&Live>, mirror: bool, thermal: &mut Thermal) -> bool {
     let empty = Live::default();
     let l = live.unwrap_or(&empty);
     let s = &l.settings;
@@ -148,7 +149,20 @@ pub fn show(ui: &mut egui::Ui, t: &Theme, live: Option<&Live>, mirror: bool, the
     w::tiles(ui, t, &[volts_tile, response_tile(t, l, live.is_some()), imb, sag]);
     ui.add_space(w::GAP);
 
+    let then = if s.response_mode == crate::protocol::ResponseMode::Tiered {
+        "limit GPU, then shut down"
+    } else {
+        "shut down"
+    };
+    let text = format!(
+        "{} A for {} s  ·  {} A for {} s  ·  {} A at once  ·  {then}",
+        s.threshold_amps, s.sustained_seconds_required, s.critical_amps, s.critical_seconds, s.catastrophic_amps
+    );
+    let edit = w::summary_line(ui, t, "Protection", &text);
+    ui.add_space(w::GAP);
+
     history_chart(ui, t, l);
+    edit
 }
 
 fn response_tile(t: &Theme, l: &Live, have: bool) -> Tile {
@@ -222,7 +236,8 @@ fn sag_tile(t: &Theme, l: &Live) -> Tile {
 
 fn history_chart(ui: &mut egui::Ui, t: &Theme, l: &Live) {
     let width = ui.available_width();
-    let height = 150.0;
+    // what the window leaves, so the tab does not scroll at the default size
+    let height = ui.available_height().clamp(100.0, 150.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let p = ui.painter_at(rect.expand(1.0));
     p.rect(rect, 8.0, t.surface, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);
