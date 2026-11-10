@@ -175,6 +175,26 @@ fn loop_stalled(l: &Live, now: f64) -> bool {
 }
 const MIN_SIZE: Vec2 = Vec2::new(660.0, 560.0);
 
+/// Whether the window can keep itself above others. Wayland has no protocol for a client to
+/// ask for that, and winit ignores the request there (seen on KDE Plasma, 2026-11-11), so the
+/// option is hidden on a Wayland window; X11 (also XWayland via `WINIT_UNIX_BACKEND=x11`),
+/// Windows and macOS honour it.
+pub(crate) fn always_on_top_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let var = |k: &str| std::env::var(k).ok();
+        !runs_on_wayland(var("WAYLAND_DISPLAY").as_deref(), var("WINIT_UNIX_BACKEND").as_deref())
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+/// winit picks Wayland whenever a Wayland display is there, unless told to use X11.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn runs_on_wayland(wayland_display: Option<&str>, winit_backend: Option<&str>) -> bool {
+    wayland_display.is_some_and(|d| !d.is_empty()) && winit_backend != Some("x11")
+}
+
 /// The window (taskbar) icon: the app icon with a status dot in the corner, so the taskbar
 /// shows the state at a glance. Falls back to the plain dot if the PNG cannot be read.
 fn icon_data(status: Status) -> Arc<egui::IconData> {
@@ -272,7 +292,7 @@ pub fn run(args: &[String]) -> i32 {
         .with_inner_size(size)
         .with_min_inner_size(MIN_SIZE)
         .with_icon(icon_data(Status::Missing));
-    if prefs.always_on_top && !shot {
+    if prefs.always_on_top && !shot && always_on_top_supported() {
         vp = vp.with_always_on_top();
     }
     // eframe shows the window after its first frame no matter what, so a window that
@@ -1229,6 +1249,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn always_on_top_is_hidden_only_on_a_wayland_window() {
+        assert!(runs_on_wayland(Some("wayland-0"), None));
+        assert!(!runs_on_wayland(Some("wayland-0"), Some("x11")), "XWayland honours it");
+        assert!(!runs_on_wayland(None, None), "an X11 session");
+        assert!(!runs_on_wayland(Some(""), None));
+    }
 
     #[test]
     fn the_guard_loop_counts_as_stalled_after_five_seconds() {
