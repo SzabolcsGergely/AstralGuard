@@ -34,6 +34,8 @@ const PAUSE_REMINDER_EVERY_SEC: f64 = 1800.0;
 const RECONNECT_EVERY_SEC: f64 = 3.0;
 /// How often a start-up apply whose GPU would not open is tried again.
 const OC_OPEN_RETRY_SEC: f64 = 30.0;
+/// How often the XBAR / SYS load gate reads the GPU's power (an NVML read, no NVAPI).
+const LOAD_POLL_SEC: f64 = 1.0;
 
 fn sleep(sec: f64) {
     std::thread::sleep(Duration::from_secs_f64(sec));
@@ -206,6 +208,21 @@ struct OcLoop {
     /// than `RESUME_GRACE_SEC` means the machine slept (or the loop stalled; re-applying is
     /// harmless then).
     last_step: Option<f64>,
+    /// XBAR / SYS "only under load".
+    gate: crate::overclock::load::LoadGate,
+    next_power_read: f64,
+}
+
+impl OcLoop {
+    fn new(now: f64, delay: f64) -> Self {
+        OcLoop {
+            timer: OcTimer::new(now, delay),
+            was_engaged: false,
+            last_step: None,
+            gate: Default::default(),
+            next_power_read: 0.0,
+        }
+    }
 }
 
 /// After the pin decision of an iteration: a pending Apply now, the start-up apply and the
@@ -247,6 +264,7 @@ fn overclock_step_inner(shared: &Shared, oc: &mut OcLoop, engaged: bool) {
     oc.last_step = Some(now);
     let action = oc_step(&mut oc.timer, now, engaged, released_now);
     if action == OcAction::None {
+        load_step(shared, oc, engaged, now);
         return;
     }
     let s = shared.settings();
@@ -266,6 +284,38 @@ fn overclock_step_inner(shared: &Shared, oc: &mut OcLoop, engaged: bool) {
         OcAccess::Unavailable(_) if action == OcAction::Apply => oc.timer.open_failed(crate::now()),
         OcAccess::Unavailable(_) | OcAccess::Ran(()) => {}
     }
+}
+
+/// XBAR / SYS "only under load": once a second read what the GPU draws, and when the load
+/// gate flips, apply or put back the offsets. Only after the start-up apply (the driver has
+/// settled), never while the guard limits the GPU (it holds the gate; the after-release apply
+/// follows the overclocker's state). A power read that fails, or an overclocker held by a
+/// status read, leaves the gate as it is.
+fn load_step(shared: &Shared, oc: &mut OcLoop, engaged: bool, now: f64) {
+    let s = shared.settings();
+    if !(s.oc_clk_load_only && (s.oc_xbar_enabled || s.oc_sys_enabled)) {
+        oc.gate.reset();
+        return;
+    }
+    if engaged || !oc.timer.applied || now < oc.next_power_read {
+        return;
+    }
+    oc.next_power_read = now + LOAD_POLL_SEC;
+    let gate = &mut oc.gate;
+    let _ = shared.try_overclock("the XBAR / SYS load check", |d| {
+        let Ok(w) = d.power_draw_w() else { return };
+        let flipped = gate.feed(now, w as f64, s.oc_clk_load_watts, s.oc_clk_load_seconds, s.oc_clk_idle_seconds);
+        // Also when the overclocker disagrees (reopened after a reconnect, say).
+        if flipped.is_some() || d.loaded() != gate.loaded() {
+            let loaded = gate.loaded();
+            logger::info(format!(
+                "Overclock: GPU {} ({w} W); {} the XBAR / SYS offsets",
+                if loaded { "under load" } else { "idle" },
+                if loaded { "applying" } else { "putting back" }
+            ));
+            d.set_loaded(&s, loaded, engaged);
+        }
+    });
 }
 
 /// The log line for a trip while AstralGuard has overclock settings applied.
@@ -357,8 +407,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
     let mut paused_since: Option<f64> = None;
     let mut last_pause_reminder = 0.0;
     let mut shutting_down = false;
-    let mut oc =
-        OcLoop { timer: OcTimer::new(crate::now(), s.oc_apply_delay_seconds), was_engaged: false, last_step: None };
+    let mut oc = OcLoop::new(crate::now(), s.oc_apply_delay_seconds);
 
     while !shared.stop.load(Ordering::Relaxed) {
         let now = crate::now();
@@ -863,7 +912,7 @@ mod tests {
 
     /// Already due: started long ago with no delay.
     fn due() -> OcLoop {
-        OcLoop { timer: OcTimer::new(0.0, 0.0), was_engaged: false, last_step: None }
+        OcLoop::new(0.0, 0.0)
     }
 
     #[test]
@@ -1007,6 +1056,18 @@ mod tests {
         fn managed(&self) -> Vec<String> {
             Vec::new()
         }
+        fn set_loaded(&mut self, _: &crate::protocol::Settings, _: bool, _: bool) -> crate::protocol::OcReport {
+            panic!("driver binding bug")
+        }
+        fn power_draw_w(&mut self) -> Result<u32, String> {
+            Ok(0)
+        }
+        fn loaded(&self) -> bool {
+            false
+        }
+        fn live(&mut self) -> crate::protocol::OcLive {
+            crate::protocol::OcLive::default()
+        }
     }
 
     fn panicking_service() -> Arc<Shared> {
@@ -1044,7 +1105,7 @@ mod tests {
         });
         crate::service::tests::wait_for_mailbox(&shared);
         // Not due yet: only the Apply now runs (and panics).
-        let mut oc = OcLoop { timer: OcTimer::new(crate::now(), 3600.0), was_engaged: false, last_step: None };
+        let mut oc = OcLoop::new(crate::now(), 3600.0);
         assert!(overclock_step(&shared, &mut oc, false).is_some());
         let Response::Overclock { report } = request.join().unwrap() else { panic!("not an overclock answer") };
         assert!(report.results.iter().all(|r| !r.ok) && !report.results.is_empty(), "{report:?}");

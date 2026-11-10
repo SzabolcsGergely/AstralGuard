@@ -164,6 +164,18 @@ pub struct Settings {
     pub oc_mem_offset_mhz: f64,
     /// Wait after the service starts before applying, so the driver has settled.
     pub oc_apply_delay_seconds: f64,
+    /// Crossbar (XBAR) and SYS clock offsets, MHz, through the driver's clock-domain control.
+    pub oc_xbar_enabled: bool,
+    pub oc_xbar_offset_mhz: f64,
+    pub oc_sys_enabled: bool,
+    pub oc_sys_offset_mhz: f64,
+    /// Apply the XBAR / SYS offsets only under load: once the GPU has drawn at least
+    /// `oc_clk_load_watts` for `oc_clk_load_seconds`, and put back after `oc_clk_idle_seconds`
+    /// below it. A raised XBAR keeps the core from dropping to its idle clock.
+    pub oc_clk_load_only: bool,
+    pub oc_clk_load_watts: f64,
+    pub oc_clk_load_seconds: f64,
+    pub oc_clk_idle_seconds: f64,
 }
 
 impl Default for Settings {
@@ -207,6 +219,14 @@ impl Default for Settings {
             oc_mem_enabled: false,
             oc_mem_offset_mhz: 2000.0,
             oc_apply_delay_seconds: 30.0,
+            oc_xbar_enabled: false,
+            oc_xbar_offset_mhz: 0.0,
+            oc_sys_enabled: false,
+            oc_sys_offset_mhz: 0.0,
+            oc_clk_load_only: true,
+            oc_clk_load_watts: 250.0,
+            oc_clk_load_seconds: 10.0,
+            oc_clk_idle_seconds: 30.0,
         }
     }
 }
@@ -241,6 +261,14 @@ pub struct SettingsPatch {
     pub oc_mem_enabled: Option<bool>,
     pub oc_mem_offset_mhz: Option<f64>,
     pub oc_apply_delay_seconds: Option<f64>,
+    pub oc_xbar_enabled: Option<bool>,
+    pub oc_xbar_offset_mhz: Option<f64>,
+    pub oc_sys_enabled: Option<bool>,
+    pub oc_sys_offset_mhz: Option<f64>,
+    pub oc_clk_load_only: Option<bool>,
+    pub oc_clk_load_watts: Option<f64>,
+    pub oc_clk_load_seconds: Option<f64>,
+    pub oc_clk_idle_seconds: Option<f64>,
 }
 
 #[cfg_attr(not(feature = "ui"), allow(dead_code))]
@@ -397,6 +425,9 @@ pub enum Request {
     /// The overclock state read from the driver, for the Overclock tab while it is visible.
     /// Only this, an apply or a release opens the GPU for the overclock.
     OverclockStatus,
+    /// What the card runs now, for the Overclock tab's tiles: NVML and the clock-domain
+    /// measure only, no NVAPI (the V/F curve stays in `OverclockStatus`).
+    OverclockLive,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -415,6 +446,7 @@ pub enum Response {
     Scan { report: ScanReport },
     Overclock { report: OcReport },
     OverclockStatus { status: OcStatus },
+    OverclockLive { live: OcLive },
     Error { message: String },
 }
 
@@ -434,6 +466,20 @@ pub struct OcReport {
     pub results: Vec<OcResult>,
     /// Nothing was written because the guard is limiting the GPU; apply again after release.
     pub deferred: bool,
+}
+
+/// What the card runs now, read about once a second while the Overclock tab is open. Every
+/// value is `None` when its read failed.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct OcLive {
+    pub power_draw_w: Option<u32>,
+    pub power_limit_w: Option<u32>,
+    pub core_mhz: Option<u32>,
+    pub mem_mhz: Option<u32>,
+    /// Measured by the driver's clock-domain control (Windows).
+    pub xbar_mhz: Option<u32>,
+    pub sys_mhz: Option<u32>,
+    pub temp_c: Option<u32>,
 }
 
 /// The overclock state as read from the driver, for the Overclock tab. Every value is
@@ -467,7 +513,13 @@ pub struct OcStatus {
     pub live_mv: Option<f32>,
     /// The current curve's clock at the live voltage (where the card sits on the graph).
     pub live_mhz: Option<f32>,
-    /// Settings AstralGuard applied and will restore on untick: "undervolt", "power", "memory".
+    /// XBAR / SYS clock offset (current, min, max), kHz; None when it cannot be read.
+    pub xbar_khz: Option<(i32, i32, i32)>,
+    pub sys_khz: Option<(i32, i32, i32)>,
+    /// "Only under load": the load gate's state.
+    pub clk_loaded: bool,
+    /// Settings AstralGuard applied and will restore on untick: "undervolt", "power", "memory",
+    /// "xbar", "sys".
     pub managed: Vec<String>,
 }
 

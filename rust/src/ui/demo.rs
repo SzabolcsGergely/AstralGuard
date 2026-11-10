@@ -199,6 +199,21 @@ impl Demo {
         OcReport { results, deferred: false }
     }
 
+    /// The tiles' readings: the simulated connector's load, scaled to a 5090.
+    fn oc_live(&self) -> crate::protocol::OcLive {
+        let load = (self.watts / 600.0).clamp(0.0, 1.0);
+        let limited = (65.0..75.0).contains(&self.phase(now()));
+        crate::protocol::OcLive {
+            power_draw_w: Some((self.watts * 0.82 + 22.0) as u32),
+            power_limit_w: Some(if limited { 400 } else { self.oc.power_w }),
+            core_mhz: Some(if limited { 180 } else { (210.0 + 2617.0 * load) as u32 }),
+            mem_mhz: Some(if load > 0.1 { (14001 + self.oc.mem_ab) as u32 } else { 405 }),
+            xbar_mhz: Some((600.0 + 1842.0 * load) as u32),
+            sys_mhz: Some((600.0 + 1692.0 * load) as u32),
+            temp_c: Some((34.0 + 34.0 * load) as u32),
+        }
+    }
+
     fn oc_status(&self) -> OcStatus {
         let current: Vec<(f32, f32)> = OC_STOCK
             .iter()
@@ -236,6 +251,9 @@ impl Demo {
             current_curve: current,
             live_mv: Some(OC_LIVE_MV),
             live_mhz,
+            xbar_khz: Some((0, -1_000_000, 1_000_000)),
+            sys_khz: Some((0, -1_000_000, 1_000_000)),
+            clk_loaded: false,
             managed: self.oc.managed.clone(),
         }
     }
@@ -532,6 +550,7 @@ impl Backend for Demo {
                 }
             }
             Request::OverclockStatus => Response::OverclockStatus { status: self.oc_status() },
+            Request::OverclockLive => Response::OverclockLive { live: self.oc_live() },
         })
     }
 }

@@ -180,6 +180,27 @@ impl Nvml {
         Ok(String::from_utf8_lossy(&buf[..end]).into_owned())
     }
 
+    /// The clock running now, MHz (`NVML_CLOCK_GRAPHICS` 0, `NVML_CLOCK_MEM` 2).
+    pub(crate) fn clock_mhz(&self, h: Handle, clock_type: i32) -> Result<u32, String> {
+        let mut v = 0u32;
+        call!(
+            self,
+            "nvmlDeviceGetClockInfo",
+            unsafe extern "C" fn(Handle, i32, *mut u32) -> i32,
+            h,
+            clock_type,
+            &mut v
+        );
+        Ok(v)
+    }
+
+    /// The GPU core temperature, °C (`NVML_TEMPERATURE_GPU`).
+    pub(crate) fn temperature_c(&self, h: Handle) -> Result<u32, String> {
+        let mut v = 0u32;
+        call!(self, "nvmlDeviceGetTemperature", unsafe extern "C" fn(Handle, i32, *mut u32) -> i32, h, 0, &mut v);
+        Ok(v)
+    }
+
     pub(crate) fn power_limit_mw(&self, h: Handle) -> Result<u32, String> {
         let mut v = 0u32;
         call!(self, "nvmlDeviceGetPowerManagementLimit", unsafe extern "C" fn(Handle, *mut u32) -> i32, h, &mut v);

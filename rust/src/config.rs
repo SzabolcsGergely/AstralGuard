@@ -145,6 +145,10 @@ const OC_TARGET_MHZ: RangeInclusive<f64> = 200.0..=4000.0;
 const OC_POWER_W: RangeInclusive<f64> = 1.0..=2000.0;
 const OC_MEM_MHZ: RangeInclusive<f64> = -10000.0..=10000.0;
 const OC_DELAY_S: RangeInclusive<f64> = 0.0..=600.0;
+/// The XBAR / SYS offset; the driver's own range is checked again before a write.
+const OC_CLK_MHZ: RangeInclusive<f64> = -1000.0..=1000.0;
+const OC_LOAD_W: RangeInclusive<f64> = 10.0..=2000.0;
+const OC_LOAD_S: RangeInclusive<f64> = 1.0..=3600.0;
 
 /// The sag reference: gravity's direction when calibrated, and the card it was taken on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -235,6 +239,18 @@ pub fn from_ini(ini: &Ini) -> (Settings, Option<SagBaseline>) {
     s.oc_mem_offset_mhz = mem;
     s.oc_mem_enabled = mem_ok && ini.boolean("oc_mem_enabled").unwrap_or(d.oc_mem_enabled);
     s.oc_apply_delay_seconds = oc("oc_apply_delay_seconds", d.oc_apply_delay_seconds, &OC_DELAY_S).0;
+    let (xbar, xbar_ok) = oc("oc_xbar_offset_mhz", d.oc_xbar_offset_mhz, &OC_CLK_MHZ);
+    s.oc_xbar_offset_mhz = xbar;
+    s.oc_xbar_enabled = xbar_ok && ini.boolean("oc_xbar_enabled").unwrap_or(d.oc_xbar_enabled);
+    let (sys, sys_ok) = oc("oc_sys_offset_mhz", d.oc_sys_offset_mhz, &OC_CLK_MHZ);
+    s.oc_sys_offset_mhz = sys;
+    s.oc_sys_enabled = sys_ok && ini.boolean("oc_sys_enabled").unwrap_or(d.oc_sys_enabled);
+    // A damaged load gate falls back to its defaults rather than unticking: the gate only ever
+    // makes the offsets apply less often than "always".
+    s.oc_clk_load_only = ini.boolean("oc_clk_load_only").unwrap_or(d.oc_clk_load_only);
+    s.oc_clk_load_watts = oc("oc_clk_load_watts", d.oc_clk_load_watts, &OC_LOAD_W).0;
+    s.oc_clk_load_seconds = oc("oc_clk_load_seconds", d.oc_clk_load_seconds, &OC_LOAD_S).0;
+    s.oc_clk_idle_seconds = oc("oc_clk_idle_seconds", d.oc_clk_idle_seconds, &OC_LOAD_S).0;
 
     (s, baseline_from_ini(ini))
 }
@@ -319,6 +335,31 @@ pub fn save_oc_vf_failed(path: &Path, driver: &str) -> std::io::Result<()> {
     })
 }
 
+/// The driver version the XBAR / SYS write check passed on (`oc_clk_verified_driver`), and
+/// the one it failed on with a wrong landing (`oc_clk_failed_driver`: no XBAR / SYS write on
+/// it until the driver changes or the key is removed by hand).
+pub fn load_oc_clk_verified(path: &Path) -> Option<String> {
+    let v = Ini::read(path).get(S, "oc_clk_verified_driver")?.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+pub fn save_oc_clk_verified(path: &Path, driver: &str) -> std::io::Result<()> {
+    update(path, |ini| {
+        ini.set(S, "oc_clk_verified_driver", driver.to_string());
+    })
+}
+
+pub fn load_oc_clk_failed(path: &Path) -> Option<String> {
+    let v = Ini::read(path).get(S, "oc_clk_failed_driver")?.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+pub fn save_oc_clk_failed(path: &Path, driver: &str) -> std::io::Result<()> {
+    update(path, |ini| {
+        ini.set(S, "oc_clk_failed_driver", driver.to_string());
+    })
+}
+
 /// Python's str(float): "9.5", "15.0".
 pub fn fmt_float(v: f64) -> String {
     format!("{v:?}")
@@ -360,6 +401,14 @@ pub fn save_settings(path: &Path, s: &Settings, keys: &[&str]) -> std::io::Resul
                 "oc_mem_enabled" => fmt_bool(s.oc_mem_enabled),
                 "oc_mem_offset_mhz" => fmt_float(s.oc_mem_offset_mhz),
                 "oc_apply_delay_seconds" => fmt_float(s.oc_apply_delay_seconds),
+                "oc_xbar_enabled" => fmt_bool(s.oc_xbar_enabled),
+                "oc_xbar_offset_mhz" => fmt_float(s.oc_xbar_offset_mhz),
+                "oc_sys_enabled" => fmt_bool(s.oc_sys_enabled),
+                "oc_sys_offset_mhz" => fmt_float(s.oc_sys_offset_mhz),
+                "oc_clk_load_only" => fmt_bool(s.oc_clk_load_only),
+                "oc_clk_load_watts" => fmt_float(s.oc_clk_load_watts),
+                "oc_clk_load_seconds" => fmt_float(s.oc_clk_load_seconds),
+                "oc_clk_idle_seconds" => fmt_float(s.oc_clk_idle_seconds),
                 _ => continue,
             };
             ini.set(S, key, value);
@@ -407,7 +456,15 @@ pub fn patch_keys(p: &SettingsPatch) -> Vec<&'static str> {
         oc_power_w,
         oc_mem_enabled,
         oc_mem_offset_mhz,
-        oc_apply_delay_seconds
+        oc_apply_delay_seconds,
+        oc_xbar_enabled,
+        oc_xbar_offset_mhz,
+        oc_sys_enabled,
+        oc_sys_offset_mhz,
+        oc_clk_load_only,
+        oc_clk_load_watts,
+        oc_clk_load_seconds,
+        oc_clk_idle_seconds
     );
     keys
 }
@@ -445,7 +502,15 @@ pub fn merged(s: &Settings, p: &SettingsPatch) -> Settings {
         oc_power_w,
         oc_mem_enabled,
         oc_mem_offset_mhz,
-        oc_apply_delay_seconds
+        oc_apply_delay_seconds,
+        oc_xbar_enabled,
+        oc_xbar_offset_mhz,
+        oc_sys_enabled,
+        oc_sys_offset_mhz,
+        oc_clk_load_only,
+        oc_clk_load_watts,
+        oc_clk_load_seconds,
+        oc_clk_idle_seconds
     );
     m
 }
@@ -491,13 +556,18 @@ pub fn check(current: &Settings, p: &SettingsPatch) -> (Vec<String>, Vec<String>
     if m.sag_serious_degrees <= m.sag_warn_degrees {
         errors.push("The serious sag angle must be larger than the warning angle".into());
     }
-    let ocs: [(&str, Option<f64>, &RangeInclusive<f64>, &str); 6] = [
+    let ocs: [(&str, Option<f64>, &RangeInclusive<f64>, &str); 11] = [
         ("Undervolt start", p.oc_uv_from_mv, &OC_MV, "mV"),
         ("Undervolt end", p.oc_uv_to_mv, &OC_MV, "mV"),
         ("Undervolt target clock", p.oc_uv_target_mhz, &OC_TARGET_MHZ, "MHz"),
         ("Power limit", p.oc_power_w, &OC_POWER_W, "W"),
         ("Memory offset", p.oc_mem_offset_mhz, &OC_MEM_MHZ, "MHz"),
         ("Apply delay", p.oc_apply_delay_seconds, &OC_DELAY_S, "s"),
+        ("XBAR offset", p.oc_xbar_offset_mhz, &OC_CLK_MHZ, "MHz"),
+        ("SYS offset", p.oc_sys_offset_mhz, &OC_CLK_MHZ, "MHz"),
+        ("Load threshold", p.oc_clk_load_watts, &OC_LOAD_W, "W"),
+        ("Load time", p.oc_clk_load_seconds, &OC_LOAD_S, "s"),
+        ("Idle time", p.oc_clk_idle_seconds, &OC_LOAD_S, "s"),
     ];
     for (name, value, range, unit) in ocs {
         if let Some(v) = value {

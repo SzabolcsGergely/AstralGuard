@@ -301,8 +301,11 @@ documented driver API.
 - **Overview**: a thermal-camera style view of the plug (colour = current, scaled to the
   thresholds), max / min / delta / total power, average voltage, response state,
   imbalance and sag, the protection thresholds in one line, and five minutes of history.
-- **Overclock**: an optional undervolt, power limit and memory offset ([below](#overclock)),
-  with what the card is doing now: power draw, core voltage, memory clock, highest pin.
+- **Overclock**: an optional undervolt, power limit, memory offset and XBAR / SYS offsets
+  ([below](#overclock)), with what the card runs now, refreshed every second: one row for
+  power (GPU power draw, GPU temperature, core voltage, the highest pin and the connector's
+  total) and one for clocks (core, XBAR, SYS and memory, each with its offset). NVML reports
+  no VRAM temperature on GeForce cards, so there is none.
 - **Sag**: bubble level, the card's angle on each axis, sag against the calibrated
   position, the sag limits in one line, and a minute of history. **Calibrate** sets the
   reference.
@@ -335,6 +338,16 @@ touched.
 - **Power limit**: the board power limit in watts, through NVML.
 - **Memory offset**: in Afterburner units. AstralGuard sends twice the number to the driver,
   so `2000` here is what the driver calls `4000`.
+- **XBAR / SYS offset**: the crossbar and SYS clocks, in MHz, through the driver's
+  clock-domain control (undocumented; on Linux through `/dev/nvidiactl`). Before the first write on each
+  driver version, AstralGuard writes +15 MHz to XBAR alone, reads the control of every clock
+  domain back, checks that only that one value changed, and undoes it; if anything else moved,
+  XBAR / SYS stay off on that driver version. Every write is read back. A raised XBAR keeps the
+  core from dropping to its idle clock, so **Only under load** (on by default) applies the
+  offsets only after the GPU has drawn at least the set power (250 W) for the load time (10 s),
+  and puts them back after it has drawn less for the idle time (30 s). Raised XBAR clocks have
+  been reported to cause display corruption without extra voltage, which recent drivers do not
+  apply; raise it in small steps.
 
 AstralGuard records what it changed, the value it applied and the value from before in
 `overclock.active`, next to `mitigation.active`. Unticking a setting puts back the value from
@@ -362,8 +375,11 @@ Quitting AstralGuard leaves the overclock in place; the driver drops it at reboo
 guard trips while an overclock is active, the log and the flight dump say so.
 
 The NVAPI curve layouts were verified on Linux (2026-11-09, ROG Astral RTX 5090 OC, driver
-620.70.06) and on Windows (2026-11-10, same card, driver 621.14). Only the core voltage readout
-is unverified on Windows.
+620.70.06) and on Windows (2026-11-10, same card, driver 621.14), the core voltage readout
+included (Windows: 2026-11-11). The XBAR and SYS controls were verified on Windows (2026-11-10,
+same card, driver 621.14: the write check, a +15 MHz apply and its untick) and on Linux
+(2026-11-11, same card, driver 620.70.06: the write check, applies, unticks back to +0 MHz and
+the clock readouts). The write check runs before the first write on every driver.
 
 ## Configuration
 
@@ -400,13 +416,19 @@ hand, stop the guard first.
 | `oc_mem_enabled` | `false` | Overclock: apply the memory offset |
 | `oc_mem_offset_mhz` | `2000` | Memory offset in Afterburner units (the driver gets twice this) |
 | `oc_apply_delay_seconds` | `30` | Wait after the service starts, or the machine wakes up, before applying the overclock |
+| `oc_xbar_enabled` / `oc_xbar_offset_mhz` | `false` / `0` | Overclock: the XBAR clock offset (MHz) |
+| `oc_sys_enabled` / `oc_sys_offset_mhz` | `false` / `0` | Overclock: the SYS clock offset (MHz) |
+| `oc_clk_load_only` | `true` | Apply XBAR / SYS only under load |
+| `oc_clk_load_watts` / `oc_clk_load_seconds` | `250` / `10` | Under load: at least this many W for this long |
+| `oc_clk_idle_seconds` | `30` | Back to idle after this long below the threshold |
 
 The sag baseline (`sag_baseline`, `sag_baseline_subsystem`) is written by **Calibrate** and
 re-taken automatically when a different card is installed. `oc_vf_verified_driver` is written
 by the service after the undervolt's compatibility check passes, so the check runs again only
 after a driver update. `oc_vf_failed_driver` is written when the check finds a write landing
 in the wrong place: on that driver version the check does not run again and the undervolt stays
-off until a driver update (or until the key is removed).
+off until a driver update (or until the key is removed). `oc_clk_verified_driver` and
+`oc_clk_failed_driver` do the same for the XBAR / SYS write check.
 
 Window preferences (theme, size, which tab, pin order, close action, update check) are kept per user in
 `%APPDATA%\AstralGuard\ui.json` / `~/.config/astralguard/ui.json`.
@@ -465,7 +487,7 @@ On Linux the same events go to the journal as `[id] message`.
 | `astralguard service` | The service alone (what systemd runs on Linux) |
 | `astralguard ui [--show]` | Tray and dashboard alone |
 | `astralguard ui --demo` | Dashboard with a simulated card: no hardware, no service |
-| `astralguard probe` | Read the card a few times and print pins, volts and tilt. Read-only, safe next to a running guard. |
+| `astralguard probe` | Read the card a few times and print pins, volts, tilt and the XBAR / SYS offsets. Read-only, safe next to a running guard. |
 | `astralguard probe --detect [--dry-run]` | Linux: find the I2C adapter that carries the pin monitor and save it (what the dashboard's **Scan** does) |
 | `astralguard status [--exit]` | Ask the running service for its state, or stop it (elevated / root) |
 | `astralguard register [--all-users]` / `unregister` | Windows, elevated: create / remove the logon task (for this user, or for everyone who signs in) and the Event Log source. The installer uses these. |

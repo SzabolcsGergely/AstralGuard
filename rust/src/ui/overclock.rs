@@ -22,6 +22,10 @@ use crate::protocol::{Live, OcReport, OcStatus, Response, Settings, SettingsPatc
 const MAX_DELTA_MHZ: i32 = 1000;
 /// How often the tab asks the service for the GPU's state while it is visible.
 const POLL: Duration = Duration::from_secs(2);
+/// How often the tiles' readings are asked for.
+const LIVE_POLL: Duration = Duration::from_secs(1);
+/// The tooltip on "Only under load".
+const LOAD_ONLY_WHY: &str = "A raised XBAR clock keeps the core from dropping to its idle clock, so the card draws more at the desktop. With this on, the XBAR and SYS offsets are applied only after the GPU has drawn at least the given power for the given time (a game, a render), and put back after it has drawn less for the idle time.";
 
 // Graph axes.
 const MV: (f32, f32) = (700.0, 1240.0);
@@ -37,6 +41,14 @@ pub struct OverclockView {
     target: String,
     power: String,
     mem: String,
+    xbar_on: bool,
+    sys_on: bool,
+    xbar: String,
+    sys: String,
+    load_only: bool,
+    load_w: String,
+    load_s: String,
+    idle_s: String,
     base: Option<Settings>,
     status: Option<OcStatus>,
     status_err: Option<String>,
@@ -48,6 +60,12 @@ pub struct OverclockView {
     next_poll: Instant,
     /// Height of everything in the tab but the graph, measured on the last frame.
     fixed_h: f32,
+    /// The tiles' readings, polled faster than `status` (no NVAPI in them).
+    live: Option<crate::protocol::OcLive>,
+    live_pending: bool,
+    next_live: Instant,
+    /// The tallest of the three bottom cards' content on the last frame: all three get it.
+    cards_h: f32,
 }
 
 /// What an undervolt with the form's numbers would do on this card's curve.
@@ -105,6 +123,14 @@ fn oc_patch(s: &Settings) -> SettingsPatch {
         oc_mem_enabled: Some(s.oc_mem_enabled),
         oc_mem_offset_mhz: Some(s.oc_mem_offset_mhz),
         oc_apply_delay_seconds: Some(s.oc_apply_delay_seconds),
+        oc_xbar_enabled: Some(s.oc_xbar_enabled),
+        oc_xbar_offset_mhz: Some(s.oc_xbar_offset_mhz),
+        oc_sys_enabled: Some(s.oc_sys_enabled),
+        oc_sys_offset_mhz: Some(s.oc_sys_offset_mhz),
+        oc_clk_load_only: Some(s.oc_clk_load_only),
+        oc_clk_load_watts: Some(s.oc_clk_load_watts),
+        oc_clk_load_seconds: Some(s.oc_clk_load_seconds),
+        oc_clk_idle_seconds: Some(s.oc_clk_idle_seconds),
         ..Default::default()
     }
 }
@@ -121,6 +147,14 @@ impl Default for OverclockView {
             target: String::new(),
             power: String::new(),
             mem: String::new(),
+            xbar_on: false,
+            sys_on: false,
+            xbar: String::new(),
+            sys: String::new(),
+            load_only: true,
+            load_w: String::new(),
+            load_s: String::new(),
+            idle_s: String::new(),
             base: None,
             status: None,
             status_err: None,
@@ -131,6 +165,10 @@ impl Default for OverclockView {
             pending: false,
             next_poll: Instant::now(),
             fixed_h: 0.0,
+            live: None,
+            live_pending: false,
+            next_live: Instant::now(),
+            cards_h: 0.0,
         };
         v.fill(&Settings::default());
         v
@@ -148,6 +186,14 @@ impl OverclockView {
         self.target = g(s.oc_uv_target_mhz);
         self.power = g(s.oc_power_w);
         self.mem = g(s.oc_mem_offset_mhz);
+        self.xbar_on = s.oc_xbar_enabled;
+        self.sys_on = s.oc_sys_enabled;
+        self.xbar = g(s.oc_xbar_offset_mhz);
+        self.sys = g(s.oc_sys_offset_mhz);
+        self.load_only = s.oc_clk_load_only;
+        self.load_w = g(s.oc_clk_load_watts);
+        self.load_s = g(s.oc_clk_load_seconds);
+        self.idle_s = g(s.oc_clk_idle_seconds);
     }
 
     fn load(&mut self, s: &Settings) {
@@ -172,6 +218,11 @@ impl OverclockView {
         let target = num("Target", &self.target);
         let power = num("Power limit", &self.power);
         let mem = num("Memory offset", &self.mem);
+        let xbar = num("XBAR", &self.xbar);
+        let sys = num("SYS", &self.sys);
+        let load_w = num("Load", &self.load_w);
+        let load_s = num("Load time", &self.load_s);
+        let idle_s = num("Idle time", &self.idle_s);
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -185,6 +236,14 @@ impl OverclockView {
             oc_mem_enabled: Some(self.mem_on),
             oc_mem_offset_mhz: mem,
             oc_apply_delay_seconds: delay,
+            oc_xbar_enabled: Some(self.xbar_on),
+            oc_xbar_offset_mhz: xbar,
+            oc_sys_enabled: Some(self.sys_on),
+            oc_sys_offset_mhz: sys,
+            oc_clk_load_only: Some(self.load_only),
+            oc_clk_load_watts: load_w,
+            oc_clk_load_seconds: load_s,
+            oc_clk_idle_seconds: idle_s,
             ..Default::default()
         })
     }
@@ -219,13 +278,32 @@ impl OverclockView {
         true
     }
 
+    /// Time to ask for the tiles' readings (the app calls this only while the tab is visible).
+    pub fn live_due(&mut self) -> bool {
+        if self.live_pending || Instant::now() < self.next_live {
+            return false;
+        }
+        self.live_pending = true;
+        self.next_live = Instant::now() + LIVE_POLL;
+        true
+    }
+
     /// The tab was just opened: ask at once.
     pub fn opened(&mut self) {
         self.next_poll = Instant::now();
+        self.next_live = Instant::now();
     }
 
     pub fn on_done(&mut self, job: &Job, r: &Result<Response, String>) {
         match (job, r) {
+            (Job::OverclockLive, Ok(Response::OverclockLive { live })) => {
+                self.live_pending = false;
+                self.live = Some(live.clone());
+            }
+            (Job::OverclockLive, _) => {
+                self.live_pending = false;
+                self.live = None;
+            }
             (Job::OverclockStatus, Ok(Response::OverclockStatus { status })) => {
                 self.pending = false;
                 self.status = Some(status.clone());
@@ -325,17 +403,34 @@ impl OverclockView {
         });
         ui.add_space(4.0);
 
-        live_tiles(ui, t, &status, live);
+        live_tiles(ui, t, &status, live, self.live.as_ref());
         ui.add_space(w::GAP);
 
         let deferred = self.report.as_ref().is_some_and(|r| r.deferred);
         self.undervolt_card(ui, t, &status, deferred, graph_h);
         ui.add_space(w::GAP);
-        ui.columns(2, |cols| {
-            let (left, right) = cols.split_at_mut(1);
-            left[0].with_layout(Layout::top_down(Align::LEFT), |ui| self.power_card(ui, t, &status, deferred));
-            right[0].with_layout(Layout::top_down(Align::LEFT), |ui| self.memory_card(ui, t, &status, deferred));
+        // One height for the three cards: the tallest content of the last frame.
+        let target = self.cards_h;
+        let mut tallest = 0.0f32;
+        ui.columns(3, |cols| {
+            let [a, b, c] = cols else { return };
+            // Pad a card by what it is short of the tallest one.
+            let mut fit = |ui: &mut Ui, natural: f32| {
+                tallest = tallest.max(natural);
+                // add_space brings its own item spacing with it
+                let pad = target - natural - ui.spacing().item_spacing.y;
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
+            };
+            a.with_layout(Layout::top_down(Align::LEFT), |ui| self.power_card(ui, t, &status, deferred, &mut fit));
+            b.with_layout(Layout::top_down(Align::LEFT), |ui| self.memory_card(ui, t, &status, deferred, &mut fit));
+            c.with_layout(Layout::top_down(Align::LEFT), |ui| self.clocks_card(ui, t, &status, deferred, &mut fit));
         });
+        if (tallest - self.cards_h).abs() > 0.5 {
+            self.cards_h = tallest;
+            ui.ctx().request_repaint();
+        }
         if let Some(e) = &self.status_err {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("GPU state: {e}")).color(t.pending).size(12.0));
@@ -353,8 +448,9 @@ impl OverclockView {
         w::card(ui, t, "Voltage/frequency curve", |ui| {
             let b = self.base.clone().unwrap_or_default();
             let c = changed_color(t, self.uv_on != b.oc_uv_enabled);
-            ui.checkbox(&mut self.uv_on, RichText::new("Enabled").color(c));
             ui.horizontal(|ui| {
+                ui.checkbox(&mut self.uv_on, RichText::new("Enabled").color(c));
+                ui.add_space(16.0);
                 ui.label(RichText::new("From").color(t.text));
                 field(ui, t, &mut self.from, Some(b.oc_uv_from_mv));
                 ui.label(RichText::new("mV").color(t.muted()).size(12.0));
@@ -372,18 +468,21 @@ impl OverclockView {
                 (Some(f), Some(to), Some(tg)) => Some((f, to, preview(status, f, to, tg))),
                 _ => None,
             };
-            match &plan {
-                Some((f, to, Ok(p))) => {
-                    ui.label(RichText::new(offset_text(p, *f, *to)).color(t.text));
+            // The plan and what is applied, on one line.
+            ui.horizontal_wrapped(|ui| {
+                match &plan {
+                    Some((f, to, Ok(p))) => {
+                        ui.label(RichText::new(offset_text(p, *f, *to)).color(t.text));
+                    }
+                    Some((_, _, Err(e))) => {
+                        ui.label(RichText::new(e.as_str()).color(t.danger));
+                    }
+                    None => {
+                        ui.label(RichText::new("Enter numbers in From, To and Target").color(t.danger));
+                    }
                 }
-                Some((_, _, Err(e))) => {
-                    ui.label(RichText::new(e.as_str()).color(t.danger));
-                }
-                None => {
-                    ui.label(RichText::new("Enter numbers in From, To and Target").color(t.danger));
-                }
-            }
-            ui.label(RichText::new(applied_curve_text(status)).color(t.muted()).size(12.0));
+                ui.label(RichText::new(format!("· {}", applied_curve_text(status))).color(t.muted()).size(12.0));
+            });
             if status.foreign_core_offset_mhz != 0 {
                 ui.label(
                     RichText::new(format!(
@@ -408,8 +507,16 @@ impl OverclockView {
         });
     }
 
-    fn power_card(&mut self, ui: &mut Ui, t: &Theme, status: &OcStatus, deferred: bool) {
+    fn power_card(
+        &mut self,
+        ui: &mut Ui,
+        t: &Theme,
+        status: &OcStatus,
+        deferred: bool,
+        fit: &mut dyn FnMut(&mut Ui, f32),
+    ) {
         w::card(ui, t, "Power limit", |ui| {
+            let top = ui.min_rect().top();
             let b = self.base.clone().unwrap_or_default();
             let c = changed_color(t, self.power_on != b.oc_power_enabled);
             ui.checkbox(&mut self.power_on, RichText::new("Enabled").color(c));
@@ -424,11 +531,20 @@ impl OverclockView {
                 None => range_line(ui, t, "Allowed range not read", false),
             }
             self.result_lines(ui, t, "power", self.power_on, deferred);
+            fit(ui, ui.min_rect().bottom() - top);
         });
     }
 
-    fn memory_card(&mut self, ui: &mut Ui, t: &Theme, status: &OcStatus, deferred: bool) {
+    fn memory_card(
+        &mut self,
+        ui: &mut Ui,
+        t: &Theme,
+        status: &OcStatus,
+        deferred: bool,
+        fit: &mut dyn FnMut(&mut Ui, f32),
+    ) {
         w::card(ui, t, "Memory offset", |ui| {
+            let top = ui.min_rect().top();
             let b = self.base.clone().unwrap_or_default();
             let c = changed_color(t, self.mem_on != b.oc_mem_enabled);
             ui.checkbox(&mut self.mem_on, RichText::new("Enabled").color(c));
@@ -436,9 +552,6 @@ impl OverclockView {
                 field(ui, t, &mut self.mem, Some(b.oc_mem_offset_mhz));
                 ui.label(RichText::new("MHz").color(t.muted()).size(12.0));
             });
-            if let Some(line) = mem_clock_text(status) {
-                ui.add(egui::Label::new(RichText::new(line).color(t.muted()).size(12.0)).wrap());
-            }
             let range = status.mem_range_ab.map(|(lo, hi)| (lo as f64, hi as f64));
             let bad = matches!((parse(&self.mem), range), (Some(v), Some((lo, hi))) if v < lo || v > hi);
             match status.mem_range_ab {
@@ -446,6 +559,48 @@ impl OverclockView {
                 None => range_line(ui, t, "Allowed range not read", false),
             }
             self.result_lines(ui, t, "memory", self.mem_on, deferred);
+            fit(ui, ui.min_rect().bottom() - top);
+        });
+    }
+
+    fn clocks_card(
+        &mut self,
+        ui: &mut Ui,
+        t: &Theme,
+        status: &OcStatus,
+        deferred: bool,
+        fit: &mut dyn FnMut(&mut Ui, f32),
+    ) {
+        w::card(ui, t, "XBAR / SYS offset · MHz", |ui| {
+            let top = ui.min_rect().top();
+            let b = self.base.clone().unwrap_or_default();
+            let available = status.xbar_khz.is_some() || status.sys_khz.is_some();
+            ui.horizontal(|ui| {
+                for (on, text, base_on, base_v, name) in [
+                    (&mut self.xbar_on, &mut self.xbar, b.oc_xbar_enabled, b.oc_xbar_offset_mhz, "XBAR"),
+                    (&mut self.sys_on, &mut self.sys, b.oc_sys_enabled, b.oc_sys_offset_mhz, "SYS"),
+                ] {
+                    let c = changed_color(t, *on != base_on);
+                    ui.add_enabled(available || *on, egui::Checkbox::new(on, RichText::new(name).color(c)));
+                    field_w(ui, t, text, Some(base_v), 36.0);
+                }
+            });
+            let c = changed_color(t, self.load_only != b.oc_clk_load_only);
+            ui.checkbox(&mut self.load_only, RichText::new("Only under load").color(c)).on_hover_text(LOAD_ONLY_WHY);
+            ui.add_enabled_ui(self.load_only, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    field_w(ui, t, &mut self.load_w, Some(b.oc_clk_load_watts), 36.0);
+                    ui.label(RichText::new("W for").color(t.muted()).size(12.0));
+                    field_w(ui, t, &mut self.load_s, Some(b.oc_clk_load_seconds), 26.0);
+                    ui.label(RichText::new("s · idle").color(t.muted()).size(12.0));
+                    field_w(ui, t, &mut self.idle_s, Some(b.oc_clk_idle_seconds), 26.0);
+                    ui.label(RichText::new("s").color(t.muted()).size(12.0));
+                });
+            });
+            self.result_lines(ui, t, "xbar", self.xbar_on, deferred);
+            self.result_lines(ui, t, "sys", self.sys_on, deferred);
+            fit(ui, ui.min_rect().bottom() - top);
         });
     }
 
@@ -462,41 +617,66 @@ impl OverclockView {
     }
 }
 
-/// What the card is doing right now, next to what was set.
-fn live_tiles(ui: &mut Ui, t: &Theme, status: &OcStatus, live: Option<&Live>) {
+/// What the card runs now: two rows of tiles, from the fast readings (`OcLive`), the
+/// connector's pins and, for the voltage and the offsets, the slower status.
+fn live_tiles(ui: &mut Ui, t: &Theme, status: &OcStatus, live: Option<&Live>, oc: Option<&crate::protocol::OcLive>) {
     use w::Tile;
-    let dash = "—";
+    let dash = || "—".to_string();
+    let mhz = |v: Option<u32>| v.map_or_else(dash, |v| format!("{v} MHz"));
+    let o = oc.cloned().unwrap_or_default();
     let limited = live.is_some_and(|l| l.engaged);
-    let power = {
-        let tile = Tile::new("GPU power", status.power_draw_w.map_or(dash.to_string(), |w| format!("{w} W")));
-        match (limited, status.power_w) {
-            (true, _) => tile.sub("limited by the guard").sub_color(Some(t.pending)),
-            (false, Some(w)) => tile.sub(format!("limit {w} W")),
-            _ => tile,
-        }
+
+    // Row 1, power: what the card draws, how hot and at what voltage, and the connector.
+    let power = Tile::new("GPU power", o.power_draw_w.map_or_else(dash, |w| format!("{w} W")));
+    let power = match (limited, o.power_limit_w) {
+        (true, _) => power.sub("limited by the guard").sub_color(Some(t.pending)),
+        (false, Some(w)) => power.sub(format!("limit {w} W")),
+        _ => power,
     };
-    let core = match (status.live_mv, status.live_mhz) {
-        (Some(mv), Some(mhz)) => Tile::new("Core", format!("{mv:.0} mV")).sub(format!("{mhz:.0} MHz on the curve")),
-        (Some(mv), None) => Tile::new("Core", format!("{mv:.0} mV")),
-        _ => Tile::new("Core", dash),
-    };
-    let memory = match status.mem_ab {
-        Some(ab) => {
-            let tile = Tile::new("Memory", format!("{ab:+} MHz"));
-            match status.mem_clock_mhz {
-                Some(c) => tile.sub(format!("{c} MHz at full load")),
-                None => tile,
-            }
-        }
-        None => Tile::new("Memory", dash),
-    };
+    let temp = Tile::new("GPU temperature", o.temp_c.map_or_else(dash, |c| format!("{c} °C")))
+        .color(o.temp_c.and_then(|c| match c {
+            90.. => Some(t.danger),
+            83.. => Some(t.pending),
+            _ => None,
+        }))
+        .sub("core");
+    let volts = Tile::new("Core voltage", status.live_mv.map_or_else(dash, |mv| format!("{mv:.0} mV")));
     let pin = match live.filter(|l| !l.pins.is_empty()) {
-        Some(l) => Tile::new("Max pin", format!("{:.2} A", l.max_val))
-            .color(super::live::amps_color(t, l.max_val, &l.settings))
-            .sub(format!("{} · limit {} A", l.max_label, l.settings.threshold_amps)),
-        None => Tile::new("Max pin", dash),
+        Some(l) => {
+            let total: f64 = l.pins.iter().map(|p| p.1).sum();
+            Tile::new("Max pin", format!("{:.2} A", l.max_val))
+                .color(super::live::amps_color(t, l.max_val, &l.settings))
+                .sub(format!("{} · total {total:.1} A", l.max_label))
+        }
+        None => Tile::new("Max pin", dash()),
     };
-    w::tiles(ui, t, &[power, core, memory, pin]);
+    w::tiles(ui, t, &[power, temp, volts, pin]);
+    ui.add_space(w::GAP);
+
+    // Row 2, clocks: each as measured, with the offset applied to it.
+    let offset = |khz: Option<(i32, i32, i32)>| match khz {
+        Some((0, _, _)) => "no offset".to_string(),
+        Some((k, _, _)) => format!("offset {:+} MHz", k / 1000),
+        None => "not available".to_string(),
+    };
+    // The load gate's state goes with the offsets, when "only under load" is on.
+    let gate = match live.map(|l| l.settings.oc_clk_load_only) {
+        Some(true) if status.clk_loaded => " · under load",
+        Some(true) => " · idle",
+        _ => "",
+    };
+    let core = Tile::new("Core clock", mhz(o.core_mhz)).sub(match status.uv_offset_mhz {
+        Some(off) if status.managed.iter().any(|m| m == "undervolt") => format!("curve {off:+} MHz"),
+        _ => "stock curve".to_string(),
+    });
+    let xbar = Tile::new("XBAR clock", mhz(o.xbar_mhz)).sub(offset(status.xbar_khz) + gate);
+    let sys = Tile::new("SYS clock", mhz(o.sys_mhz)).sub(offset(status.sys_khz));
+    let mem = Tile::new("Memory clock", mhz(o.mem_mhz)).sub(match status.mem_ab {
+        Some(0) => "no offset".to_string(),
+        Some(ab) => format!("offset {ab:+} MHz"),
+        None => String::new(),
+    });
+    w::tiles(ui, t, &[core, xbar, sys, mem]);
 }
 
 /// "Applied now: ..." for the curve: the stock curve, or the offset where it differs.
@@ -511,17 +691,6 @@ fn applied_curve_text(status: &OcStatus) -> String {
     } else {
         format!("Applied now: curve changed (largest step {:+} MHz)", top.round() as i32)
     }
-}
-
-/// "Memory clock 16001 MHz at full load · stock 14001 MHz". Stock is the full-load clock with
-/// the applied offset taken back out (the offset is shown in the units the clock moves by).
-fn mem_clock_text(status: &OcStatus) -> Option<String> {
-    let clock = status.mem_clock_mhz?;
-    let mut text = format!("Memory clock {clock} MHz at full load");
-    if let Some(offset) = status.mem_ab {
-        text.push_str(&format!(" · stock {} MHz", clock as i64 - offset as i64));
-    }
-    Some(text)
 }
 
 /// The curve's highest frequency and the first voltage that reaches it, as (mV, MHz).
@@ -553,6 +722,10 @@ fn label_row_text(ui: &mut Ui, t: &Theme, label: &str) {
 
 /// A number box: danger when it does not parse, accent when it differs from the saved value.
 fn field(ui: &mut Ui, t: &Theme, text: &mut String, base: Option<f64>) {
+    field_w(ui, t, text, base, 62.0);
+}
+
+fn field_w(ui: &mut Ui, t: &Theme, text: &mut String, base: Option<f64>, width: f32) {
     let parsed = parse(text);
     let color = match (parsed, base) {
         (None, _) => t.danger,
@@ -561,7 +734,7 @@ fn field(ui: &mut Ui, t: &Theme, text: &mut String, base: Option<f64>) {
     };
     ui.add(
         TextEdit::singleline(text)
-            .desired_width(62.0)
+            .desired_width(width)
             .horizontal_align(Align::RIGHT)
             .text_color(color)
             .margin(egui::Margin::symmetric(6, 3)),
@@ -569,7 +742,7 @@ fn field(ui: &mut Ui, t: &Theme, text: &mut String, base: Option<f64>) {
 }
 
 const GRAPH_H: f32 = 200.0;
-const GRAPH_MIN_H: f32 = 110.0;
+const GRAPH_MIN_H: f32 = 90.0;
 
 /// A small accent label with a surface-colored backing.
 fn tag(p: &egui::Painter, t: &Theme, pos: Pos2, align: Align2, text: String) {
@@ -606,8 +779,8 @@ fn graph(ui: &mut Ui, t: &Theme, status: &OcStatus, preview: Option<&Preview>, t
         p.text(Pos2::new(x, plot.max.y + 3.0), Align2::CENTER_TOP, format!("{mv:.0}"), label.clone(), t.faint());
     }
     p.text(Pos2::new(plot.max.x, plot.max.y + 3.0), Align2::RIGHT_TOP, "mV", label.clone(), t.muted());
-    // beside the top tick, clear of the target label
-    p.text(Pos2::new(plot.max.x, plot.min.y + 2.0), Align2::RIGHT_TOP, "MHz", label.clone(), t.muted());
+    // above the axis labels, clear of the curves and the target label
+    p.text(Pos2::new(rect.min.x, rect.min.y), Align2::LEFT_TOP, "MHz", label.clone(), t.muted());
 
     let clipped = p.with_clip_rect(plot.expand(6.0));
     let stock: Vec<Pos2> = status.stock_curve.iter().map(|&(mv, mhz)| at(mv, mhz)).collect();
@@ -709,6 +882,14 @@ mod tests {
         rest.oc_mem_enabled = None;
         rest.oc_mem_offset_mhz = None;
         rest.oc_apply_delay_seconds = None;
+        rest.oc_xbar_enabled = None;
+        rest.oc_xbar_offset_mhz = None;
+        rest.oc_sys_enabled = None;
+        rest.oc_sys_offset_mhz = None;
+        rest.oc_clk_load_only = None;
+        rest.oc_clk_load_watts = None;
+        rest.oc_clk_load_seconds = None;
+        rest.oc_clk_idle_seconds = None;
         assert!(rest.is_empty());
         v.mem = "abc".into();
         assert!(v.apply_job().is_err());
@@ -731,15 +912,5 @@ mod tests {
         assert_eq!(curve_peak(&p.curve), Some((895.0, 2827.0)));
         assert_eq!(curve_peak(&owner_status().stock_curve), Some((1240.0, 3232.0)));
         assert_eq!(curve_peak(&[]), None);
-    }
-
-    #[test]
-    fn the_memory_clock_line_shows_full_load_and_stock() {
-        let mut s = OcStatus { mem_clock_mhz: Some(16001), mem_ab: Some(2000), ..Default::default() };
-        assert_eq!(mem_clock_text(&s).unwrap(), "Memory clock 16001 MHz at full load · stock 14001 MHz");
-        s.mem_ab = None;
-        assert_eq!(mem_clock_text(&s).unwrap(), "Memory clock 16001 MHz at full load");
-        s.mem_clock_mhz = None;
-        assert_eq!(mem_clock_text(&s), None);
     }
 }

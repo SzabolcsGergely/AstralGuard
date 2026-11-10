@@ -143,6 +143,19 @@ fn probe(args: &[String]) -> i32 {
         }
     };
     println!("{} (subsystem 0x{:08X})", sensor.description(), sensor.info.subsystem);
+    // The XBAR / SYS clock offsets, read only (the control's GET calls; no write is made here).
+    for d in [overclock::ClkDomain::Xbar, overclock::ClkDomain::Sys] {
+        match overclock::clkctl::offset_khz(sensor.info.subsystem, d) {
+            Ok((cur, lo, hi)) => {
+                println!("{} offset {:+} MHz (range {:+}..{:+})", d.name(), cur / 1000, lo / 1000, hi / 1000)
+            }
+            Err(e) => println!("{} offset: {e}", d.name()),
+        }
+        match overclock::clkctl::measure_khz(sensor.info.subsystem, d) {
+            Ok(khz) => println!("{} clock {} MHz", d.name(), khz / 1000),
+            Err(e) => println!("{} clock: {e}", d.name()),
+        }
+    }
     for _ in 0..5 {
         match sensor.read_pins() {
             Ok(pins) => println!(
