@@ -18,7 +18,10 @@ rust/                     the whole program: one crate, one binary (astralguard)
   src/config.rs           config.ini read/write (keeps unknown keys and comments), data_dir()
   src/ipc.rs              local socket: named pipe (Windows) / unix socket (Linux)
   src/watchdog.rs         supervises service + ui, restarts crashes (job object / SIGKILL)
-  src/sensor/             IT8915 per-pin + accelerometer reads: nvapi.rs (Windows), i2cdev.rs (Linux),
+  src/logger.rs           astralguard.log (rotates at 2 MB, keeps 5)
+  src/crash.rs            panic hook: logs/crash_trace.log
+  src/sensor/             IT8915 per-pin + accelerometer reads: mod.rs (ASTRAL_CARDS, parsing, plausibility),
+                          nvapi.rs (Windows), i2cdev.rs (Linux),
                           detect.rs (Linux sensor scan: probe --detect / dashboard Scan)
   src/mitigation.rs       NVML clock lock + power limit, and putting them back
   src/nvapi.rs            the one shared NVAPI binding (Windows pin reads, V/F curve calls), one lock;
@@ -26,7 +29,7 @@ rust/                     the whole program: one crate, one binary (astralguard)
                           connect (recovers after a driver reset)
   src/overclock/          the optional overclock: curve.rs (math), gpu.rs (OcGpu trait + RealGpu),
                           mod.rs (Overclocker, overclock.active marker, probe)
-  src/service/            the protection core
+  src/service/            the protection core; mod.rs = shared state and the IPC requests
     monitor.rs            0.5 s loop: read pins, tier 1 timer, act on the ladder's decision
     response.rs           the response ladder (tiers 1-3, grace, hold, release, retrigger)
     imbalance.rs sag.rs   warnings (sag never acts; imbalance acts only in "act" mode)
@@ -38,7 +41,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
   build.rs                Windows: embeds the icon + version info (writes a .res itself)
   assets/icon/            icon sources (SVG), render.py, the generated .ico / PNGs
   packaging/windows/      Inno Setup script for the setup .exe
-  packaging/linux/        systemd unit, autostart entry, debian/postinst, arch/PKGBUILD
+  packaging/linux/        systemd unit, sysusers.conf, modules-load.conf (i2c-dev), autostart and
+                          launcher .desktop, debian/postinst, arch/PKGBUILD + astralguard.install
   .cargo/config.toml      Windows GNU toolchain linker settings (see below)
   build.ps1               Windows GNU build helper
 .github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags)
@@ -69,7 +73,7 @@ Then:
 ```sh
 cd rust
 cargo build --release            # target/release/astralguard
-cargo build --release --no-default-features   # service only, no tray/window/GTK
+cargo build --release --no-default-features   # service only, no tray/window
 ```
 
 ### Windows
@@ -112,7 +116,7 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
   the dashboard instead), the service's (two guards would mean two shutdown commands) and
   the UI's. A just-stopped guard can take seconds to exit, so the service and the
   watchdog-started UI wait up to 15 s for a lock before giving up. Don't shorten that:
-  giving up early once left no guard running. If a guard is installed, stop it (Task
+  giving up early can leave no guard running. If a guard is installed, stop it (Task
   Scheduler task `AstralGuard`, or `systemctl stop astralguard`) before running your build,
   and start it again afterwards.
 - Windows elevation: a non-elevated `astralguard` starts the guard through this user's
@@ -147,16 +151,19 @@ existing tone of the module doc comments.
 
 These are not style preferences. A change that breaks one gets rejected.
 
-1. **I2C is read-only.** Every transaction to the IT8915 (device `0x2B`) is "set register
-   pointer, read N bytes". Never write a data register, never probe other I2C addresses:
-   a write to the wrong device on a GPU bus can permanently damage hardware.
-   `NvAPI_I2CWriteEx` is deliberately not bound. Don't bind it. The one place that touches
-   more than one bus is the sensor scan (`sensor/detect.rs`): only on a person's request
-   or with `sensor_auto_scan` on (off by default; then once per time the pins stop
-   reading, never at every start), only the Astral's own adapters, only address `0x2B`, a pure 1-byte read first, and the
-   pointer+read only where that was acknowledged. The service refuses a scan while a
-   sensor is connected. On Linux, reads go through `I2C_SMBUS` block reads: the NVIDIA
-   driver returns zeros for the same read through `I2C_RDWR`.
+1. **I2C is read-only.** Every transaction to the IT8915 (device `0x2B`) is a read: "set
+   register pointer, read N bytes", and the sensor scan's SMBus receive byte. Never write a
+   data register, never probe other I2C addresses: a write to the wrong device on a GPU bus
+   can permanently damage hardware. `NvAPI_I2CWriteEx` is deliberately not bound. Don't bind
+   it. The one place that touches more than one bus is the sensor scan (`sensor/detect.rs`):
+   only on a person's request or with `sensor_auto_scan` on (off by default; then at most
+   once each time the pins stop reading, never at every start), only the Astral's own
+   adapters (PCI vendor `0x10DE`, adapters named `NVIDIA i2c adapter …`), only address
+   `0x2B`, an SMBus receive byte (no pointer write) first, and the pointer+read only where
+   that was acknowledged. The service refuses a scan while a sensor is connected, and the
+   scan holds the bus lock so the monitor cannot connect meanwhile. On Linux, reads go
+   through `I2C_SMBUS`: the NVIDIA driver returns zeros for the same read through
+   `I2C_RDWR`.
 2. **The service makes no network connections.** Anything networked (the update check)
    lives in the UI process.
 3. **Nothing in the UI can stop protection.** The UI is a client of the service over IPC.
@@ -164,7 +171,8 @@ These are not style preferences. A change that breaks one gets rejected.
    hang must not affect the service. Don't move protection logic into the UI.
 4. **The shutdown decision stays testable.** `TieredResponse::evaluate()` returns a reason;
    only the monitor loop acts on it. Shutdown uses absolute paths
-   (`%SystemRoot%\System32\shutdown.exe`, `/usr/bin/systemctl`), never PATH.
+   (`%SystemRoot%\System32\shutdown.exe`, `/usr/bin/systemctl`, falling back to
+   `/sbin/shutdown -P now`), never PATH.
 5. **GPU limiting is reversible.** `mitigation.rs` records the clock and power limit before
    changing them and restores exactly those. The `mitigation.active` marker file covers a
    crash while limited. In shutdown-only mode the protection path never touches NVML. The
@@ -177,14 +185,15 @@ These are not style preferences. A change that breaks one gets rejected.
    A bad value falls back to its own default; unknown keys and comments survive a save.
 8. **Verified facts are marked.** Sensor constants and NVML behaviour carry
    `VERIFIED (date, card)` notes; anything not confirmed on hardware is marked
-   `UNVERIFIED`, like the Linux I2C adapter mapping. Keep it that way.
+   `UNVERIFIED`, like which physical socket each Pin number is. Keep it that way.
 9. **NVAPI's V/F calls are the overclock's only.** The NVAPI V/F curve functions are
    undocumented. They are used only in `overclock/`, only behind the compatibility check
    (write 15 MHz to one point, because the driver does not apply a 5 MHz offset, read the whole curve back, restore), and a per-point offset
    beyond ±1000 MHz is refused. NVAPI is loaded once and never unloaded, Initialize runs
    again on every Windows sensor connect (so the binding recovers after a driver reset),
    and every call goes through one lock. So a hung driver call delays the pin reads too;
-   that is why the overclock calls NVAPI only on apply, release and status requests. Rule 1
+   that is why the overclock calls NVAPI only when it applies (Apply now, at start, after a
+   limit is released, on resume), on an untick and on status requests. Rule 1
    is unchanged: nothing here writes to I2C.
 
 ## Changing things
@@ -223,7 +232,7 @@ results are downloadable run artifacts), and `release.yml` runs it for tags.
 | Package | Built by | Notes |
 |---|---|---|
 | `AstralGuard-<v>-setup.exe` | Inno Setup, `rust/packaging/windows/astralguard.iss` | Asks "all users" (Program Files, `astralguard register --all-users`: a task for the Users group) or "just me" (user profile, `astralguard register` via one UAC prompt) |
-| `astralguard_<v>-1_amd64.deb` | cargo-deb, `[package.metadata.deb]` in `rust/Cargo.toml` | Built in a `debian:bookworm` container so it runs on Debian 12+ / Ubuntu 22.04+; install-tested on four distributions |
+| `astralguard_<v>-1_amd64.deb` | cargo-deb, `[package.metadata.deb]` in `rust/Cargo.toml` | Built in a `debian:bookworm` container so it runs on Debian 12+ / Ubuntu 22.04+; install-tested on Debian 12 and Ubuntu 22.04, 24.04 and latest |
 | `astralguard-<v>-1-x86_64.pkg.tar.zst` | `makepkg`, `rust/packaging/linux/arch/PKGBUILD` | Built and install-tested in an `archlinux` container |
 
 To cut a release:

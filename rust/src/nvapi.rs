@@ -17,8 +17,9 @@
 //! anywhere else.
 //!
 //! V/F LAYOUTS (undocumented NVAPI; from ekojsalim/nvcurve, MIT, protocol only, no code
-//! copied). VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux). The
-//! Windows path (nvapi64.dll, same ids and layouts) is UNVERIFIED.
+//! copied). VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux) and
+//! (2026-11-10, same card, driver 621.14, Windows: nvapi64.dll, same ids and layouts) for the
+//! mask, curve and control calls; the core voltage read on Windows VERIFIED 2026-11-11.
 //!   Every buffer starts with a version word `(1 << 16) | size`; each call is
 //!   `fn(gpu, *mut buffer) -> status` (0 = OK).
 //!   Mask    0x507B4B59, 0x182C bytes: request bytes 4..36 = 0xFF, the answer's 4..36 is the
@@ -49,15 +50,15 @@ const NVAPI_ENUM_PHYSICAL_GPUS: u32 = 0xE5AC921F;
 const NVAPI_GPU_GET_PCI_IDENTIFIERS: u32 = 0x2DDFB66E;
 const NVAPI_MAX_PHYSICAL_GPUS: usize = 64;
 
-// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux); Windows UNVERIFIED.
+// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux; 2026-11-10, driver 621.14, Windows).
 const VF_MASK: u32 = 0x507B4B59;
 const VF_MASK_SIZE: usize = 0x182C;
-// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux); Windows UNVERIFIED.
+// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux; 2026-11-10, driver 621.14, Windows).
 const VF_CURVE: u32 = 0x21537AD4;
 const VF_CURVE_SIZE: usize = 0x1C28;
 const VF_CURVE_ENTRIES_AT: usize = 0x48;
 const VF_CURVE_STRIDE: usize = 0x1C;
-// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux); Windows UNVERIFIED.
+// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux; 2026-11-10, driver 621.14, Windows).
 const VF_CONTROL_GET: u32 = 0x23F1B133;
 const VF_CONTROL_SET: u32 = 0x0733E009;
 const VF_CONTROL_SIZE: usize = 0x2420;
@@ -65,7 +66,8 @@ const VF_CONTROL_ENTRIES_AT: usize = 0x44;
 const VF_CONTROL_STRIDE: usize = 0x24;
 const VF_CONTROL_DELTA_AT: usize = 0x14;
 const VF_CONTROL_FLAG_MEMORY: u32 = 1;
-// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux); Windows UNVERIFIED.
+// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux; 2026-11-11, same card,
+// Windows).
 const CORE_VOLTAGE: u32 = 0x465F9BCF;
 const CORE_VOLTAGE_SIZE: usize = 0x4C;
 const CORE_VOLTAGE_UV_AT: usize = 0x28;
@@ -297,8 +299,7 @@ pub fn read_curve(api: &Api, gpu: GpuHandle) -> Result<Vec<RawPoint>, String> {
 }
 
 /// Set the frequency delta (kHz) of the given curve points; every other point keeps its own.
-/// Not called by anything yet: the Overclocker (behind its compatibility check) will be the
-/// only caller.
+/// Called only by the Overclocker, behind its compatibility check (safety rule 9).
 pub fn write_deltas(api: &Api, gpu: GpuHandle, deltas_khz: &[(usize, i32)]) -> Result<(), String> {
     if deltas_khz.is_empty() {
         return Ok(());

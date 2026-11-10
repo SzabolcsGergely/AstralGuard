@@ -3,6 +3,8 @@
 config.ini
 logs/
 mitigation.active
+overclock.active
+*.active.tmp
 last_shutdown.json
 
 # IDE
@@ -11,9 +13,11 @@ last_shutdown.json
 *.swp
 *.swo
 
-# Design mockups
+# Design mockups and working notes
 mockups/
+docs/superpowers/
 
 # Rust build
 rust/target/
+rust/target-*/
 /astralguard.exe
