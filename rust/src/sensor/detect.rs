@@ -2,9 +2,10 @@
 //! of the Astral's I2C adapters carries the IT8915, prove it, and save it for the service
 //! (Linux only).
 //!
-//! The one place that talks to more than one adapter, and only when a person asks for it.
-//! The service runs it only on the dashboard's request, and only while no sensor is
-//! reading; otherwise it uses the single saved adapter (see i2cdev.rs).
+//! The one place that talks to more than one adapter. The service runs it on the dashboard's
+//! request, or by itself with `sensor_auto_scan` on (off by default; at most once each time
+//! the pins stop reading), and only while no sensor is reading; otherwise it uses the single
+//! saved adapter (see i2cdev.rs).
 //!
 //! Per adapter of the Astral's own PCI device (never another device's bus):
 //! 1. a pure 1-byte read at 0x2B, no register pointer write. No ack: skip the adapter.

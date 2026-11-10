@@ -30,8 +30,9 @@ pub trait OcGpu {
 /// every call, because a sensor reconnect re-initializes NVAPI and may invalidate handles
 /// (see `nvapi`'s module doc), and an NVML handle is cheap to find.
 ///
-/// UNVERIFIED as a whole: exercised on hardware in a later, supervised step. The individual
-/// NVML and NVAPI calls carry their own VERIFIED notes.
+/// VERIFIED as a whole (2026-11-10, ROG Astral RTX 5090 OC, driver 621.14, Windows): apply and
+/// untick of all three settings, back exactly at stock. The individual NVML and NVAPI calls
+/// carry their own notes, Linux included.
 pub struct RealGpu {
     subsystem: u32,
     nvml: Nvml,

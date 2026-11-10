@@ -31,8 +31,8 @@ use crate::logger;
 use crate::protocol::{OcReport, OcResult, OcStatus, Settings};
 use curve::{ab_to_nvml_mem, nvml_to_ab_mem, plan_undervolt, stock_mhz, RawPoint};
 
-/// The driver's per-point offset range. ClkDomainsGetInfo reports it, but the constant is what
-/// the owner's card reports (±1000 MHz, see the design) and the design allows using it.
+/// The driver's per-point offset range. ClkDomainsGetInfo reports it; this card reports
+/// ±1000 MHz (ROG Astral RTX 5090 OC), so the constant is used instead of another driver call.
 const MAX_CURVE_DELTA_MHZ: i32 = 1000;
 /// The compatibility check's test write on the middle core point: 15 MHz.
 /// VERIFIED (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06, Linux): a small per-point

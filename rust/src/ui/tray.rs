@@ -439,7 +439,7 @@ fn run(link: Arc<Link>, actions: Actions, _hwnd: Arc<AtomicIsize>) {
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn run(_link: Arc<Link>, _actions: Actions, _hwnd: Arc<AtomicIsize>) {
-    // TODO: macOS needs the tray on the main thread; not a target for now.
+    // No tray: only Windows and Linux are supported (macOS would need it on the main thread).
 }
 
 #[cfg(all(test, target_os = "linux"))]

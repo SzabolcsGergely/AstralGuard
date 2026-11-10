@@ -114,8 +114,8 @@ starts the guard elevated. Limiting the GPU needs administrator rights, and the 
 provides them without a UAC prompt at every sign-in. Upgrades keep the choice you made
 the first time.
 
-The guard then lives in the tray. Hover the icon: `AstralGuard: Safe (all pins within
-limits) | ...` means it is reading your card. Opening **AstralGuard** from the Start menu
+The guard then lives in the tray. Hover the icon: `AstralGuard: Safe | Max 7.12A, Min
+6.80A` means it is reading your card. Opening **AstralGuard** from the Start menu
 brings up the dashboard, or starts the guard if it isn't running.
 
 Silent install: `AstralGuard-<version>-setup.exe /VERYSILENT /ALLUSERS` (or
@@ -154,10 +154,11 @@ Or build it yourself with [`rust/packaging/linux/arch/PKGBUILD`](rust/packaging/
 > reading** with a **Scan** button (or run `sudo astralguard probe --detect`). The scan
 > tries the card's own I2C adapters, keeps the one that shows 12 V on every pin, about
 > 1 g on the accelerometer and a total that matches NVML's board power, and saves it
-> (`i2c_adapter` in `config.ini`). Tick **Scan automatically next time** in the scan popup
+> (`i2c_adapter` and `i2c_adapter_subsystem` in `config.ini`, used only while the same card
+> sits at the same PCI address). Tick **Scan automatically next time** in the scan popup
 > (or Settings → System) and the guard does this by itself the next time the pins stop
 > reading, for example after a driver update. `ASTRALGUARD_I2C_BUS=<n>` in a systemd
-> drop-in still selects an adapter explicitly.
+> drop-in selects an adapter explicitly and overrides the saved one.
 
 ### Updating and uninstalling
 
@@ -319,9 +320,7 @@ touched.
   undervolt is switched off, and it stays off on that driver version. Any
   per-point offset beyond ±1000 MHz is refused, not clamped. It is also refused while a core
   clock offset is set outside AstralGuard. The probe writes 15 MHz because the driver does not
-  apply a 5 MHz offset. The driver applies the target exactly in its reported curve (2827 MHz
-  reported on the owner's card). With the owner's undervolt applied, the driver also raised the
-  two points just below From to smooth the jump (810 mV and 815 mV) while their offsets stayed 0.
+  apply a 5 MHz offset.
 - **Power limit**: the board power limit in watts, through NVML.
 - **Memory offset**: in Afterburner units. AstralGuard sends twice the number to the driver,
   so `2000` here is what the driver calls `4000`.
@@ -351,8 +350,9 @@ than 5 s.
 Quitting AstralGuard leaves the overclock in place; the driver drops it at reboot. If the
 guard trips while an overclock is active, the log and the flight dump say so.
 
-The NVAPI curve layouts were verified on Linux (2026-11-09, ROG Astral RTX 5090 OC, driver 620.70.06). The
-Windows overclock path is **unverified**.
+The NVAPI curve layouts were verified on Linux (2026-11-09, ROG Astral RTX 5090 OC, driver
+620.70.06) and on Windows (2026-11-10, same card, driver 621.14). Only the core voltage readout
+is unverified on Windows.
 
 ## Configuration
 
@@ -397,7 +397,7 @@ after a driver update. `oc_vf_failed_driver` is written when the check finds a w
 in the wrong place: on that driver version the check does not run again and the undervolt stays
 off until a driver update (or until the key is removed).
 
-Window preferences (theme, size, which tab, pin order) are kept per user in
+Window preferences (theme, size, which tab, pin order, close action, update check) are kept per user in
 `%APPDATA%\AstralGuard\ui.json` / `~/.config/astralguard/ui.json`.
 
 ## Files, logs and events
@@ -406,9 +406,12 @@ Window preferences (theme, size, which tab, pin order) are kept per user in
 |---|---|---|
 | Settings | `C:\ProgramData\AstralGuard\config.ini` | `/var/lib/astralguard/config.ini` |
 | Log (rotates at 2 MB, keeps 5) | `…\logs\astralguard.log` | `/var/lib/astralguard/logs/astralguard.log` |
-| Watchdog / crash traces | `…\logs\watchdog.log`, `crash_trace.log` | journal (`journalctl -u astralguard`) |
+| Watchdog / crash traces | `…\logs\watchdog.log`, `crash_trace.log` | `logs/crash_trace.log`; restarts in the journal (`journalctl -u astralguard`) |
 | Flight recorder | `…\logs\flight_<time>_<event>.csv` | same, under `logs/` |
 | Daily sag median | `…\logs\sag_history.csv` | same, under `logs/` |
+| GPU limit / overclock markers | `mitigation.active`, `overclock.active` (data folder) | same, `/var/lib/astralguard` |
+| Last emergency shutdown | `last_shutdown.json` (data folder) | same |
+| Installer steps | `…\logs\setup.log` | none |
 
 A copy of `astralguard.exe` with a `config.ini` next to it keeps everything in its own
 folder (portable use). `ASTRALGUARD_HOME` overrides the location.
@@ -423,16 +426,31 @@ source *AstralGuard*):
 | 1005 | Restarted after a crash |
 | 3001 / 3002 | Pin over the threshold / still over |
 | 4001 | Load cleared, timer reset |
-| 6001 | Critical current (tier 2) |
-| 9001 | Error: the monitor loop or an overclock step panicked (the guard carries on) |
 | 5090 | Emergency shutdown |
 | 5091 | The last shutdown was an emergency stop (reported at the next start) |
+| 6001 | Critical current (tier 2) |
+| 6002 | GPU limited (tier 1 or 2) |
+| 6003 | The limit brought the current down; holding |
+| 6004 | Tiered mode selected, but the GPU cannot be limited: running shutdown-only |
+| 6005 | GPU limit released |
+| 6006 | Restored a GPU limit left by a crash (`mitigation.active`) |
+| 7001 / 7002 | GPU sag warning / serious |
+| 7003 | Card orientation changed suddenly |
+| 7004 | Sag creeping up over weeks |
+| 7005 | Sag baseline calibrated |
+| 7006 | Sag back to normal |
+| 7007 | Card off level at calibration |
+| 8001 / 8002 | Pin imbalance / cleared |
+| 9001 | Error: the monitor loop or an overclock step panicked (the guard carries on) |
+
+On Linux the same events go to the journal as `[id] message`.
 
 ## Command line
 
 | Command | |
 |---|---|
 | `astralguard` | Watchdog + service + tray. Started again while running, it opens the dashboard. |
+| `astralguard watchdog [--no-ui]` | The watchdog explicitly; `--no-ui` supervises the service only |
 | `astralguard service` | The service alone (what systemd runs on Linux) |
 | `astralguard ui [--show]` | Tray and dashboard alone |
 | `astralguard ui --demo` | Dashboard with a simulated card: no hardware, no service |
@@ -448,7 +466,7 @@ source *AstralGuard*):
   `astralguard probe` shows exactly what the chip answers.
 - **Banner says *Pin sensor not reading***: the card is there but its pin monitor gives
   no valid data (Linux). Press **Scan**; the result lists what each I2C adapter answered.
-- **Response shows *GPU limit unavailable* / *shutdown-only***: the guard is not running
+- **Banner says *GPU limiting unavailable* (Response: *Shutdown only*)**: the guard is not running
   elevated (Windows) or as root (Linux), so it can only shut down. Start it through the
   logon task (Start menu) or the systemd unit.
 - **The dashboard says *Guard service not running***: on Windows, start AstralGuard from
