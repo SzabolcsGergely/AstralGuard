@@ -25,6 +25,28 @@ pub trait OcGpu {
     fn curve(&mut self) -> Result<Vec<RawPoint>, String>;
     fn set_curve(&mut self, deltas_khz: &[(usize, i32)]) -> Result<(), String>;
     fn core_voltage_mv(&mut self) -> Result<f64, String>;
+    /// (current, min, max) offset of the XBAR or SYS clock domain, kHz.
+    fn clock_offset_khz(&mut self, d: ClkDomain) -> Result<(i32, i32, i32), String>;
+    fn set_clock_offset_khz(&mut self, d: ClkDomain, khz: i32) -> Result<(), String>;
+    /// What the card runs now. Reads only; no NVAPI.
+    fn live(&mut self) -> crate::protocol::OcLive;
+}
+
+/// The clock domains besides core and memory that the overclock can offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClkDomain {
+    /// The crossbar between the GPCs and the memory partitions.
+    Xbar,
+    Sys,
+}
+
+impl ClkDomain {
+    pub fn name(self) -> &'static str {
+        match self {
+            ClkDomain::Xbar => "XBAR",
+            ClkDomain::Sys => "SYS",
+        }
+    }
 }
 
 /// The real card: its own NVML instance (never the mitigator's) and the process's one NVAPI
@@ -65,6 +87,30 @@ impl RealGpu {
 // No test may call into the real driver, so under `cargo test` nothing constructs a RealGpu.
 #[cfg_attr(test, allow(dead_code))]
 impl OcGpu for RealGpu {
+    fn live(&mut self) -> crate::protocol::OcLive {
+        let mut l = crate::protocol::OcLive::default();
+        if let Ok(h) = self.nvml_handle() {
+            l.power_draw_w = self.nvml.power_usage_mw(h).ok().map(|mw| (mw + 500) / 1000);
+            l.power_limit_w = self.nvml.power_limit_mw(h).ok().map(|mw| (mw + 500) / 1000);
+            l.core_mhz = self.nvml.clock_mhz(h, NVML_CLOCK_GRAPHICS).ok();
+            l.mem_mhz = self.nvml.clock_mhz(h, NVML_CLOCK_MEM).ok();
+            l.temp_c = self.nvml.temperature_c(h).ok();
+        }
+        let measure = |d| super::clkctl::measure_khz(self.subsystem, d).ok().map(|k| k / 1000);
+        l.xbar_mhz = measure(ClkDomain::Xbar);
+        l.sys_mhz = measure(ClkDomain::Sys);
+        l
+    }
+
+    fn clock_offset_khz(&mut self, d: ClkDomain) -> Result<(i32, i32, i32), String> {
+        super::clkctl::offset_khz(self.subsystem, d)
+    }
+
+    fn set_clock_offset_khz(&mut self, d: ClkDomain, khz: i32) -> Result<(), String> {
+        let driver = self.nvml.driver_version()?;
+        super::clkctl::set_offset_khz(self.subsystem, &driver, d, khz)
+    }
+
     fn subsystem(&self) -> u32 {
         self.subsystem
     }

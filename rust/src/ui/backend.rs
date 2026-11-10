@@ -43,6 +43,8 @@ pub enum Job {
     ApplyOverclock(SettingsPatch),
     /// The overclock state from the driver; only sent while the Overclock tab is visible.
     OverclockStatus,
+    /// The Overclock tab's live readings (about once a second while it is visible).
+    OverclockLive,
 }
 
 impl Job {
@@ -63,6 +65,7 @@ impl Job {
             Job::ScanSensor => Request::ScanSensor,
             Job::ApplyOverclock(c) => Request::ApplyOverclock { changes: c.clone() },
             Job::OverclockStatus => Request::OverclockStatus,
+            Job::OverclockLive => Request::OverclockLive,
         }
     }
 

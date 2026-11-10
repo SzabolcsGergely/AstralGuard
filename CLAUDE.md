@@ -28,7 +28,10 @@ rust/                     the whole program: one crate, one binary (astralguard)
                           loaded once, never unloaded, Initialize again on every Windows sensor
                           connect (recovers after a driver reset)
   src/overclock/          the optional overclock: curve.rs (math), gpu.rs (OcGpu trait + RealGpu),
-                          mod.rs (Overclocker, overclock.active marker, probe)
+                          mod.rs (Overclocker, overclock.active marker, probe), load.rs (the
+                          XBAR / SYS load gate), clkctl.rs (XBAR / SYS clock-domain control and its
+                          checks; clkctl/windows_rm.rs = the display driver's escape channel,
+                          clkctl/linux_rm.rs = ioctls on /dev/nvidiactl)
   src/service/            the protection core; mod.rs = shared state and the IPC requests
     monitor.rs            0.5 s loop: read pins, tier 1 timer, act on the ladder's decision
     response.rs           the response ladder (tiers 1-3, grace, hold, release, retrigger)
@@ -197,6 +200,16 @@ These are not style preferences. A change that breaks one gets rejected.
    that is why the overclock calls NVAPI only when it applies (Apply now, at start, after a
    limit is released, on resume), on an untick and on status requests. Rule 1
    is unchanged: nothing here writes to I2C.
+10. **The XBAR / SYS clock control writes only behind its checks.** The driver's clock-domain
+    control (`overclock/clkctl.rs`; on Windows through the display driver's escape channel, on
+    Linux through ioctls on `/dev/nvidiactl`) is
+    undocumented and used only by the overclock. Every reply is checked against the layout
+    and refused when anything differs; the domains are found by their id, never by a fixed
+    index; only the clock-domain SET_CONTROL is ever sent as a write, carrying one domain's
+    offset and nothing else. Before the first write on a driver version the write check runs
+    (+15 MHz on XBAR, the whole control block of every domain read back, undone, compared byte
+    for byte); a wrong landing fails that driver for good (`oc_clk_failed_driver`). Every
+    write is read back. Don't add another command to this channel without the same checks.
 
 ## Common pitfalls
 

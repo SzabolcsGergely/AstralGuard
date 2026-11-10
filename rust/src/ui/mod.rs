@@ -726,8 +726,13 @@ impl eframe::App for App {
         self.modals(ctx);
         self.screenshot(ctx);
         // the GPU's state is read only while this tab is on screen
-        if self.tab == Tab::Overclock && self.shown && self.connected && self.overclock.poll_due() {
-            self.send(Job::OverclockStatus);
+        if self.tab == Tab::Overclock && self.shown && self.connected {
+            if self.overclock.poll_due() {
+                self.send(Job::OverclockStatus);
+            }
+            if self.overclock.live_due() {
+                self.send(Job::OverclockLive);
+            }
         }
         if self.tab == Tab::Log && self.shown {
             let link = self.link.clone();

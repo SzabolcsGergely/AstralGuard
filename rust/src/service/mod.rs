@@ -48,6 +48,12 @@ pub trait OcDriver {
     fn subsystem(&self) -> u32;
     /// What AstralGuard applied and will restore; no driver call.
     fn managed(&self) -> Vec<String>;
+    /// The load gate changed (XBAR / SYS "only under load").
+    fn set_loaded(&mut self, s: &Settings, loaded: bool, guard_engaged: bool) -> OcReport;
+    fn power_draw_w(&mut self) -> Result<u32, String>;
+    /// The load gate state the overclocker last applied.
+    fn loaded(&self) -> bool;
+    fn live(&mut self) -> crate::protocol::OcLive;
 }
 
 impl<G: OcGpu> OcDriver for Overclocker<G> {
@@ -71,6 +77,18 @@ impl<G: OcGpu> OcDriver for Overclocker<G> {
     }
     fn managed(&self) -> Vec<String> {
         Overclocker::managed(self)
+    }
+    fn set_loaded(&mut self, s: &Settings, loaded: bool, guard_engaged: bool) -> OcReport {
+        Overclocker::set_loaded(self, s, loaded, guard_engaged)
+    }
+    fn power_draw_w(&mut self) -> Result<u32, String> {
+        Overclocker::power_draw_w(self)
+    }
+    fn loaded(&self) -> bool {
+        Overclocker::loaded(self)
+    }
+    fn live(&mut self) -> crate::protocol::OcLive {
+        Overclocker::live(self)
     }
 }
 
@@ -124,6 +142,14 @@ fn copy_oc(from: &Settings, to: &mut Settings) {
     to.oc_mem_enabled = from.oc_mem_enabled;
     to.oc_mem_offset_mhz = from.oc_mem_offset_mhz;
     to.oc_apply_delay_seconds = from.oc_apply_delay_seconds;
+    to.oc_xbar_enabled = from.oc_xbar_enabled;
+    to.oc_xbar_offset_mhz = from.oc_xbar_offset_mhz;
+    to.oc_sys_enabled = from.oc_sys_enabled;
+    to.oc_sys_offset_mhz = from.oc_sys_offset_mhz;
+    to.oc_clk_load_only = from.oc_clk_load_only;
+    to.oc_clk_load_watts = from.oc_clk_load_watts;
+    to.oc_clk_load_seconds = from.oc_clk_load_seconds;
+    to.oc_clk_idle_seconds = from.oc_clk_idle_seconds;
 }
 
 /// Only the oc_* keys of a patch: Apply now must not change anything else, whatever it is sent.
@@ -138,6 +164,14 @@ fn oc_only(p: &SettingsPatch) -> SettingsPatch {
         oc_mem_enabled: p.oc_mem_enabled,
         oc_mem_offset_mhz: p.oc_mem_offset_mhz,
         oc_apply_delay_seconds: p.oc_apply_delay_seconds,
+        oc_xbar_enabled: p.oc_xbar_enabled,
+        oc_xbar_offset_mhz: p.oc_xbar_offset_mhz,
+        oc_sys_enabled: p.oc_sys_enabled,
+        oc_sys_offset_mhz: p.oc_sys_offset_mhz,
+        oc_clk_load_only: p.oc_clk_load_only,
+        oc_clk_load_watts: p.oc_clk_load_watts,
+        oc_clk_load_seconds: p.oc_clk_load_seconds,
+        oc_clk_idle_seconds: p.oc_clk_idle_seconds,
         ..SettingsPatch::default()
     }
 }
@@ -153,7 +187,7 @@ impl Drop for ApplyRunning<'_> {
 
 /// Any overclock setting ticked.
 pub fn oc_ticked(s: &Settings) -> bool {
-    s.oc_uv_enabled || s.oc_power_enabled || s.oc_mem_enabled
+    s.oc_uv_enabled || s.oc_power_enabled || s.oc_mem_enabled || s.oc_xbar_enabled || s.oc_sys_enabled
 }
 
 /// The service's overclocker: the real GPU, its marker, and the driver version verified before.
@@ -590,6 +624,14 @@ impl Shared {
         }
     }
 
+    /// The tiles' readings: an empty set when the GPU cannot be opened.
+    fn overclock_live(&self) -> crate::protocol::OcLive {
+        match self.run_overclock(true, |d| d.live()) {
+            OcAccess::Ran(l) => l,
+            _ => crate::protocol::OcLive::default(),
+        }
+    }
+
     /// Apply now. Saved first, through the same path as every setting, so the next start
     /// applies exactly what was written; then written by the monitor thread (`serve_apply_now`),
     /// never from here: only there is the write ordered against the guard engaging.
@@ -762,6 +804,7 @@ impl Shared {
             Request::ScanSensor => Response::Scan { report: self.scan_sensor("from the dashboard") },
             Request::ApplyOverclock { changes } => Response::Overclock { report: self.apply_overclock(&changes) },
             Request::OverclockStatus => Response::OverclockStatus { status: self.overclock_status() },
+            Request::OverclockLive => Response::OverclockLive { live: self.overclock_live() },
             Request::CalibrateSag => {
                 self.calibrate_request.store(true, Ordering::Relaxed);
                 Response::Ok

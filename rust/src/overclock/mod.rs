@@ -17,15 +17,17 @@
 //!   lost or, worse, restored over.
 //! - Each setting stands alone: one refusal or driver error never stops the others.
 
+pub mod clkctl;
 pub mod curve;
 pub mod gpu;
+pub mod load;
 
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub use gpu::OcGpu;
+pub use gpu::{ClkDomain, OcGpu};
 
 use crate::logger;
 use crate::protocol::{OcReport, OcResult, OcStatus, Settings};
@@ -49,6 +51,8 @@ const PROBE_FREQ_TOLERANCE_KHZ: i64 = 1000;
 const UNDERVOLT: &str = "undervolt";
 const POWER: &str = "power";
 const MEMORY: &str = "memory";
+const XBAR: &str = "xbar";
+const SYS: &str = "sys";
 
 pub fn marker_path() -> PathBuf {
     crate::config::data_dir().join("overclock.active")
@@ -74,11 +78,39 @@ struct Marker {
     mem_applied_nvml: Option<i32>,
     #[serde(default)]
     curve_applied_khz: Option<Vec<(usize, i32)>>,
+    /// The XBAR / SYS clock offsets, kHz: before and applied, as for the others.
+    #[serde(default)]
+    xbar_before_khz: Option<i32>,
+    #[serde(default)]
+    xbar_applied_khz: Option<i32>,
+    #[serde(default)]
+    sys_before_khz: Option<i32>,
+    #[serde(default)]
+    sys_applied_khz: Option<i32>,
 }
 
 impl Marker {
     fn is_empty(&self) -> bool {
-        self.power_before_w.is_none() && self.mem_before_nvml.is_none() && self.curve_before_khz.is_none()
+        self.power_before_w.is_none()
+            && self.mem_before_nvml.is_none()
+            && self.curve_before_khz.is_none()
+            && self.xbar_before_khz.is_none()
+            && self.sys_before_khz.is_none()
+    }
+
+    /// (before, applied) of a clock domain's offset.
+    fn clock(&self, d: ClkDomain) -> (Option<i32>, Option<i32>) {
+        match d {
+            ClkDomain::Xbar => (self.xbar_before_khz, self.xbar_applied_khz),
+            ClkDomain::Sys => (self.sys_before_khz, self.sys_applied_khz),
+        }
+    }
+
+    fn clock_mut(&mut self, d: ClkDomain) -> (&mut Option<i32>, &mut Option<i32>) {
+        match d {
+            ClkDomain::Xbar => (&mut self.xbar_before_khz, &mut self.xbar_applied_khz),
+            ClkDomain::Sys => (&mut self.sys_before_khz, &mut self.sys_applied_khz),
+        }
     }
 
     /// "undervolt", "power", "memory": what AstralGuard applied and restores on untick.
@@ -87,6 +119,8 @@ impl Marker {
             (UNDERVOLT, self.curve_before_khz.is_some()),
             (POWER, self.power_before_w.is_some()),
             (MEMORY, self.mem_before_nvml.is_some()),
+            (XBAR, self.xbar_before_khz.is_some()),
+            (SYS, self.sys_before_khz.is_some()),
         ]
         .into_iter()
         .filter(|(_, on)| *on)
@@ -245,6 +279,19 @@ fn mem_nvml(s: &Settings) -> i32 {
     ab_to_nvml_mem(s.oc_mem_offset_mhz.round() as i32)
 }
 
+/// The XBAR / SYS settings: (domain, its name in results and the marker, ticked, offset kHz).
+fn clock_settings(s: &Settings) -> [(ClkDomain, &'static str, bool, i32); 2] {
+    let khz = |mhz: f64| (mhz.round() as i32).saturating_mul(1000);
+    [
+        (ClkDomain::Xbar, XBAR, s.oc_xbar_enabled, khz(s.oc_xbar_offset_mhz)),
+        (ClkDomain::Sys, SYS, s.oc_sys_enabled, khz(s.oc_sys_offset_mhz)),
+    ]
+}
+
+fn mhz(khz: i32) -> String {
+    format!("{:+} MHz", khz / 1000)
+}
+
 fn plan(s: &Settings, points: &[RawPoint]) -> Result<curve::UvPlan, String> {
     plan_undervolt(points, s.oc_uv_from_mv, s.oc_uv_to_mv, s.oc_uv_target_mhz, MAX_CURVE_DELTA_MHZ)
 }
@@ -257,6 +304,9 @@ pub struct Overclocker<G: OcGpu> {
     verified_driver: Option<String>,
     /// The driver version the check failed on: not probed again on that driver.
     failed_driver: Option<FailedDriver>,
+    /// "Only under load": whether the load gate says the GPU is busy. Without that setting the
+    /// XBAR / SYS offsets follow their tick boxes alone.
+    loaded: bool,
 }
 
 impl<G: OcGpu> Overclocker<G> {
@@ -271,7 +321,7 @@ impl<G: OcGpu> Overclocker<G> {
             version,
             persist: true,
         });
-        Overclocker { gpu, marker_path: marker, marker: m, verified_driver, failed_driver }
+        Overclocker { gpu, marker_path: marker, marker: m, verified_driver, failed_driver, loaded: false }
     }
 
     pub fn verified_driver(&self) -> Option<&str> {
@@ -319,6 +369,49 @@ impl<G: OcGpu> Overclocker<G> {
         }
         log_results("after release", &results);
         OcReport { results, deferred: false }
+    }
+
+    /// The load gate changed: apply the XBAR / SYS offsets (`loaded`) or put them back, and
+    /// nothing else. Like `apply`, nothing is written while the guard limits the GPU; the
+    /// state is kept, so the after-release apply follows it.
+    pub fn set_loaded(&mut self, s: &Settings, loaded: bool, guard_engaged: bool) -> OcReport {
+        self.loaded = loaded;
+        if guard_engaged {
+            return OcReport { results: Vec::new(), deferred: true };
+        }
+        let results: Vec<OcResult> =
+            self.run_clocks(s).into_iter().filter(|(_, acted)| *acted).map(|(r, _)| r).collect();
+        log_results(if loaded { "under load" } else { "idle" }, &results);
+        OcReport { results, deferred: false }
+    }
+
+    pub fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// What the card runs now, for the tab's tiles. Reads only.
+    pub fn live(&mut self) -> crate::protocol::OcLive {
+        self.gpu.live()
+    }
+
+    /// What the card draws now, W (for the load gate).
+    pub fn power_draw_w(&mut self) -> Result<u32, String> {
+        self.gpu.power_draw_w()
+    }
+
+    /// The XBAR / SYS steps: a ticked domain is applied when wanted (always, or under load with
+    /// "only under load"), and put back when not; an unticked one AstralGuard applied is put back.
+    fn run_clocks(&mut self, s: &Settings) -> Vec<(OcResult, bool)> {
+        let wanted = !s.oc_clk_load_only || self.loaded;
+        let mut results = Vec::new();
+        for (d, name, ticked, khz) in clock_settings(s) {
+            if ticked && wanted {
+                results.push(outcome(name, self.apply_clock(d, khz)));
+            } else if let (Some(before), applied) = self.marker.clock(d) {
+                results.push(outcome(name, self.restore_clock(d, before, applied)));
+            }
+        }
+        results
     }
 
     /// The one path behind `apply` and `after_release`: ticked = ensure applied, unticked and
@@ -382,6 +475,8 @@ impl<G: OcGpu> Overclocker<G> {
                 ));
             }
         }
+        // After the memory step, like the curve: whether a memory write resets these is not known.
+        results.extend(self.run_clocks(s));
         results
     }
 
@@ -422,6 +517,10 @@ impl<G: OcGpu> Overclocker<G> {
                 None
             };
         }
+        for (d, slot) in [(ClkDomain::Xbar, &mut st.xbar_khz), (ClkDomain::Sys, &mut st.sys_khz)] {
+            *slot = self.gpu.clock_offset_khz(d).ok();
+        }
+        st.clk_loaded = self.loaded;
         st.managed = self.marker.managed();
         st
     }
@@ -513,6 +612,54 @@ impl<G: OcGpu> Overclocker<G> {
         self.gpu.set_mem_offset(before).map_err(|e| format!("could not restore the memory offset ({e})"))?;
         self.forget(|m| (m.mem_before_nvml, m.mem_applied_nvml) = (None, None));
         Ok(Done::Wrote(format!("memory offset restored to {:+} MHz", nvml_to_ab_mem(before))))
+    }
+
+    fn apply_clock(&mut self, d: ClkDomain, want: i32) -> Result<Done, String> {
+        let what = d.name();
+        let (cur, min, max) =
+            self.gpu.clock_offset_khz(d).map_err(|e| format!("could not read the {what} clock offset ({e})"))?;
+        if !(min..=max).contains(&want) {
+            return Err(format!("{what} {} is outside the card's range {}..{}", mhz(want), mhz(min), mhz(max)));
+        }
+        let (before, applied) = self.marker.clock(d);
+        if before.is_none() || applied != Some(want) {
+            self.record(|m| {
+                let (b, a) = m.clock_mut(d);
+                b.get_or_insert(cur);
+                *a = Some(want);
+            })?;
+        }
+        let msg = format!("{what} offset {}", mhz(want));
+        if cur == want {
+            return Ok(Done::InEffect(msg));
+        }
+        self.gpu.set_clock_offset_khz(d, want).map_err(|e| format!("could not set the {what} clock offset ({e})"))?;
+        // Undocumented control: a write that reports success is read back before it counts.
+        let (now, _, _) =
+            self.gpu.clock_offset_khz(d).map_err(|e| format!("could not read back the {what} clock offset ({e})"))?;
+        if now != want {
+            return Err(format!("{what} offset written as {} but reads back {}", mhz(want), mhz(now)));
+        }
+        Ok(Done::Wrote(msg))
+    }
+
+    fn restore_clock(&mut self, d: ClkDomain, before: i32, applied: Option<i32>) -> Result<Done, String> {
+        let what = d.name();
+        let drop_entry = |m: &mut Marker| {
+            let (b, a) = m.clock_mut(d);
+            (*b, *a) = (None, None);
+        };
+        let (live, _, _) =
+            self.gpu.clock_offset_khz(d).map_err(|e| format!("could not read the {what} clock offset ({e})"))?;
+        if applied != Some(live) {
+            self.forget(drop_entry);
+            return Ok(left_as_is(&format!("{what} offset ({} now)", mhz(live))));
+        }
+        self.gpu
+            .set_clock_offset_khz(d, before)
+            .map_err(|e| format!("could not restore the {what} clock offset ({e})"))?;
+        self.forget(drop_entry);
+        Ok(Done::Wrote(format!("{what} offset restored to {}", mhz(before))))
     }
 
     fn apply_undervolt(&mut self, s: &Settings) -> Result<Done, String> {
@@ -751,6 +898,8 @@ pub(crate) mod fake {
         /// The Windows driver: a memory offset write resets every curve delta to 0.
         pub mem_write_resets_curve: bool,
         pub live_mv: f64,
+        /// XBAR and SYS: (current, min, max) offset, kHz.
+        pub clocks: [(i32, i32, i32); 2],
         /// Every set call, e.g. "set_power_limit_w(520)".
         pub calls: Vec<String>,
     }
@@ -787,6 +936,7 @@ pub(crate) mod fake {
                 curve_write_error: false,
                 mem_write_resets_curve: false,
                 live_mv: 880.0,
+                clocks: [(0, -1_000_000, 1_000_000); 2],
                 calls: Vec::new(),
             })))
         }
@@ -891,6 +1041,27 @@ pub(crate) mod fake {
         }
         fn core_voltage_mv(&mut self) -> Result<f64, String> {
             Ok(self.state().live_mv)
+        }
+        fn clock_offset_khz(&mut self, d: super::ClkDomain) -> Result<(i32, i32, i32), String> {
+            Ok(self.state().clocks[d as usize])
+        }
+        fn live(&mut self) -> crate::protocol::OcLive {
+            let st = self.state();
+            crate::protocol::OcLive {
+                power_draw_w: Some(st.power_w - 20),
+                power_limit_w: Some(st.power_w),
+                core_mhz: Some(2827),
+                mem_mhz: Some(14001),
+                xbar_mhz: Some((2_442_000 + st.clocks[0].0) as u32 / 1000),
+                sys_mhz: Some((2_292_000 + st.clocks[1].0) as u32 / 1000),
+                temp_c: Some(55),
+            }
+        }
+        fn set_clock_offset_khz(&mut self, d: super::ClkDomain, khz: i32) -> Result<(), String> {
+            let mut st = self.state();
+            st.calls.push(format!("set_clock_offset_khz({}, {khz})", d.name()));
+            st.clocks[d as usize].0 = khz;
+            Ok(())
         }
     }
 }
@@ -1422,5 +1593,92 @@ mod tests {
         assert!(o.after_release(&s).results.is_empty());
         assert!(gpu.calls().is_empty());
         let _ = std::fs::remove_file(&m);
+    }
+
+    fn clocks(xbar: i32, sys: i32, load_only: bool) -> Settings {
+        Settings {
+            oc_xbar_enabled: xbar != 0,
+            oc_xbar_offset_mhz: xbar as f64,
+            oc_sys_enabled: sys != 0,
+            oc_sys_offset_mhz: sys as f64,
+            oc_clk_load_only: load_only,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn xbar_and_sys_apply_read_back_and_restore_exactly() {
+        let (gpu, m) = (FakeGpu::owners(), marker("clk-apply"));
+        gpu.state().clocks[1].0 = 5_000; // SYS had +5 MHz from before
+        let mut o = oc(&gpu, &m);
+        let r = o.apply(&clocks(150, 30, false), false);
+        assert!(r.results.iter().all(|x| x.ok), "{r:?}");
+        assert_eq!(gpu.state().clocks[0].0, 150_000);
+        assert_eq!(gpu.state().clocks[1].0, 30_000);
+        assert_eq!(o.managed(), vec!["xbar", "sys"]);
+        // a second apply records nothing new and writes nothing
+        gpu.clear_calls();
+        o.apply(&clocks(150, 30, false), false);
+        assert!(gpu.calls().is_empty(), "{:?}", gpu.calls());
+        // untick: back to exactly what was there
+        let r = o.apply(&Settings::default(), false);
+        assert!(result(&r, "sys").message.contains("restored to +5 MHz"), "{r:?}");
+        // one lock at a time: the fake's mutex is not re-entrant
+        let now = gpu.state().clocks;
+        assert_eq!((now[0].0, now[1].0), (0, 5_000));
+        assert!(o.managed().is_empty() && !m.exists());
+    }
+
+    #[test]
+    fn only_under_load_applies_with_the_gate_and_puts_back_at_idle() {
+        let (gpu, m) = (FakeGpu::owners(), marker("clk-load"));
+        let mut o = oc(&gpu, &m);
+        let s = clocks(150, 0, true);
+        assert!(o.apply(&s, false).results.is_empty(), "idle: nothing to do");
+        assert!(gpu.calls().is_empty());
+        let r = o.set_loaded(&s, true, false);
+        assert!(result(&r, "xbar").ok && gpu.state().clocks[0].0 == 150_000, "{r:?}");
+        // the after-release apply follows the gate's state
+        gpu.clear_calls();
+        o.after_release(&s);
+        assert!(gpu.calls().is_empty(), "still under load and in effect: {:?}", gpu.calls());
+        let r = o.set_loaded(&s, false, false);
+        assert!(result(&r, "xbar").message.contains("restored to +0 MHz"), "{r:?}");
+        assert_eq!(gpu.state().clocks[0].0, 0);
+        assert!(!m.exists());
+    }
+
+    #[test]
+    fn the_load_gate_writes_nothing_while_the_guard_limits() {
+        let (gpu, m) = (FakeGpu::owners(), marker("clk-engaged"));
+        let mut o = oc(&gpu, &m);
+        let s = clocks(150, 0, true);
+        assert!(o.set_loaded(&s, true, true).deferred);
+        assert!(gpu.calls().is_empty());
+        // the release applies what the gate asked for meanwhile
+        o.after_release(&s);
+        assert_eq!(gpu.state().clocks[0].0, 150_000);
+        let _ = std::fs::remove_file(&m);
+    }
+
+    #[test]
+    fn a_clock_changed_by_another_tool_is_left_as_is() {
+        let (gpu, m) = (FakeGpu::owners(), marker("clk-foreign"));
+        let mut o = oc(&gpu, &m);
+        o.apply(&clocks(150, 0, false), false);
+        gpu.state().clocks[0].0 = 90_000;
+        gpu.clear_calls();
+        let r = o.apply(&Settings::default(), false);
+        assert!(result(&r, "xbar").message.contains("left as is"), "{r:?}");
+        assert!(gpu.calls().is_empty() && !m.exists());
+    }
+
+    #[test]
+    fn a_clock_offset_outside_the_drivers_range_is_refused() {
+        let (gpu, m) = (FakeGpu::owners(), marker("clk-range"));
+        gpu.state().clocks[0] = (0, -500_000, 500_000);
+        let r = oc(&gpu, &m).apply(&clocks(600, 0, false), false);
+        assert!(!result(&r, "xbar").ok && result(&r, "xbar").message.contains("outside"), "{r:?}");
+        assert!(gpu.calls().is_empty() && !m.exists());
     }
 }
