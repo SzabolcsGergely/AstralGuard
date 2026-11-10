@@ -110,6 +110,23 @@ impl Tile {
     }
 }
 
+/// One read-only line that says what a tab's thresholds are, with a link to where they are
+/// edited. Returns true when the link was clicked.
+pub fn summary_line(ui: &mut Ui, t: &Theme, caption: &str, text: &str) -> bool {
+    let mut clicked = false;
+    surface_frame(t).inner_margin(egui::Margin::symmetric(12, 7)).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(caption_job(caption, t.muted()));
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(egui::RichText::new(text).color(t.text).size(13.0)).truncate());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                clicked = ui.link(egui::RichText::new("Edit…").size(13.0)).clicked();
+            });
+        });
+    });
+    clicked
+}
+
 pub const TILE_H: f32 = 76.0;
 
 /// A row of equal-width tiles: caption, big value, small line under it.

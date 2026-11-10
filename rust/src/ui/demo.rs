@@ -28,6 +28,8 @@ pub struct Demo {
     autostart: bool,
     rng: u64,
     oc: DemoOc,
+    /// The connector's power at the last sample, W.
+    watts: f64,
 }
 
 /// The simulated GPU's overclock state: what AstralGuard has written.
@@ -81,6 +83,7 @@ impl Demo {
             autostart: true,
             rng: 0x9E37_79B9_7F4A_7C15,
             oc: DemoOc { managed: Vec::new(), deltas_khz: Vec::new(), power_w: OC_STOCK_W, mem_ab: 0 },
+            watts: 0.0,
         };
         // the owner's profile, ticked and already applied, so the Overclock tab has something to show
         d.settings.oc_uv_enabled = true;
@@ -221,6 +224,8 @@ impl Demo {
             reason: String::new(),
             power_w: Some(self.oc.power_w),
             power_range_w: Some(OC_POWER_RANGE),
+            // the connector's share plus what the slot carries
+            power_draw_w: Some((self.watts * 0.82 + 22.0) as u32),
             mem_ab: Some(self.oc.mem_ab),
             mem_range_ab: Some(OC_MEM_RANGE),
             mem_clock_mhz: Some((14001 + self.oc.mem_ab) as u32),
@@ -320,6 +325,7 @@ impl Demo {
         }
         let t = now();
         let amps = self.pins(t);
+        self.watts = amps.iter().sum::<f64>() * 12.0;
         self.history.push_back((t, amps.clone()));
         while self.history.front().is_some_and(|h| t - h.0 > 300.0) {
             self.history.pop_front();

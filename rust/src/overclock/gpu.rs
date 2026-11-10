@@ -12,6 +12,8 @@ pub trait OcGpu {
     fn driver_version(&mut self) -> Result<String, String>;
     fn power_limit_w(&mut self) -> Result<u32, String>;
     fn power_range_w(&mut self) -> Result<(u32, u32), String>;
+    /// What the card draws right now, W. A read for the Overclock tab; nothing decides on it.
+    fn power_draw_w(&mut self) -> Result<u32, String>;
     fn set_power_limit_w(&mut self, w: u32) -> Result<(), String>;
     /// (current, min, max) memory clock offset, NVML MHz.
     fn mem_offset(&mut self) -> Result<(i32, i32, i32), String>;
@@ -75,6 +77,13 @@ impl OcGpu for RealGpu {
         let h = self.nvml_handle()?;
         // NVML limits are whole watts in practice; round rather than truncate a stray mW.
         Ok((self.nvml.power_limit_mw(h)? + 500) / 1000)
+    }
+
+    // VERIFIED (2026-11-10, ROG Astral RTX 5090 OC, driver 621.14, Windows):
+    // nvmlDeviceGetPowerUsage gives the figure nvidia-smi shows as power.draw (83.08 W idle).
+    fn power_draw_w(&mut self) -> Result<u32, String> {
+        let h = self.nvml_handle()?;
+        Ok((self.nvml.power_usage_mw(h)? + 500) / 1000)
     }
 
     fn power_range_w(&mut self) -> Result<(u32, u32), String> {

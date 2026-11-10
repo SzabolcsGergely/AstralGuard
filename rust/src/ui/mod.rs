@@ -54,17 +54,19 @@ use crate::protocol::{Live, Response, ResponseMode, SagStatus, ScanReport, Setti
 enum Tab {
     Live,
     Imu,
+    Protection,
     Settings,
     Overclock,
     Log,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Live, Tab::Overclock, Tab::Imu, Tab::Settings, Tab::Log];
+    const ALL: [Tab; 6] = [Tab::Live, Tab::Overclock, Tab::Imu, Tab::Protection, Tab::Settings, Tab::Log];
     fn key(self) -> &'static str {
         match self {
             Tab::Live => "live",
             Tab::Imu => "imu",
+            Tab::Protection => "protection",
             Tab::Settings => "settings",
             Tab::Overclock => "overclock",
             Tab::Log => "log",
@@ -73,7 +75,8 @@ impl Tab {
     fn label(self) -> &'static str {
         match self {
             Tab::Live => "Overview",
-            Tab::Imu => "Anti-sag",
+            Tab::Imu => "Sag",
+            Tab::Protection => "Protection",
             Tab::Settings => "Settings",
             Tab::Overclock => "Overclock",
             Tab::Log => "Log",
@@ -84,7 +87,7 @@ impl Tab {
         let s = s.to_ascii_lowercase();
         let s = match s.as_str() {
             "overview" => "live",
-            "anti-sag" => "imu",
+            "anti-sag" | "sag" => "imu",
             other => other,
         };
         Tab::ALL.into_iter().find(|t| t.key() == s).unwrap_or(Tab::Live)
@@ -758,7 +761,7 @@ impl App {
                 self.tab_bar(ui, &t);
             });
 
-        if self.tab == Tab::Settings {
+        if self.tab == Tab::Protection {
             egui::TopBottomPanel::bottom("settings_bar")
                 .frame(egui::Frame::new().fill(t.background).inner_margin(Margin {
                     left: 16,
@@ -789,7 +792,9 @@ impl App {
             .show(ctx, |ui| match self.tab {
                 Tab::Live => {
                     egui::ScrollArea::vertical().id_salt("live").auto_shrink([false, false]).show(ui, |ui| {
-                        live::show(ui, &t, l, self.prefs.connector_mirror, &mut self.thermal);
+                        if live::show(ui, &t, l, self.prefs.connector_mirror, &mut self.thermal) {
+                            self.tab = Tab::Protection;
+                        }
                     });
                 }
                 Tab::Imu => {
@@ -801,15 +806,19 @@ impl App {
                     match action {
                         Some(imu::ImuAction::Fast(s)) => self.send(Job::ImuFast(s)),
                         Some(imu::ImuAction::Calibrate) => self.confirm = Some(Confirm::Calibrate),
+                        Some(imu::ImuAction::Edit) => self.tab = Tab::Protection,
                         None => {}
                     }
                 }
-                Tab::Settings => {
+                Tab::Protection | Tab::Settings => {
+                    let protection = self.tab == Tab::Protection;
                     let card_mm = l.map(|l| l.card_length_mm).unwrap_or(0.0);
                     let (ask, changed) = egui::ScrollArea::vertical()
                         .id_salt("settings")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.settings.show(ui, &t, &mut self.prefs, card_mm, self.updates.as_ref()))
+                        .show(ui, |ui| {
+                            self.settings.show(ui, &t, &mut self.prefs, card_mm, self.updates.as_ref(), protection)
+                        })
                         .inner;
                     if let Some(ask) = ask {
                         self.handle_ask(ask);
@@ -1040,11 +1049,14 @@ impl App {
         let mut x = bar.min.x;
         for tab in Tab::ALL {
             let selected = self.tab == tab;
-            let g = p.layout_no_wrap(
-                tab.label().into(),
-                if selected { theme::semibold(14.0) } else { theme::regular(14.0) },
-                t.text,
-            );
+            // a dot while the Protection tab holds edits that are not applied
+            let label = if tab == Tab::Protection && self.settings.dirty() {
+                format!("{} •", tab.label())
+            } else {
+                tab.label().to_string()
+            };
+            let g =
+                p.layout_no_wrap(label, if selected { theme::semibold(14.0) } else { theme::regular(14.0) }, t.text);
             let r = egui::Rect::from_min_size(Pos2::new(x, bar.min.y), Vec2::new(g.size().x + 24.0, bar.height()));
             let resp = ui.interact(r, ui.id().with(tab.key()), Sense::click());
             let color = if selected {
