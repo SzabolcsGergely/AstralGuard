@@ -9,10 +9,12 @@ pkgdesc="Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs (service, tray i
 arch=('x86_64')
 url="https://github.com/SzabolcsGergely/AstralGuard"
 license=('MIT')
-# The window's libraries are loaded at runtime (winit, glutin), so name them here.
-depends=('gcc-libs' 'glibc' 'openssl' 'libxkbcommon' 'wayland' 'libglvnd')
+# The window's libraries are loaded at runtime (winit, glutin), so name them here: Wayland
+# (wayland, libxkbcommon, libglvnd's EGL) and an X11 session (the libX* ones, libxkbcommon-x11).
+depends=('gcc-libs' 'glibc' 'openssl' 'libxkbcommon' 'wayland' 'libglvnd'
+         'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxrender' 'libxkbcommon-x11')
 makedepends=('cargo' 'pkgconf')
-optdepends=('nvidia-utils: NVML clock and power limits (mitigation)')
+optdepends=('nvidia-utils: NVML and NVAPI, for limiting the GPU and for the overclock')
 install=astralguard.install
 options=('!lto')
 source=("AstralGuard-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
