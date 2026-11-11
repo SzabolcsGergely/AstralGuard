@@ -600,4 +600,115 @@ mod tests {
         assert_eq!(lines[1], "13 A or more for 3 s: the PC shuts down.");
         assert!(lines.iter().all(|l| !l.contains("is limited")), "{lines:?}");
     }
+
+    /// The form as loaded from the service's current settings.
+    fn form(s: &Settings) -> SettingsView {
+        let mut v = SettingsView::default();
+        v.load(s);
+        v
+    }
+
+    fn idx(field: &str) -> usize {
+        let labels: Vec<_> = NUMS.iter().map(|n| n.label).collect();
+        match field {
+            "threshold" => 0,
+            "critical" => 2,
+            "imbalance_percent" => 5,
+            _ => panic!("no field {field} in {labels:?}"),
+        }
+    }
+
+    #[test]
+    fn an_untouched_form_sends_nothing() {
+        let v = form(&Settings::default());
+        let (p, errors) = v.diff();
+        assert!(p.is_empty() && errors.is_empty());
+        assert!(!v.dirty());
+    }
+
+    #[test]
+    fn only_the_fields_that_changed_are_sent() {
+        let mut v = form(&Settings::default());
+        v.texts[idx("threshold")] = "9,0".into(); // a decimal comma is fine
+        v.texts[idx("critical")] = " 13.000 ".into(); // the same value, written differently
+        v.sag_enabled = false;
+        let (p, errors) = v.diff();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            p,
+            SettingsPatch { threshold_amps: Some(9.0), sag_enabled: Some(false), ..Default::default() },
+            "unchanged values and untouched switches stay out of the change"
+        );
+        assert!(v.dirty());
+    }
+
+    #[test]
+    fn a_number_that_does_not_parse_is_reported_and_not_sent() {
+        let mut v = form(&Settings::default());
+        v.texts[idx("threshold")] = "nine".into();
+        v.texts[idx("imbalance_percent")] = "inf".into();
+        let (p, errors) = v.diff();
+        assert!(p.is_empty(), "{p:?}");
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].starts_with("Tier 1: 'nine'"), "{errors:?}");
+        assert!(v.dirty(), "Apply must not look done while a field is wrong");
+    }
+
+    #[test]
+    fn the_form_follows_the_service_but_never_over_an_edit() {
+        let mut v = form(&Settings::default());
+        let changed = Settings { threshold_amps: 8.5, ..Settings::default() };
+        v.sync(Some(&changed));
+        assert_eq!(v.texts[idx("threshold")], "8.5", "not edited: shows the service's value");
+
+        v.texts[idx("threshold")] = "8".into();
+        v.sync(Some(&Settings { threshold_amps: 9.0, ..Settings::default() }));
+        assert_eq!(v.texts[idx("threshold")], "8", "an edit in progress is kept");
+
+        // After an apply the next snapshot wins, edit or not.
+        v.on_done(
+            &Job::Apply(SettingsPatch { threshold_amps: Some(8.0), ..Default::default() }),
+            &Ok(Response::Applied { failures: vec![] }),
+        );
+        let applied = Settings { threshold_amps: 8.0, ..Settings::default() };
+        v.sync(Some(&applied));
+        assert!(!v.dirty(), "the form is the applied settings again");
+    }
+
+    #[test]
+    fn a_weakening_change_is_confirmed_before_it_is_applied() {
+        // The whole path of safety rule 6: the form, the service's check, the confirmation.
+        let current = Settings { threshold_amps: 8.5, ..Settings::default() };
+        let mut v = form(&current);
+        v.texts[idx("threshold")] = "9".into();
+        let (patch, _) = v.diff();
+        let (errors, warnings) = crate::config::check(&current, &patch);
+        let job = Job::Check(patch.clone());
+        let ask = v.on_done(&job, &Ok(Response::Check { errors, warnings }));
+        match ask {
+            Some(Ask::ConfirmWarnings(ws, p)) => {
+                assert_eq!(p, patch, "the confirmed change is exactly the checked one");
+                assert!(ws[0].contains("from 8.5 A to 9 A"), "{ws:?}");
+            }
+            _ => panic!("a weakening change must ask, not apply"),
+        }
+        assert!(v.busy.is_none(), "waiting for the person, not busy");
+    }
+
+    #[test]
+    fn a_clean_check_applies_and_an_error_stops() {
+        let mut v = form(&Settings::default());
+        let patch = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        let ok = v.on_done(&Job::Check(patch.clone()), &Ok(Response::Check { errors: vec![], warnings: vec![] }));
+        assert!(matches!(ok, Some(Ask::Job(Job::Apply(p))) if p == patch), "tightening applies at once");
+        assert_eq!(v.busy, Some("Applying…"));
+
+        let bad = v.on_done(
+            &Job::Check(patch.clone()),
+            &Ok(Response::Check { errors: vec!["Thresholds must rise".into()], warnings: vec!["x".into()] }),
+        );
+        assert!(bad.is_none(), "an error is never applied, warnings or not");
+        assert!(matches!(&v.msg, Some((m, MsgKind::Err, _)) if m.contains("must rise")));
+        assert!(v.busy.is_none());
+    }
 }
