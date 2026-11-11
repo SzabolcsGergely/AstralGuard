@@ -412,20 +412,30 @@ impl OverclockView {
         // One height for the three cards: the tallest content of the last frame.
         let target = self.cards_h;
         let mut tallest = 0.0f32;
-        ui.columns(3, |cols| {
-            let [a, b, c] = cols else { return };
-            // Pad a card by what it is short of the tallest one.
-            let mut fit = |ui: &mut Ui, natural: f32| {
-                tallest = tallest.max(natural);
-                // add_space brings its own item spacing with it
-                let pad = target - natural - ui.spacing().item_spacing.y;
-                if pad > 0.0 {
-                    ui.add_space(pad);
-                }
+        // Pad a card by what it is short of the tallest one.
+        let mut fit = |ui: &mut Ui, natural: f32| {
+            tallest = tallest.max(natural);
+            // add_space brings its own item spacing with it
+            let pad = target - natural - ui.spacing().item_spacing.y;
+            if pad > 0.0 {
+                ui.add_space(pad);
+            }
+        };
+        // Not three equal columns: the XBAR / SYS card has twice the controls of the others.
+        let width = ui.available_width() - 2.0 * w::GAP;
+        let (wa, wb) = (width * 0.3, width * 0.3);
+        let wc = width - wa - wb;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = w::GAP;
+            let col = |ui: &mut Ui, w: f32, add: &mut dyn FnMut(&mut Ui)| {
+                ui.allocate_ui_with_layout(Vec2::new(w, ui.available_height()), Layout::top_down(Align::LEFT), |ui| {
+                    ui.set_width(w);
+                    add(ui)
+                });
             };
-            a.with_layout(Layout::top_down(Align::LEFT), |ui| self.power_card(ui, t, &status, deferred, &mut fit));
-            b.with_layout(Layout::top_down(Align::LEFT), |ui| self.memory_card(ui, t, &status, deferred, &mut fit));
-            c.with_layout(Layout::top_down(Align::LEFT), |ui| self.clocks_card(ui, t, &status, deferred, &mut fit));
+            col(ui, wa, &mut |ui| self.power_card(ui, t, &status, deferred, &mut fit));
+            col(ui, wb, &mut |ui| self.memory_card(ui, t, &status, deferred, &mut fit));
+            col(ui, wc, &mut |ui| self.clocks_card(ui, t, &status, deferred, &mut fit));
         });
         if (tallest - self.cards_h).abs() > 0.5 {
             self.cards_h = tallest;
@@ -519,17 +529,19 @@ impl OverclockView {
             let top = ui.min_rect().top();
             let b = self.base.clone().unwrap_or_default();
             let c = changed_color(t, self.power_on != b.oc_power_enabled);
-            ui.checkbox(&mut self.power_on, RichText::new("Enabled").color(c));
-            ui.horizontal(|ui| {
+            row(ui, |ui| {
+                ui.checkbox(&mut self.power_on, RichText::new("Enabled").color(c));
+            });
+            row(ui, |ui| {
                 field(ui, t, &mut self.power, Some(b.oc_power_w));
                 ui.label(RichText::new("W").color(t.muted()).size(12.0));
             });
             let range = status.power_range_w.map(|(lo, hi)| (lo as f64, hi as f64));
             let bad = matches!((parse(&self.power), range), (Some(v), Some((lo, hi))) if v < lo || v > hi);
-            match status.power_range_w {
+            row(ui, |ui| match status.power_range_w {
                 Some((lo, hi)) => range_line(ui, t, &format!("Allowed {lo}–{hi} W"), bad),
                 None => range_line(ui, t, "Allowed range not read", false),
-            }
+            });
             self.result_lines(ui, t, "power", self.power_on, deferred);
             fit(ui, ui.min_rect().bottom() - top);
         });
@@ -547,17 +559,19 @@ impl OverclockView {
             let top = ui.min_rect().top();
             let b = self.base.clone().unwrap_or_default();
             let c = changed_color(t, self.mem_on != b.oc_mem_enabled);
-            ui.checkbox(&mut self.mem_on, RichText::new("Enabled").color(c));
-            ui.horizontal(|ui| {
+            row(ui, |ui| {
+                ui.checkbox(&mut self.mem_on, RichText::new("Enabled").color(c));
+            });
+            row(ui, |ui| {
                 field(ui, t, &mut self.mem, Some(b.oc_mem_offset_mhz));
                 ui.label(RichText::new("MHz").color(t.muted()).size(12.0));
             });
             let range = status.mem_range_ab.map(|(lo, hi)| (lo as f64, hi as f64));
             let bad = matches!((parse(&self.mem), range), (Some(v), Some((lo, hi))) if v < lo || v > hi);
-            match status.mem_range_ab {
+            row(ui, |ui| match status.mem_range_ab {
                 Some((lo, hi)) => range_line(ui, t, &format!("Allowed {lo:+} to {hi:+} MHz"), bad),
                 None => range_line(ui, t, "Allowed range not read", false),
-            }
+            });
             self.result_lines(ui, t, "memory", self.mem_on, deferred);
             fit(ui, ui.min_rect().bottom() - top);
         });
@@ -575,26 +589,32 @@ impl OverclockView {
             let top = ui.min_rect().top();
             let b = self.base.clone().unwrap_or_default();
             let available = status.xbar_khz.is_some() || status.sys_khz.is_some();
-            ui.horizontal(|ui| {
+            row(ui, |ui| {
                 for (on, text, base_on, base_v, name) in [
                     (&mut self.xbar_on, &mut self.xbar, b.oc_xbar_enabled, b.oc_xbar_offset_mhz, "XBAR"),
                     (&mut self.sys_on, &mut self.sys, b.oc_sys_enabled, b.oc_sys_offset_mhz, "SYS"),
                 ] {
                     let c = changed_color(t, *on != base_on);
                     ui.add_enabled(available || *on, egui::Checkbox::new(on, RichText::new(name).color(c)));
-                    field_w(ui, t, text, Some(base_v), 36.0);
+                    // room for "-1000"
+                    field_w(ui, t, text, Some(base_v), 40.0);
+                    ui.add_space(6.0);
                 }
             });
             let c = changed_color(t, self.load_only != b.oc_clk_load_only);
-            ui.checkbox(&mut self.load_only, RichText::new("Only under load").color(c)).on_hover_text(LOAD_ONLY_WHY);
+            row(ui, |ui| {
+                ui.checkbox(&mut self.load_only, RichText::new("Only under load").color(c))
+                    .on_hover_text(LOAD_ONLY_WHY);
+            });
             ui.add_enabled_ui(self.load_only, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    field_w(ui, t, &mut self.load_w, Some(b.oc_clk_load_watts), 36.0);
+                row(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    // up to 2000 W and 3600 s: four digits each
+                    field_w(ui, t, &mut self.load_w, Some(b.oc_clk_load_watts), 32.0);
                     ui.label(RichText::new("W for").color(t.muted()).size(12.0));
-                    field_w(ui, t, &mut self.load_s, Some(b.oc_clk_load_seconds), 26.0);
+                    field_w(ui, t, &mut self.load_s, Some(b.oc_clk_load_seconds), 32.0);
                     ui.label(RichText::new("s · idle").color(t.muted()).size(12.0));
-                    field_w(ui, t, &mut self.idle_s, Some(b.oc_clk_idle_seconds), 26.0);
+                    field_w(ui, t, &mut self.idle_s, Some(b.oc_clk_idle_seconds), 32.0);
                     ui.label(RichText::new("s").color(t.muted()).size(12.0));
                 });
             });
@@ -710,6 +730,15 @@ fn changed_color(t: &Theme, changed: bool) -> Color32 {
     } else {
         t.text
     }
+}
+
+/// One row of a bottom card, the same height in all three so their rows line up.
+fn row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    const ROW_H: f32 = 26.0;
+    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), ROW_H), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_height(ROW_H);
+        add(ui)
+    });
 }
 
 fn range_line(ui: &mut Ui, t: &Theme, text: &str, bad: bool) {

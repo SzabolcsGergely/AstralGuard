@@ -77,3 +77,27 @@ pub fn set_autostart(enable: bool) -> bool {
     systemctl(&[if enable { "enable" } else { "disable" }, UNIT_NAME]).map(|o| o.status.success()).unwrap_or(false)
         && autostart() == Some(enable)
 }
+
+// ------------------------------------------------------------- system description
+
+/// "Arch Linux · kernel 6.12.1-arch1-1".
+pub fn os_version() -> String {
+    let kernel =
+        std::fs::read_to_string("/proc/sys/kernel/osrelease").map(|k| k.trim().to_string()).unwrap_or_default();
+    let distro = std::fs::read_to_string("/etc/os-release").ok().and_then(|t| super::os_release_name(&t));
+    match (distro, kernel.is_empty()) {
+        (Some(d), false) => format!("{d} · kernel {kernel}"),
+        (Some(d), true) => d,
+        (None, false) => format!("Linux · kernel {kernel}"),
+        (None, true) => "Linux".into(),
+    }
+}
+
+/// "NVIDIA 580.95.05 open" (or "proprietary"), from the loaded kernel module; "" when none.
+pub fn gpu_driver() -> String {
+    std::fs::read_to_string("/proc/driver/nvidia/version")
+        .ok()
+        .and_then(|t| super::nvidia_proc_version(&t))
+        .map(|(version, flavour)| format!("NVIDIA {version} {flavour}"))
+        .unwrap_or_default()
+}

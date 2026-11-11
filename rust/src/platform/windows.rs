@@ -11,8 +11,8 @@ use windows::Win32::System::EventLog::{
     EVENTLOG_WARNING_TYPE,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ,
-    REG_OPTION_NON_VOLATILE,
+    RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD,
+    REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, OpenProcessToken};
 
@@ -377,6 +377,83 @@ pub fn unregister() -> Result<(), String> {
         let _ = RegDeleteKeyW(HKEY_LOCAL_MACHINE, &key);
     }
     Ok(())
+}
+
+// ------------------------------------------------------------- system description
+
+const CURRENT_VERSION: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+/// The display adapters' device class; each adapter's driver is a numbered subkey.
+const DISPLAY_CLASS: &str = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+
+fn reg_string(sub: &str, value: &str) -> Option<String> {
+    let (sub, value) = (HSTRING::from(sub), HSTRING::from(value));
+    let mut size: u32 = 0;
+    unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, &sub, &value, RRF_RT_REG_SZ, None, None, Some(&mut size)) }.ok().ok()?;
+    let mut buf = vec![0u16; (size as usize).div_ceil(2)];
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &sub,
+            &value,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .ok()?;
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+fn reg_dword(sub: &str, value: &str) -> Option<u32> {
+    let (sub, value) = (HSTRING::from(sub), HSTRING::from(value));
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &sub,
+            &value,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    }
+    .ok()
+    .ok()?;
+    Some(data)
+}
+
+/// "Windows 11 Pro 25H2 · build 28000.1234".
+pub fn os_version() -> String {
+    let build: u32 = reg_string(CURRENT_VERSION, "CurrentBuildNumber").and_then(|b| b.trim().parse().ok()).unwrap_or(0);
+    let product = reg_string(CURRENT_VERSION, "ProductName").unwrap_or_else(|| "Windows".into());
+    let mut out = super::windows_name(&product, build);
+    if let Some(release) = reg_string(CURRENT_VERSION, "DisplayVersion").filter(|r| !r.trim().is_empty()) {
+        out = format!("{out} {}", release.trim());
+    }
+    if build > 0 {
+        out = match reg_dword(CURRENT_VERSION, "UBR") {
+            Some(ubr) => format!("{out} · build {build}.{ubr}"),
+            None => format!("{out} · build {build}"),
+        };
+    }
+    out
+}
+
+/// "NVIDIA 621.14", from the first NVIDIA display adapter's driver entry; "" when none.
+/// Windows has one driver type (DCH); Game Ready and Studio are release channels of it that
+/// nothing on the system tells apart, so there is no flavour to show.
+pub fn gpu_driver() -> String {
+    (0..32)
+        .map(|i| format!(r"{DISPLAY_CLASS}\{i:04}"))
+        .filter(|key| reg_string(key, "ProviderName").is_some_and(|p| p.trim() == "NVIDIA"))
+        .find_map(|key| reg_string(&key, "DriverVersion").and_then(|v| super::nvidia_release(&v)))
+        .map(|v| format!("NVIDIA {v}"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

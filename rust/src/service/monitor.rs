@@ -341,6 +341,53 @@ struct Tier1 {
     last_over_notice: f64,
 }
 
+/// Since when protection has been paused, and when the user was last reminded.
+#[derive(Default)]
+struct Pause {
+    since: Option<f64>,
+    last_reminder: f64,
+}
+
+/// One loop iteration while protection is paused: no pin decisions, a GPU limit in place
+/// released, a reminder every half hour. Checked before connecting, so a paused guard stays
+/// quiet about missing sensors. Pausing is the protection's only: the overclock keeps its
+/// start-up apply, Apply now, the after-release apply and the XBAR / SYS load gate.
+fn paused_tick(
+    shared: &Shared,
+    response: &mut TieredResponse,
+    oc: &mut OcLoop,
+    pause: &mut Pause,
+    now: f64,
+    s: &crate::protocol::Settings,
+) {
+    let since = *pause.since.get_or_insert_with(|| {
+        pause.last_reminder = now;
+        now
+    });
+    if response.engaged {
+        // Pausing hands the decision back to the user; leaving their GPU crippled
+        // while no longer watching it is not ours to do.
+        response.release(now, "protection paused", false, s);
+    }
+    if now - pause.last_reminder >= PAUSE_REMINDER_EVERY_SEC {
+        let msg = format!(
+            "Protection has been paused for {} minutes - the card is unprotected until you resume.",
+            ((now - since) / 60.0) as i64
+        );
+        logger::warn(&msg);
+        shared.notify(&format!("{APP_NAME} - still paused"), &msg);
+        pause.last_reminder = now;
+    }
+    shared.update(|l| {
+        l.status = Status::Paused;
+        l.last_message = "Paused".into();
+        l.engaged = response.engaged;
+        l.engaged_tier = response.engaged_tier;
+        l.engaged_at = response.engaged_at;
+    });
+    let _ = overclock_step(shared, oc, response.engaged);
+}
+
 /// Runs until the guard is told to stop or shuts the machine down. True when it fired a
 /// shutdown.
 pub fn run(shared: &Arc<Shared>) -> bool {
@@ -404,8 +451,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
     // a successful connection re-arms it.
     let mut auto_scanned = false;
     let mut connected_notified = false;
-    let mut paused_since: Option<f64> = None;
-    let mut last_pause_reminder = 0.0;
+    let mut pause = Pause::default();
     let mut shutting_down = false;
     let mut oc = OcLoop::new(crate::now(), s.oc_apply_delay_seconds);
 
@@ -416,37 +462,12 @@ pub fn run(shared: &Arc<Shared>) -> bool {
         shared.update(|l| l.loop_at = now);
 
         if shared.paused.load(Ordering::Relaxed) {
-            // Checked before connecting so a paused guard stays quiet about missing sensors.
-            let since = *paused_since.get_or_insert_with(|| {
-                last_pause_reminder = now;
-                now
-            });
-            if response.engaged {
-                // Pausing hands the decision back to the user; leaving their GPU crippled
-                // while no longer watching it is not ours to do.
-                response.release(now, "monitoring paused", false, &s);
-            }
-            if now - last_pause_reminder >= PAUSE_REMINDER_EVERY_SEC {
-                let msg = format!(
-                    "Monitoring has been paused for {} minutes - the card is unprotected until you resume.",
-                    ((now - since) / 60.0) as i64
-                );
-                logger::warn(&msg);
-                shared.notify(&format!("{APP_NAME} - still paused"), &msg);
-                last_pause_reminder = now;
-            }
-            shared.update(|l| {
-                l.status = Status::Paused;
-                l.last_message = "Paused".into();
-                l.engaged = response.engaged;
-                l.engaged_tier = response.engaged_tier;
-                l.engaged_at = response.engaged_at;
-            });
+            paused_tick(shared, &mut response, &mut oc, &mut pause, now, &s);
             sleep(0.5);
             continue;
         }
-        if let Some(since) = paused_since.take() {
-            logger::info(format!("Monitoring resumed after {} min paused.", ((now - since) / 60.0) as i64));
+        if let Some(since) = pause.since.take() {
+            logger::info(format!("Protection resumed after {} min paused.", ((now - since) / 60.0) as i64));
         }
 
         // (Re)connect whenever there is no live sensor.
@@ -482,9 +503,13 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                     }
                     response.subsystem = Some(new.info.subsystem);
                     let (model, sub) = (new.info.model.to_string(), new.info.subsystem);
+                    // Read again on every connect: a driver update or reset reconnects.
+                    let (os, driver) = (platform::os_version(), platform::gpu_driver());
                     shared.update(|l| {
                         l.card = model;
                         l.card_subsystem = Some(sub);
+                        l.os = os;
+                        l.driver = driver;
                         l.sensor_scan_suggested = false;
                         l.sensor_problem.clear();
                     });
@@ -1120,5 +1145,52 @@ mod tests {
         assert_eq!(flight_event("engaged", &managed), "engaged-overclock-power-memory");
         assert_eq!(flight_event("engaged", &[]), "engaged");
         assert_eq!(flight_event("shutdown", &managed), "shutdown-overclock-power-memory");
+    }
+
+    /// A limiter that is never needed: the ladder is not engaged in these tests.
+    struct NoLimiter;
+
+    impl super::super::response::Limiter for NoLimiter {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn unavailable_reason(&self) -> String {
+            String::new()
+        }
+        fn engage(&mut self, _reason: &str) -> bool {
+            true
+        }
+        fn release(&mut self) -> bool {
+            true
+        }
+        fn close(&mut self) {}
+        fn abandon(&mut self) {}
+    }
+
+    #[test]
+    fn pausing_protection_leaves_the_overclock_running() {
+        use crate::overclock::fake::OWNERS_SUBSYSTEM;
+        use crate::protocol::Settings;
+        use crate::service::tests::test_marker;
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let opens = Arc::new(AtomicUsize::new(0));
+        let o2 = Arc::clone(&opens);
+        let shared = Shared::with_overclock_factory(
+            Settings { oc_power_enabled: true, ..Settings::default() },
+            test_marker("paused"),
+            Box::new(move |_| {
+                o2.fetch_add(1, O::SeqCst);
+                Err("NVML not found".to_string())
+            }),
+        );
+        shared.update(|l| l.card_subsystem = Some(OWNERS_SUBSYSTEM));
+        shared.paused.store(true, O::SeqCst);
+        let mut response = TieredResponse::new(Arc::clone(&shared), Box::new(|_| Box::new(NoLimiter)));
+        let (mut oc, mut pause) = (due(), Pause::default());
+        let now = crate::now();
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, now, &shared.settings());
+        assert_eq!(opens.load(O::SeqCst), 1, "the start-up apply is not held back by the pause");
+        assert_eq!(shared.snapshot().status, Status::Paused);
+        assert_eq!(pause.since, Some(now));
     }
 }

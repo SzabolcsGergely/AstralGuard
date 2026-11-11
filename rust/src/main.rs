@@ -135,6 +135,12 @@ fn probe(args: &[String]) -> i32 {
             return 0;
         }
     }
+    let driver = platform::gpu_driver();
+    println!(
+        "system: {} · {}",
+        platform::os_version(),
+        if driver.is_empty() { "no NVIDIA driver found" } else { &driver }
+    );
     let mut sensor = match sensor::PinSensor::connect() {
         Ok(s) => s,
         Err(e) => {

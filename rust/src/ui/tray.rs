@@ -186,7 +186,7 @@ fn build(link: &Arc<Link>, actions: &Actions, hwnd: &Arc<AtomicIsize>) -> Option
     let version = MenuItem::new(format!("{APP_NAME} v{APP_VERSION}"), false, None);
     let open = MenuItem::new("Open Dashboard", true, None);
     let log = MenuItem::new("Open Log", true, None);
-    let pause = MenuItem::new("Pause", true, None);
+    let pause = MenuItem::new("Pause protection", true, None);
     let exit = MenuItem::new("Exit", true, None);
     menu.append_items(&[
         &version,
@@ -239,7 +239,14 @@ fn build(link: &Arc<Link>, actions: &Actions, hwnd: &Arc<AtomicIsize>) -> Option
         b = b.with_icon(icon);
     }
     let tray = b.build().ok()?;
-    Some(Items { tray, pause, last_status: Some(status), last_tip: tip, last_pause_text: "Pause".into(), ticks: 0 })
+    Some(Items {
+        tray,
+        pause,
+        last_status: Some(status),
+        last_tip: tip,
+        last_pause_text: "Pause protection".into(),
+        ticks: 0,
+    })
 }
 
 fn act(link: &Link, actions: &Actions, hwnd: &AtomicIsize, a: TrayAction) {
@@ -279,7 +286,7 @@ fn refresh(link: &Link, it: &mut Items) {
         let _ = it.tray.set_tooltip(Some(&tip));
         it.last_tip = tip;
     }
-    let pause_text = if live.as_ref().is_some_and(|l| l.paused) { "Resume" } else { "Pause" };
+    let pause_text = if live.as_ref().is_some_and(|l| l.paused) { "Resume protection" } else { "Pause protection" };
     if pause_text != it.last_pause_text {
         it.pause.set_text(pause_text);
         it.last_pause_text = pause_text.into();
@@ -399,7 +406,7 @@ impl ksni::Tray for Sni {
             item("Open Dashboard", true, |t| t.act(TrayAction::Open)),
             item("Open Log", true, |t| open_log(&t.link, &t.actions, &AtomicIsize::new(0))),
             ksni::MenuItem::Separator,
-            item(if self.paused { "Resume" } else { "Pause" }, self.connected, |t| {
+            item(if self.paused { "Resume protection" } else { "Pause protection" }, self.connected, |t| {
                 if t.paused {
                     t.link.send(Job::SetPaused(false));
                 } else {

@@ -302,6 +302,10 @@ pub struct Live {
     pub last_message: String,
     /// Model name of the monitored card, "" while none is connected.
     pub card: String,
+    /// "Windows 11 Pro 25H2 · build 28000.1234" / "Arch Linux · kernel 6.12.1-arch1-1".
+    pub os: String,
+    /// "NVIDIA 621.14" / "NVIDIA 580.95.05 open"; "" when no NVIDIA driver is found.
+    pub driver: String,
     pub card_subsystem: Option<u32>,
     /// Every pin as (short name "Pin1", amps), in the order the card reports them.
     pub pins: Vec<(String, f64)>,

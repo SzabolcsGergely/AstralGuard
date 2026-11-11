@@ -403,6 +403,8 @@ impl Demo {
             last_message: String::new(),
             card: "ROG Astral RTX 5090 OC".into(),
             card_subsystem: Some(0x89E3_1043),
+            os: "Windows 11 Pro 25H2 · build 28000.1234".into(),
+            driver: "NVIDIA 621.14".into(),
             max_label: pins[hi_i].0.clone(),
             max_val: hi,
             min_label: pins[lo_i].0.clone(),

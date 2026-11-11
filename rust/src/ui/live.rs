@@ -237,7 +237,7 @@ fn sag_tile(t: &Theme, l: &Live) -> Tile {
 fn history_chart(ui: &mut egui::Ui, t: &Theme, l: &Live) {
     let width = ui.available_width();
     // what the window leaves, so the tab does not scroll at the default size
-    let height = ui.available_height().clamp(100.0, 150.0);
+    let height = ui.available_height().clamp(80.0, 150.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let p = ui.painter_at(rect.expand(1.0));
     p.rect(rect, 8.0, t.surface, Stroke::new(1.0_f32, t.border), egui::StrokeKind::Inside);

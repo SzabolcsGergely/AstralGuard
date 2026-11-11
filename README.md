@@ -316,8 +316,9 @@ documented driver API.
 - **Log**: the guard's log and the flight recorder dumps.
 
 The **tray icon** is a dot in the status colour. Its menu: **Open Dashboard**, **Open
-Log**, **Pause / Resume** monitoring, **Exit**. Pausing is visible everywhere and reminds
-you every 30 minutes.
+Log**, **Pause protection / Resume protection**, **Exit**. Pausing is visible everywhere and
+reminds you every 30 minutes. It pauses only the connector protection: an overclock stays
+applied and keeps working (the start-up apply, Apply now, XBAR / SYS only under load).
 
 ## Overclock
 

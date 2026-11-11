@@ -201,6 +201,9 @@ fn runs_on_wayland(wayland_display: Option<&str>, winit_backend: Option<&str>) -
 
 /// The window (taskbar) icon: the app icon with a status dot in the corner, so the taskbar
 /// shows the state at a glance. Falls back to the plain dot if the PNG cannot be read.
+/// When the window icon is sent a second time; the window exists well before this.
+const ICON_RESEND_AFTER: Duration = Duration::from_secs(2);
+
 fn icon_data(status: Status) -> Arc<egui::IconData> {
     const SIZE: u32 = 64;
     let Some(mut rgba) = app_icon_rgba(SIZE) else {
@@ -419,6 +422,8 @@ struct App {
     quitting: bool,
     exit_pending: bool,
     icon_status: Option<Status>,
+    /// The icon was sent again once the window surely existed (see ICON_RESEND_AFTER).
+    icon_resent: bool,
     flash: Option<(String, Instant)>,
     /// A sensor scan is in flight (the button shows Scanning...).
     scanning: bool,
@@ -492,6 +497,7 @@ impl App {
             quitting: false,
             exit_pending: false,
             icon_status: None,
+            icon_resent: false,
             flash: None,
             scanning: false,
             scan_auto: false,
@@ -764,8 +770,12 @@ impl eframe::App for App {
         self.window_events(ctx);
 
         let status = tray::icon_status(self.live.as_deref(), self.connected);
-        if self.icon_status != Some(status) {
+        // Once more after start: eframe 0.37 drops a command sent before the native window
+        // exists, and the first frames come before it (the dot stayed grey on a Safe guard).
+        let resend = !self.icon_resent && self.started.elapsed() > ICON_RESEND_AFTER;
+        if self.icon_status != Some(status) || resend {
             self.icon_status = Some(status);
+            self.icon_resent |= resend;
             ctx.send_viewport_cmd(ViewportCommand::Icon(Some(icon_data(status))));
         }
         self.settings.sync(self.live.as_ref().map(|l| &l.settings));
@@ -946,10 +956,20 @@ impl App {
                     None => format!("{card} · v{ver}"),
                 };
                 ui.label(RichText::new(sub).size(12.0).color(t.muted()));
+                // The system it runs on: what a bug report needs first.
+                let system: Vec<&str> = l
+                    .map(|l| [l.os.as_str(), l.driver.as_str()])
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !system.is_empty() {
+                    ui.label(RichText::new(system.join(" · ")).size(12.0).color(t.muted()));
+                }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let paused = l.is_some_and(|l| l.paused);
-                let label = if paused { "Resume" } else { "Pause" };
+                let label = if paused { "Resume protection" } else { "Pause protection" };
                 let b = if paused {
                     egui::Button::new(RichText::new(label).color(Color32::WHITE))
                         .fill(w::rgb(Status::Paused.color()))
@@ -1163,8 +1183,11 @@ impl App {
         let (title, body, ok, danger): (&str, Vec<String>, &str, bool) = match confirm {
             Confirm::Pause => (
                 "Pause protection?",
-                vec!["The connector is not protected while paused, and a GPU limit in place is released.".into()],
-                "Pause",
+                vec![
+                    "The connector is not protected while paused, and a GPU limit in place is released.".into(),
+                    "The overclock is not affected: it stays applied and keeps following its settings.".into(),
+                ],
+                "Pause protection",
                 true,
             ),
             Confirm::Exit => (
