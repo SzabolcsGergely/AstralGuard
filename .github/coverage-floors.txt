@@ -9,8 +9,9 @@ src/service/monitor.rs 62     # (64.8) the rest is the run() loop: threads and r
 src/service/response.rs 85    # (87.5)
 src/service/imbalance.rs 88   # (90.3)
 src/service/flight.rs 89      # (91.9)
-src/service/sag.rs 40         # (42.2) the lowest: worth more tests
-src/sensor/mod.rs 80          # (82.6)
+src/service/sag.rs 84         # (86.5)
+src/sensor/mod.rs 87          # (89.2)
+src/sensor/detect.rs 86       # (88.3) the sensor scan: safety rule 1's decisions
 src/overclock/curve.rs 96     # (98.2)
 src/overclock/load.rs 98      # (100.0)
 src/overclock/mod.rs 91       # (93.1)
