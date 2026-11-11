@@ -281,8 +281,9 @@ overrides it).
 - **Sag**: bubble level, the card's angle on each axis, sag against the baseline, the sag
   limits in one line, and a minute of history. **Calibrate** makes the current position the
   baseline ([when to use it](#gpu-sag)).
-- **Protection**: every protection value (checked, and confirmed when it weakens
-  protection) and the response mode, with the ladder they give in words. The one place
+- **Protection**: every protection value (checked, and confirmed when it makes protection
+  weaker than it is now: a higher tier or imbalance value, or the imbalance check or sag
+  detection turned off) and the response mode, with the ladder they give in words. The one place
   protection is changed; **Edit…** on Overview and Sag leads here.
 - **Settings**: theme, window behaviour, autostart, update check. These apply at once.
 - **Log**: the guard's log and the flight recorder dumps.

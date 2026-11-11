@@ -589,25 +589,59 @@ pub fn check(current: &Settings, p: &SettingsPatch) -> (Vec<String>, Vec<String>
         ));
     }
 
-    let raised: [(&str, &str, Option<f64>, f64); 5] = [
-        ("threshold", "A", p.threshold_amps, d.threshold_amps),
-        ("sustained time", "s", p.sustained_seconds_required, d.sustained_seconds_required),
-        ("tier 2 (critical) current", "A", p.critical_amps, d.critical_amps),
-        ("tier 2 (critical) time", "s", p.critical_seconds, d.critical_seconds),
-        ("tier 3 (catastrophic) current", "A", p.catastrophic_amps, d.catastrophic_amps),
+    // Safety rule 6: a change that makes protection weaker than it is now asks first. Weaker
+    // than the current settings, not than the defaults: loosening a value that was tightened
+    // is still loosening. For every one of these, a higher number trips later.
+    let c = current;
+    let looser: [(&str, &str, Option<f64>, f64, f64); 9] = [
+        ("threshold", "A", p.threshold_amps, c.threshold_amps, d.threshold_amps),
+        (
+            "sustained time",
+            "s",
+            p.sustained_seconds_required,
+            c.sustained_seconds_required,
+            d.sustained_seconds_required,
+        ),
+        ("tier 2 (critical) current", "A", p.critical_amps, c.critical_amps, d.critical_amps),
+        ("tier 2 (critical) time", "s", p.critical_seconds, c.critical_seconds, d.critical_seconds),
+        ("tier 3 (catastrophic) current", "A", p.catastrophic_amps, c.catastrophic_amps, d.catastrophic_amps),
+        ("imbalance threshold", "%", p.imbalance_percent, c.imbalance_percent, d.imbalance_percent),
+        ("imbalance max delta", "A", p.imbalance_delta_amps, c.imbalance_delta_amps, d.imbalance_delta_amps),
+        ("imbalance minimum current", "A", p.imbalance_min_amps, c.imbalance_min_amps, d.imbalance_min_amps),
+        (
+            "imbalance sustained time",
+            "s",
+            p.imbalance_sustained_seconds,
+            c.imbalance_sustained_seconds,
+            d.imbalance_sustained_seconds,
+        ),
     ];
-    for (kind, unit, value, default) in raised {
+    for (kind, unit, value, now, default) in looser {
         if let Some(v) = value {
-            if v > default {
+            if v > now {
                 warnings.push(format!(
-                    "Raising the {kind} above the default ({} {unit}) reduces protection and \
-                     increases the risk of connector overheating, melting, or fire. \
-                     Requested: {} {unit}.",
-                    g(default),
-                    g(v)
+                    "Raising the {kind} from {} {unit} to {} {unit} reduces protection and increases \
+                     the risk of connector overheating, melting, or fire (the default is {} {unit}).",
+                    g(now),
+                    g(v),
+                    g(default)
                 ));
             }
         }
+    }
+    if c.imbalance_enabled && p.imbalance_enabled == Some(false) {
+        warnings.push(
+            "Turning the pin imbalance check off removes the early warning of a bad contact, which \
+             often comes long before any pin runs over its limit."
+                .into(),
+        );
+    }
+    if c.imbalance_response == ImbalanceResponse::Act && p.imbalance_response == Some(ImbalanceResponse::Warn) {
+        warnings.push("Switching pin imbalance to Warn only means an imbalance no longer limits the GPU.".into());
+    }
+    if c.sag_enabled && p.sag_enabled == Some(false) {
+        warnings
+            .push("Turning sag detection off removes the warning when the card sags and strains the connector.".into());
     }
     (errors, warnings)
 }
@@ -836,7 +870,7 @@ mod tests {
             let (errors, warnings) = check(&d, &p);
             assert!(errors.is_empty(), "{p:?}: {errors:?}");
             assert_eq!(warnings.len(), 1, "{p:?}");
-            assert!(warnings[0].contains("reduces protection") && warnings[0].contains("Requested"), "{}", warnings[0]);
+            assert!(warnings[0].contains("reduces protection") && warnings[0].contains(" from "), "{}", warnings[0]);
         }
         let all = SettingsPatch {
             threshold_amps: Some(10.0),
@@ -871,12 +905,74 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_is_measured_against_the_default_not_the_current_value() {
-        // Today's behaviour, pinned so a change to it is deliberate: from a tightened 8.5 A,
-        // going back up to 9.0 A (still under the 9.5 A default) does not ask.
+    fn loosening_a_tightened_value_asks_even_below_the_default() {
+        // From a tightened 8.5 A, going back up to 9.0 A is still a weakening, although 9.0 A
+        // is under the 9.5 A default.
         let current = Settings { threshold_amps: 8.5, ..Settings::default() };
         let p = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
-        assert!(check(&current, &p).1.is_empty());
+        let warnings = check(&current, &p).1;
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("from 8.5 A to 9 A") && warnings[0].contains("default is 9.5 A"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn tightening_a_loosened_value_does_not_ask_even_above_the_default() {
+        let current = Settings { threshold_amps: 11.0, critical_amps: 14.0, ..Settings::default() };
+        let p = SettingsPatch { threshold_amps: Some(10.0), ..Default::default() };
+        assert_eq!(check(&current, &p), (vec![], vec![]), "10 A is above the default but tighter than 11 A");
+    }
+
+    #[test]
+    fn loosening_the_imbalance_check_asks_first() {
+        let d = Settings::default();
+        for p in [
+            SettingsPatch { imbalance_percent: Some(d.imbalance_percent + 10.0), ..Default::default() },
+            SettingsPatch { imbalance_delta_amps: Some(d.imbalance_delta_amps + 1.0), ..Default::default() },
+            SettingsPatch { imbalance_min_amps: Some(d.imbalance_min_amps + 1.0), ..Default::default() },
+            SettingsPatch {
+                imbalance_sustained_seconds: Some(d.imbalance_sustained_seconds + 5.0),
+                ..Default::default()
+            },
+            SettingsPatch { imbalance_enabled: Some(false), ..Default::default() },
+        ] {
+            let (errors, warnings) = check(&d, &p);
+            assert!(errors.is_empty(), "{p:?}: {errors:?}");
+            assert_eq!(warnings.len(), 1, "{p:?}");
+        }
+        let acting = Settings { imbalance_response: ImbalanceResponse::Act, ..d.clone() };
+        let to_warn = SettingsPatch { imbalance_response: Some(ImbalanceResponse::Warn), ..Default::default() };
+        assert!(check(&acting, &to_warn).1[0].contains("no longer limits the GPU"));
+    }
+
+    #[test]
+    fn turning_sag_detection_off_asks_first() {
+        let p = SettingsPatch { sag_enabled: Some(false), ..Default::default() };
+        assert!(check(&Settings::default(), &p).1[0].contains("sag detection off"));
+    }
+
+    #[test]
+    fn switching_checks_on_or_to_act_does_not_ask() {
+        let off = Settings {
+            imbalance_enabled: false,
+            sag_enabled: false,
+            imbalance_response: ImbalanceResponse::Warn,
+            ..Settings::default()
+        };
+        let p = SettingsPatch {
+            imbalance_enabled: Some(true),
+            sag_enabled: Some(true),
+            imbalance_response: Some(ImbalanceResponse::Act),
+            imbalance_percent: Some(30.0),
+            ..Default::default()
+        };
+        assert_eq!(check(&off, &p), (vec![], vec![]), "all of it is stricter");
+        // Already off: setting off again is not a change.
+        let again = SettingsPatch { imbalance_enabled: Some(false), sag_enabled: Some(false), ..Default::default() };
+        assert!(check(&off, &again).1.is_empty());
     }
 
     #[test]

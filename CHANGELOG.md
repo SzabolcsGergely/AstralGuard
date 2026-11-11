@@ -7,6 +7,14 @@ here.
 
 ## [Unreleased]
 
+### Changed
+
+- The dashboard now asks before any change that makes protection weaker than your current
+  settings. Before, it only asked when a tier value went above its default, so loosening a
+  value you had tightened went through without a question. It also asks now before turning
+  the pin imbalance check or sag detection off, switching imbalance from Act to Warn only,
+  or loosening an imbalance threshold.
+
 ## [1.0.1] - 2026-11-11
 
 A packaging release: the program is the same as 1.0.0.

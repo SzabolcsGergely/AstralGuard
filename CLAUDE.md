@@ -227,8 +227,9 @@ These are not style preferences. A change that breaks one gets rejected.
    overclock is the user's separate, opt-in use of the GPU with its own NVML binding, and
    it records and restores its own values the same way (`overclock.active`).
 6. **Defaults are safety decisions.** Changing a threshold or timing default needs a reason
-   in the commit message. The dashboard asks for confirmation when a change weakens
-   protection; keep that.
+   in the commit message. The dashboard asks for confirmation when a change makes protection
+   weaker than the current settings (`config::check`'s warnings, compared with the current
+   values, not the defaults); keep that, and give a new protection setting its case there.
 7. **Config stays compatible.** `config.ini` keeps its keys from version to version.
    A bad value falls back to its own default; unknown keys and comments survive a save.
 8. **Verified facts are marked.** Sensor constants and NVML behaviour carry
