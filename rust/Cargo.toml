@@ -12,7 +12,7 @@ repository = "https://github.com/SzabolcsGergely/AstralGuard"
 [features]
 default = ["ui"]
 # The tray and dashboard. Off builds a headless service only (e.g. a Linux server).
-ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:ksni", "dep:ureq", "dep:native-tls"]
+ui = ["dep:eframe", "dep:tray-icon", "dep:notify-rust", "dep:png", "dep:raw-window-handle", "dep:ksni", "dep:ureq"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -24,10 +24,10 @@ eframe = { version = "0.31", optional = true, default-features = false, features
 # the dashboard's PNG screenshots (--screenshot) and the window handle for the tray
 png = { version = "0.18", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
-# the dashboard's update check (GitHub releases API). The OS TLS stack: SChannel on
-# Windows, OpenSSL on Linux; no bundled crypto to build.
-ureq = { version = "2.12", optional = true, default-features = false, features = ["native-tls"] }
-native-tls = { version = "0.2", optional = true }
+# the dashboard's update check (GitHub releases API). The OS TLS stack and the OS's root
+# certificates: SChannel on Windows, OpenSSL on Linux; no bundled crypto or root store
+# (ureq's "native-tls" feature would add Mozilla's roots, webpki-root-certs).
+ureq = { version = "3.5", optional = true, default-features = false, features = ["native-tls-no-default"] }
 
 [target.'cfg(windows)'.dependencies]
 # The tray on Windows. Linux uses ksni instead (see ui/tray.rs).

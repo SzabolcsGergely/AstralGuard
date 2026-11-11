@@ -73,21 +73,30 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 
 /// One check against the GitHub API. Ok(None) means up to date (or no release yet).
 fn check() -> Result<Option<Release>, String> {
-    let tls = native_tls::TlsConnector::new().map_err(|e| format!("TLS unavailable ({e})"))?;
-    let agent = ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).timeout(TIMEOUT).build();
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+    // The OS's own roots, as before ureq 3: native-tls with the platform store.
+    let tls = TlsConfig::builder().provider(TlsProvider::NativeTls).root_certs(RootCerts::PlatformVerifier).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .timeout_global(Some(TIMEOUT))
+        // 404 and friends come back as a response, so they can be told apart below.
+        .http_status_as_error(false)
+        .build()
+        .into();
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let response = agent
+    let mut response = agent
         .get(&url)
-        .set("User-Agent", &format!("{APP_NAME}/{APP_VERSION}"))
-        .set("Accept", "application/vnd.github+json")
-        .call();
-    let body = match response {
-        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        .header("User-Agent", &format!("{APP_NAME}/{APP_VERSION}"))
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("offline? ({e})"))?;
+    match response.status().as_u16() {
+        200..=299 => {}
         // No release published yet.
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(ureq::Error::Status(code, _)) => return Err(format!("GitHub answered {code}")),
-        Err(e) => return Err(format!("offline? ({e})")),
-    };
+        404 => return Ok(None),
+        code => return Err(format!("GitHub answered {code}")),
+    }
+    let body = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let release: Release = serde_json::from_str(&body).map_err(|e| format!("unexpected answer ({e})"))?;
     if release.draft || release.prerelease || !is_newer(&release.tag_name, APP_VERSION) {
         return Ok(None);
