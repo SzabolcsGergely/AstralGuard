@@ -393,33 +393,43 @@ pub fn measure_khz(subsystem: u32, d: ClkDomain) -> Result<u32, String> {
 #[cfg_attr(test, allow(dead_code))]
 pub fn set_offset_khz(subsystem: u32, driver: &str, d: ClkDomain, khz: i32) -> Result<(), String> {
     let cfg = crate::config::config_path();
-    if crate::config::load_oc_clk_failed(&cfg).as_deref() == Some(driver) {
-        return Err(format!(
-            "the XBAR / SYS write check failed on driver {driver} before; disabled until a driver update"
-        ));
+    // Before any session is opened: a driver that failed the check is not touched at all.
+    if let Some(why) = refused(&cfg, driver) {
+        return Err(why);
     }
-    with_session(subsystem, |rm| {
-        if crate::config::load_oc_clk_verified(&cfg).as_deref() != Some(driver) {
-            match write_check(rm) {
-                Check::Pass => {
-                    crate::logger::info(format!("Overclock: XBAR / SYS writes verified on driver {driver}"));
-                    if let Err(e) = crate::config::save_oc_clk_verified(&cfg, driver) {
-                        crate::logger::warn(format!("Overclock: could not save oc_clk_verified_driver ({e})"));
-                    }
-                }
-                Check::Error(e) => return Err(format!("the XBAR / SYS write check could not run ({e})")),
-                Check::Broken(e) => {
-                    let why = format!("the XBAR / SYS write check failed on driver {driver}: {e}; XBAR / SYS disabled");
-                    crate::logger::error(format!("Overclock: {why}"));
-                    if let Err(e) = crate::config::save_oc_clk_failed(&cfg, driver) {
-                        crate::logger::warn(format!("Overclock: could not save oc_clk_failed_driver ({e})"));
-                    }
-                    return Err(why);
+    with_session(subsystem, |rm| gated_write(rm, &cfg, driver, d, khz))
+}
+
+/// Some(why) when the write check failed on this driver before (config.ini remembers it).
+fn refused(cfg: &std::path::Path, driver: &str) -> Option<String> {
+    (crate::config::load_oc_clk_failed(cfg).as_deref() == Some(driver))
+        .then(|| format!("the XBAR / SYS write check failed on driver {driver} before; disabled until a driver update"))
+}
+
+/// The write, behind safety rule 10's gate: on a driver not yet verified, the write check runs
+/// first; a pass is remembered, a wrong landing disables the driver for good, and a check
+/// that could not run leaves both unrecorded and writes nothing.
+fn gated_write(rm: &mut dyn Rm, cfg: &std::path::Path, driver: &str, d: ClkDomain, khz: i32) -> Result<(), String> {
+    if crate::config::load_oc_clk_verified(cfg).as_deref() != Some(driver) {
+        match write_check(rm) {
+            Check::Pass => {
+                crate::logger::info(format!("Overclock: XBAR / SYS writes verified on driver {driver}"));
+                if let Err(e) = crate::config::save_oc_clk_verified(cfg, driver) {
+                    crate::logger::warn(format!("Overclock: could not save oc_clk_verified_driver ({e})"));
                 }
             }
+            Check::Error(e) => return Err(format!("the XBAR / SYS write check could not run ({e})")),
+            Check::Broken(e) => {
+                let why = format!("the XBAR / SYS write check failed on driver {driver}: {e}; XBAR / SYS disabled");
+                crate::logger::error(format!("Overclock: {why}"));
+                if let Err(e) = crate::config::save_oc_clk_failed(cfg, driver) {
+                    crate::logger::warn(format!("Overclock: could not save oc_clk_failed_driver ({e})"));
+                }
+                return Err(why);
+            }
         }
-        write_offset(rm, d, khz)
-    })
+    }
+    write_offset(rm, d, khz)
 }
 
 #[cfg(test)]
@@ -526,6 +536,91 @@ mod tests {
         let info = DomainInfo { index: 1, min_khz: -1_000_000, max_khz: 1_000_000 };
         put(&mut c, CTL_ENTRIES_AT + CTL_STRIDE + CTL_OFFSET_AT, 5_000_000);
         assert!(control_offset(&c, info).unwrap_err().contains("outside"));
+    }
+
+    /// A config.ini of its own per test, removed at the end.
+    struct Cfg(std::path::PathBuf);
+    impl Cfg {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("ag-clkgate-{name}-{}.ini", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            Cfg(p)
+        }
+    }
+    impl Drop for Cfg {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A driver whose every call fails, as after a driver reset.
+    struct DeadRm;
+    impl Rm for DeadRm {
+        fn control(&mut self, _cmd: u32, _p: &mut [u8]) -> Result<(), String> {
+            Err("the GPU fell off the bus".into())
+        }
+    }
+
+    #[test]
+    fn the_first_write_on_a_driver_runs_the_check_and_remembers_it() {
+        let cfg = Cfg::new("first");
+        let mut rm = FakeRm::new();
+        gated_write(&mut rm, &cfg.0, "620.70.06", ClkDomain::Xbar, 200_000).unwrap();
+        assert_eq!(rm.sets, 3, "the check's +15 MHz, its undo, then the offset");
+        assert_eq!(rm.offsets[1], 200_000);
+        assert_eq!(crate::config::load_oc_clk_verified(&cfg.0).as_deref(), Some("620.70.06"));
+
+        gated_write(&mut rm, &cfg.0, "620.70.06", ClkDomain::Sys, 50_000).unwrap();
+        assert_eq!(rm.sets, 4, "verified: no second check on the same driver");
+        assert_eq!(rm.offsets[3], 50_000);
+
+        gated_write(&mut rm, &cfg.0, "621.14", ClkDomain::Xbar, 100_000).unwrap();
+        assert_eq!(rm.sets, 7, "a driver update is checked again");
+        assert_eq!(crate::config::load_oc_clk_verified(&cfg.0).as_deref(), Some("621.14"));
+    }
+
+    #[test]
+    fn a_wrong_landing_disables_the_driver_for_good() {
+        let cfg = Cfg::new("broken");
+        let mut rm = FakeRm::new();
+        rm.misroute = Some((1, 2)); // XBAR's write lands on the next domain
+        let err = gated_write(&mut rm, &cfg.0, "620.70.06", ClkDomain::Xbar, 200_000).unwrap_err();
+        assert!(err.contains("write check failed on driver 620.70.06"), "{err}");
+        assert_eq!(rm.offsets[1], 0, "the requested offset was never written");
+        assert_eq!(crate::config::load_oc_clk_failed(&cfg.0).as_deref(), Some("620.70.06"));
+        assert!(crate::config::load_oc_clk_verified(&cfg.0).is_none());
+
+        let why = refused(&cfg.0, "620.70.06").expect("refused from now on, before any session opens");
+        assert!(why.contains("until a driver update"), "{why}");
+        assert!(refused(&cfg.0, "621.14").is_none(), "a new driver gets its own check");
+    }
+
+    #[test]
+    fn a_layout_that_moved_is_caught_by_the_check() {
+        let cfg = Cfg::new("scribble");
+        let mut rm = FakeRm::new();
+        rm.scribble = true; // a SET also changes the entry after it
+        assert!(gated_write(&mut rm, &cfg.0, "999.1", ClkDomain::Xbar, 200_000).is_err());
+        assert_eq!(crate::config::load_oc_clk_failed(&cfg.0).as_deref(), Some("999.1"));
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_writes_nothing_and_records_nothing() {
+        let cfg = Cfg::new("dead");
+        let err = gated_write(&mut DeadRm, &cfg.0, "620.70.06", ClkDomain::Xbar, 200_000).unwrap_err();
+        assert!(err.contains("could not run"), "{err}");
+        assert!(crate::config::load_oc_clk_verified(&cfg.0).is_none(), "not a pass");
+        assert!(crate::config::load_oc_clk_failed(&cfg.0).is_none(), "and not a failure either: try again later");
+    }
+
+    #[test]
+    fn a_verified_driver_still_refuses_an_offset_out_of_range() {
+        let cfg = Cfg::new("range");
+        crate::config::save_oc_clk_verified(&cfg.0, "620.70.06").unwrap();
+        let mut rm = FakeRm::new();
+        let err = gated_write(&mut rm, &cfg.0, "620.70.06", ClkDomain::Xbar, 2_000_000).unwrap_err();
+        assert!(err.contains("outside"), "{err}");
+        assert_eq!(rm.sets, 0, "nothing was sent");
     }
 
     #[test]
