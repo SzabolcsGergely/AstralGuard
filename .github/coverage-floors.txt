@@ -3,19 +3,23 @@
 # a change through. Hardware, FFI and GUI code is reported but has no floor.
 #
 # Each floor sits about 2 points under what was measured (in brackets, 2026-11-12), so
-# moving a few lines in a refactor passes and dropping a test does not.
+# moving a few lines in a refactor passes and dropping a test does not. "local" marks a
+# measurement outside CI: those have run about 2.5 points above CI's (sag: 86.5 local, 83.9
+# in CI), so a floor set from one sits about 5 under it. Raise it once CI's number is known.
 src/mitigation.rs 59          # (61.6) limit, restore, crash recovery; the rest is the NVML binding
 src/service/monitor.rs 62     # (64.8) the rest is the run() loop: threads and real time
 src/service/response.rs 85    # (87.5)
 src/service/imbalance.rs 88   # (90.3)
 src/service/flight.rs 89      # (91.9)
-src/service/sag.rs 84         # (86.5)
+src/service/mod.rs 83         # (87.9 local) the dashboard's requests: pause, check, apply
+src/service/sag.rs 89         # (95.0 local) daily history and the creep warning included
 src/sensor/mod.rs 87          # (89.2)
 src/sensor/detect.rs 86       # (88.3) the sensor scan: safety rule 1's decisions
 src/overclock/curve.rs 96     # (98.2)
 src/overclock/load.rs 98      # (100.0)
 src/overclock/mod.rs 91       # (93.1)
 src/overclock/clkctl.rs 86    # (88.0) the write gate of safety rule 10 included
+src/ipc.rs 78                 # (83.6 local) the socket: round trip, bad requests, 0660
 src/config.rs 93              # (95.6)
 src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
 src/ui/settings.rs 35         # (37.5) the form -> change -> confirm path; the rest draws it
