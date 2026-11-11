@@ -421,9 +421,10 @@ impl OverclockView {
                 ui.add_space(pad);
             }
         };
-        // Not three equal columns: the XBAR / SYS card has twice the controls of the others.
+        // Not three equal columns: each gets what its content needs at the minimum window width
+        // (power about 141 px, memory 191, XBAR / SYS 260; --check-layout catches a wider one).
         let width = ui.available_width() - 2.0 * w::GAP;
-        let (wa, wb) = (width * 0.3, width * 0.3);
+        let (wa, wb) = (width * 0.24, width * 0.32);
         let wc = width - wa - wb;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = w::GAP;

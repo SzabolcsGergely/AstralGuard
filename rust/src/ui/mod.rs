@@ -201,8 +201,11 @@ fn runs_on_wayland(wayland_display: Option<&str>, winit_backend: Option<&str>) -
 
 /// The window (taskbar) icon: the app icon with a status dot in the corner, so the taskbar
 /// shows the state at a glance. Falls back to the plain dot if the PNG cannot be read.
-/// When the window icon is sent a second time; the window exists well before this.
-const ICON_RESEND_AFTER: Duration = Duration::from_secs(2);
+/// The window icon is sent again this long after start and after the window is shown: a
+/// command sent before the native window exists is lost, and showing it can put back the
+/// icon it was created with (both seen: a grey dot on a Safe guard).
+const ICON_RESEND_AFTER_START: Duration = Duration::from_secs(2);
+const ICON_RESEND_AFTER_SHOW: Duration = Duration::from_secs(1);
 
 fn icon_data(status: Status) -> Arc<egui::IconData> {
     const SIZE: u32 = 64;
@@ -393,8 +396,10 @@ struct Shot {
     ready_frames: u32,
     requested: bool,
     check_layout: bool,
-    /// How far the tab's content ran past the window on the last frame, px (0 = it fits).
+    /// How far the tab's content ran past the window on the last frame, px (0 = it fits):
+    /// below it (the tab scrolls) and to the right of it (a card wider than its column).
     overflow: f32,
+    overflow_x: f32,
     /// Filled by the screenshot callback once the frame is captured.
     image: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
 }
@@ -422,8 +427,8 @@ struct App {
     quitting: bool,
     exit_pending: bool,
     icon_status: Option<Status>,
-    /// The icon was sent again once the window surely existed (see ICON_RESEND_AFTER).
-    icon_resent: bool,
+    /// When to send the window icon again even if the status has not changed.
+    icon_resend_at: Option<Instant>,
     flash: Option<(String, Instant)>,
     /// A sensor scan is in flight (the button shows Scanning...).
     scanning: bool,
@@ -497,7 +502,7 @@ impl App {
             quitting: false,
             exit_pending: false,
             icon_status: None,
-            icon_resent: false,
+            icon_resend_at: Some(Instant::now() + ICON_RESEND_AFTER_START),
             flash: None,
             scanning: false,
             scan_auto: false,
@@ -508,6 +513,7 @@ impl App {
                 requested: false,
                 check_layout: opts.check_layout,
                 overflow: 0.0,
+                overflow_x: 0.0,
                 image: Arc::default(),
             }),
             live: None,
@@ -573,6 +579,7 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         self.shown = true;
+        self.icon_resend_at = Some(Instant::now() + ICON_RESEND_AFTER_SHOW);
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
@@ -586,6 +593,7 @@ impl App {
     fn note_overflow<R>(&mut self, out: &egui::scroll_area::ScrollAreaOutput<R>) {
         if let Some(shot) = &mut self.shot {
             shot.overflow = (out.content_size.y - out.inner_rect.height()).max(0.0);
+            shot.overflow_x = (out.content_size.x - out.inner_rect.width()).max(0.0);
         }
     }
 
@@ -665,6 +673,7 @@ impl App {
         #[cfg(windows)]
         if !self.shown && win::is_visible(self.hwnd()) {
             self.shown = true;
+            self.icon_resend_at = Some(Instant::now() + ICON_RESEND_AFTER_SHOW);
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         }
         if self.start_hidden && self.frame == 2 {
@@ -728,12 +737,14 @@ impl App {
             if let Err(e) = save_png(&path, &img) {
                 eprintln!("screenshot: {e}");
             }
-            if shot.check_layout && shot.overflow > 0.5 {
-                eprintln!(
-                    "layout: {path}: the {} tab scrolls ({:.0} px more than the window)",
-                    self.tab.key(),
-                    shot.overflow
-                );
+            if shot.check_layout && (shot.overflow > 0.5 || shot.overflow_x > 0.5) {
+                let tab = self.tab.key();
+                if shot.overflow > 0.5 {
+                    eprintln!("layout: {path}: the {tab} tab scrolls ({:.0} px more than the window)", shot.overflow);
+                }
+                if shot.overflow_x > 0.5 {
+                    eprintln!("layout: {path}: the {tab} tab is {:.0} px wider than the window", shot.overflow_x);
+                }
                 std::process::exit(3);
             }
             self.quit(ctx);
@@ -770,13 +781,16 @@ impl eframe::App for App {
         self.window_events(ctx);
 
         let status = tray::icon_status(self.live.as_deref(), self.connected);
-        // Once more after start: eframe 0.37 drops a command sent before the native window
-        // exists, and the first frames come before it (the dot stayed grey on a Safe guard).
-        let resend = !self.icon_resent && self.started.elapsed() > ICON_RESEND_AFTER;
+        let resend = self.icon_resend_at.is_some_and(|at| Instant::now() >= at);
         if self.icon_status != Some(status) || resend {
             self.icon_status = Some(status);
-            self.icon_resent |= resend;
-            ctx.send_viewport_cmd(ViewportCommand::Icon(Some(icon_data(status))));
+            if resend {
+                self.icon_resend_at = None;
+            }
+            let icon = icon_data(status);
+            #[cfg(windows)]
+            win::set_taskbar_icon(self.hwnd(), &icon.rgba, icon.width, icon.height);
+            ctx.send_viewport_cmd(ViewportCommand::Icon(Some(icon)));
         }
         self.settings.sync(self.live.as_ref().map(|l| &l.settings));
         if self.tab == Tab::Settings && self.connected && self.settings.autostart == settings::Autostart::Unknown {

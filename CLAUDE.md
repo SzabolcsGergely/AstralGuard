@@ -115,7 +115,8 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
 - **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|overclock|imu|protection|settings|log
   [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]
   [--check-layout]` renders one frame and exits; `--check-layout` makes it exit 3 when the
-  tab would scroll. `docs/screenshots/` is made this way.
+  tab would scroll or its content is wider than the window. `docs/screenshots/` is made
+  this way.
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
   read-only and safe next to a running guard. A real guard (`astralguard`) needs elevation
   (Windows) or root (Linux) to limit the GPU; without it, it runs shutdown-only and says so.
@@ -156,8 +157,9 @@ cargo test
   - **cargo deny** (`rust/deny.toml`): security advisories, licences (a new licence is a
     decision), crate sources.
   - **Screenshots and layout**: every tab rendered from the demo on Linux (software OpenGL,
-    a virtual display), at phases 35 and 67, with `--check-layout`, which exits 3 when a tab
-    would scroll. The PNGs are the run's `screenshots` artifact: look there for a UI change.
+    a virtual display), at phases 35 and 67, at the default size and at the minimum width
+    (660x820), with `--check-layout`, which exits 3 when a tab would scroll or sticks out
+    sideways. The PNGs are the run's `screenshots` artifact: look there for a UI change.
   - **Minimum Rust**: `cargo check` on the `rust-version` in `Cargo.toml` (1.95, what egui
     0.37 needs). Raise it on purpose, not by using a newer API by accident.
   - **Windows GNU**: `build.ps1` and a start of the exe, so the GNU-specific link setup
@@ -262,6 +264,11 @@ Things that have gone wrong before, and how to avoid them.
   last chart on a tab takes what is left (`ui.available_height()`, clamped) instead of a
   fixed height; the Overclock curve measures the rest of the tab on the frame before.
   Check new content with a screenshot at the default size and at `--phase 67`.
+- **A card wider than its column at the minimum width.** egui does not shrink a row of
+  controls to its column: the card grows past it (the XBAR / SYS card did, at 660 px). Every
+  tab must also fit `MIN_SIZE`'s width (660) without anything sticking out; `--check-layout`
+  measures that too, and CI renders every tab at `--size 660x820`. Give a crowded card more
+  of the row (the Overclock bottom cards are 24 / 32 / 44 %) rather than raising the minimum.
 - **Protection settings in more than one place.** `SettingsView` is one form: one diff, one
   dirty flag, and `sync` skips reloading while anything is edited; **Reset to defaults**
   resets every protection group together. Protection values are edited only on the

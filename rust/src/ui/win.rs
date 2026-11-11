@@ -1,7 +1,7 @@
 //! The few Win32 calls the UI needs. Window handles travel between threads as isize.
 
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::{
@@ -9,7 +9,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+    CreateIcon, DestroyIcon, FindWindowW, IsIconic, IsWindowVisible, SendMessageW, SetForegroundWindow,
+    ShowWindowAsync, HICON, ICON_BIG, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, WM_SETICON,
 };
 
 fn hwnd(h: isize) -> HWND {
@@ -32,6 +33,31 @@ pub fn show_window(h: isize) {
 
 pub fn is_visible(h: isize) -> bool {
     h != 0 && unsafe { IsWindowVisible(hwnd(h)).as_bool() }
+}
+
+/// The taskbar's (big) icon. egui's icon command reaches winit's set_window_icon, which on
+/// Windows replaces only the small one (the title bar); the big one stays what the window was
+/// created with. `rgba` is width x height RGBA8.
+pub fn set_taskbar_icon(h: isize, rgba: &[u8], width: u32, height: u32) {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    // Ours from the previous call, destroyed once replaced (never winit's own).
+    static LAST: AtomicIsize = AtomicIsize::new(0);
+    if h == 0 || rgba.len() != (width * height * 4) as usize {
+        return;
+    }
+    let bgra: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, a]| [b, g, r, a]).collect();
+    // 32 bpp colour carries its own alpha; the AND mask is then ignored, but must exist.
+    let mask = vec![0u8; (width.div_ceil(16) * 2 * height) as usize];
+    unsafe {
+        let Ok(icon) = CreateIcon(None, width as i32, height as i32, 1, 32, mask.as_ptr(), bgra.as_ptr()) else {
+            return;
+        };
+        SendMessageW(hwnd(h), WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(icon.0 as isize)));
+        let old = LAST.swap(icon.0 as isize, Ordering::Relaxed);
+        if old != 0 {
+            let _ = DestroyIcon(HICON(old as *mut core::ffi::c_void));
+        }
+    }
 }
 
 /// Dark or light title bar to match the theme (Windows 10 2004+ / 11).

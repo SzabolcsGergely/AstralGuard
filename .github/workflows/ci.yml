@@ -234,6 +234,19 @@ jobs:
               fi
             done
           done
+          # The narrowest window the dashboard allows (MIN_SIZE in src/ui/mod.rs): nothing may
+          # stick out of its column there either.
+          for phase in 35 67; do
+            for tab in live overclock imu protection settings log; do
+              out="../screenshots/${tab}-phase${phase}-min-width.png"
+              if ! xvfb-run -a -s "-screen 0 1920x1080x24" \
+                  ./target/release/astralguard ui --demo --phase "$phase" --tab "$tab" --size 660x820 \
+                  --screenshot "$out" --check-layout; then
+                echo "::error::$tab at phase $phase does not fit the minimum window width (660 px)"
+                status=1
+              fi
+            done
+          done
           ls -l ../screenshots
           exit $status
       - uses: actions/upload-artifact@v7
