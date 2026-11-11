@@ -3,7 +3,7 @@
 # Builds AstralGuard from a release tag. The release workflow builds the published
 # .pkg.tar.zst with this file; to build it yourself: makepkg -si
 pkgname=astralguard
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc="Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs (service, tray icon, dashboard)"
 arch=('x86_64')

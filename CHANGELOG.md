@@ -7,6 +7,15 @@ here.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-11
+
+A packaging release: the program is the same as 1.0.0.
+
+### Changed
+
+- Release notes now come from this changelog and show the dashboard's screenshots; the
+  screenshots are also attached as a zip.
+
 ### Fixed
 
 - The Arch release no longer includes an empty `astralguard-debug` package.
@@ -66,5 +75,6 @@ The first release.
   the dashboard, or by itself when you turn that on).
   Tested on CachyOS with KDE Plasma on Wayland and the NVIDIA open kernel module.
 
-[Unreleased]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/SzabolcsGergely/AstralGuard/releases/tag/v1.0.0
