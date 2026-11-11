@@ -4,6 +4,7 @@
 #
 # Each floor sits about 2 points under what was measured (in brackets, 2026-11-12), so
 # moving a few lines in a refactor passes and dropping a test does not.
+src/mitigation.rs 59          # (61.6) limit, restore, crash recovery; the rest is the NVML binding
 src/service/monitor.rs 62     # (64.8) the rest is the run() loop: threads and real time
 src/service/response.rs 85    # (87.5)
 src/service/imbalance.rs 88   # (90.3)
