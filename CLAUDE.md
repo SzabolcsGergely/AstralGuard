@@ -49,7 +49,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
                           launcher .desktop, debian/postinst, arch/PKGBUILD + astralguard.install
   .cargo/config.toml      Windows GNU toolchain linker settings (see below)
   build.ps1               Windows GNU build helper
-.github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags)
+.github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags), scheduled.yml (weekly)
+.github/scripts/          safety-rules.sh (the mechanical checks of the safety rules)
 .github/ISSUE_TEMPLATE/   bug report, card report, feature request forms; PULL_REQUEST_TEMPLATE.md
 docs/screenshots/         README images, rendered with --screenshot
 ```
@@ -112,8 +113,9 @@ No resource compiler is needed on either toolchain: `build.rs` writes the `.res`
   `--offline` simulates a missing service, `--no-sensor` a card whose pin monitor reads
   nothing until Scan is pressed.
 - **Screenshots:** `astralguard ui --demo --phase 35 --screenshot out.png --tab live|overclock|imu|protection|settings|log
-  [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]`
-  renders one frame and exits. `docs/screenshots/` is made this way.
+  [--theme <name>] [--size 800x820] [--scale 1.5] [--confirm pause|exit|reset|calibrate|warnings|scan|scan-result]
+  [--check-layout]` renders one frame and exits; `--check-layout` makes it exit 3 when the
+  tab would scroll. `docs/screenshots/` is made this way.
 - **Real card:** `astralguard probe` reads the chip and prints pins, volts and tilt. It is
   read-only and safe next to a running guard. A real guard (`astralguard`) needs elevation
   (Windows) or root (Linux) to limit the GPU; without it, it runs shutdown-only and says so.
@@ -145,6 +147,27 @@ cargo test
   or the other OS's clippy fails.
 - `cargo test -- --include-ignored` also runs the tests that need the network (the update
   check).
+- Besides those, CI (`.github/workflows/ci.yml`) runs:
+  - **Safety rules** (`bash .github/scripts/safety-rules.sh`, runs locally too): the
+    mechanical half of the [safety rules](#safety-rules). No I2C write bound (1), no network
+    or TLS crate in the service-only build and no network code outside `src/ui/` (2),
+    shutdown by absolute path (4), the V/F write only from `overclock/` (9), and only the
+    checked commands on the XBAR / SYS channel (10). Changing a check goes with changing its rule.
+  - **cargo deny** (`rust/deny.toml`): security advisories, licences (a new licence is a
+    decision), crate sources.
+  - **Screenshots and layout**: every tab rendered from the demo on Linux (software OpenGL,
+    a virtual display), at phases 35 and 67, with `--check-layout`, which exits 3 when a tab
+    would scroll. The PNGs are the run's `screenshots` artifact: look there for a UI change.
+  - **Minimum Rust**: `cargo check` on the `rust-version` in `Cargo.toml` (1.89). Raise it
+    on purpose, not by using a newer API by accident.
+  - **Windows GNU**: `build.ps1` and a start of the exe, so the GNU-specific link setup
+    keeps working.
+  - Everything with `--locked` (`Cargo.lock` must be committed and current), on a pinned
+    toolchain (`RUST_TOOLCHAIN` in ci.yml and packages.yml); jobs and test steps have
+    timeouts, so a deadlocked test fails instead of hanging.
+  - `.github/workflows/scheduled.yml` runs weekly: the latest stable and beta (new lints
+    before they reach the pin), the network tests, and the advisory check. Dependabot
+    (`.github/dependabot.yml`) opens weekly update PRs for crates and actions.
 - The ladder is tested end to end against a fake limiter (`service/response.rs`):
   `evaluate()` returns a shutdown reason instead of shutting down. Any change to the
   response logic comes with a test there.
@@ -226,7 +249,8 @@ Things that have gone wrong before, and how to avoid them.
   # and overclock, imu, protection, settings at --phase 35
   ```
 - **A tab that scrolls at the default size.** Every tab must fit the default window
-  (800x820) without scrolling, also with a banner showing (`--phase 67` shows one). The
+  (800x820) without scrolling, also with a banner showing (`--phase 67` shows one). CI's
+  screenshot job fails when one does (`--check-layout`). The
   last chart on a tab takes what is left (`ui.available_height()`, clamped) instead of a
   fixed height; the Overclock curve measures the rest of the tab on the frame before.
   Check new content with a screenshot at the default size and at `--phase 67`.

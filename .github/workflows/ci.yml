@@ -9,20 +9,30 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  # Pinned, so a new Rust release (and its new lints) cannot turn CI red on its own;
+  # scheduled.yml tries the latest stable and beta every week. Raise it on purpose.
+  RUST_TOOLCHAIN: "1.99.1"
 
 jobs:
   windows:
     name: Windows
     runs-on: windows-latest
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: rust
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
@@ -30,13 +40,43 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test
+        # a deadlocked test must not hold the runner for hours
+        timeout-minutes: 10
+        run: cargo test --locked
+
+  windows-gnu:
+    name: Windows (GNU toolchain, build.ps1)
+    # The toolchain the project is developed with: the rust-lld link and the dlltool copy
+    # (CLAUDE.md, Building) are exercised only here.
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}-x86_64-pc-windows-gnu
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: gnu
+      - name: Build (build.ps1)
+        shell: pwsh
+        run: rust\build.ps1
+      - name: The exe starts
+        # A mislinked exe crashes before main; probe without a card must reach "no sensor".
+        shell: pwsh
+        run: |
+          $out = & .\astralguard.exe probe 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'no sensor') { throw "astralguard.exe probe did not run to the sensor check" }
 
   linux:
     name: Linux
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: rust
@@ -47,20 +87,122 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (service only)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Test
-        run: cargo test
+        timeout-minutes: 10
+        run: cargo test --locked
+
+  msrv:
+    name: Minimum Rust (rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries (window, TLS)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
+      - name: Read rust-version
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: msrv
+      - name: Check (full and service only)
+        run: |
+          cargo check --locked --all-targets
+          cargo check --locked --all-targets --no-default-features
+
+  safety:
+    name: Safety rules and dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: The mechanical checks of CLAUDE.md's safety rules
+        run: bash .github/scripts/safety-rules.sh
+      - name: Dependencies (advisories, licences, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+
+  screenshots:
+    name: Screenshots and layout
+    # Every tab rendered from the demo, idle and with a banner, at the default window size.
+    # A tab that would scroll fails the job (--check-layout); the PNGs are a run artifact,
+    # so a UI change can be looked at without building it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries (window, TLS, software OpenGL, a virtual display)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev \
+            libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2 libgl1 libegl1 libgl1-mesa-dri xvfb
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: screenshots
+      - name: Build
+        run: cargo build --locked --release
+      - name: Render every tab
+        timeout-minutes: 10
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WAYLAND_DISPLAY: ""
+        run: |
+          mkdir -p ../screenshots
+          status=0
+          for phase in 35 67; do
+            for tab in live overclock imu protection settings log; do
+              out="../screenshots/${tab}-phase${phase}.png"
+              if ! xvfb-run -a -s "-screen 0 1920x1080x24" \
+                  ./target/release/astralguard ui --demo --phase "$phase" --tab "$tab" \
+                  --screenshot "$out" --check-layout; then
+                echo "::error::$tab at phase $phase does not fit the default window, or did not render"
+                status=1
+              fi
+            done
+          done
+          ls -l ../screenshots
+          exit $status
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots/*.png
+          if-no-files-found: error
 
   packages:
     name: Packages
-    needs: [windows, linux]
+    needs: [windows, windows-gnu, linux, msrv, safety, screenshots]
     uses: ./.github/workflows/packages.yml

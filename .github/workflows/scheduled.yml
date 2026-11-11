@@ -1,0 +1,56 @@
+name: Weekly
+
+# What changes without a commit: a new Rust release (new lints), new security advisories,
+# and the GitHub API the update check talks to.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  latest-rust:
+    name: Latest ${{ matrix.toolchain }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - name: System libraries (window, TLS)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libxkbcommon-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test, network tests included
+        timeout-minutes: 10
+        run: cargo test --locked -- --include-ignored
+
+  advisories:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check advisories

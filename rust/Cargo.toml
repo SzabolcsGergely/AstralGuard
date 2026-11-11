@@ -2,6 +2,8 @@
 name = "astralguard"
 version = "2.0.0"
 edition = "2021"
+# The oldest Rust that builds it: CI checks this version (the msrv job). Raise it on purpose.
+rust-version = "1.89"
 description = "Per-pin 12V-2x6 current guard for ASUS ROG Astral GPUs"
 license = "MIT"
 publish = false
