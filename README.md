@@ -89,7 +89,8 @@ with the output of `astralguard probe` tells us whether it does.
 
 Get the package for your system from the
 [latest release](https://github.com/SzabolcsGergely/AstralGuard/releases/latest).
-`SHA256SUMS.txt` on the release page has every file's checksum.
+`SHA256SUMS.txt` on the release page has every file's checksum, and
+[`CHANGELOG.md`](CHANGELOG.md) says what changed in each release.
 
 ### Windows 10 / 11
 

@@ -183,6 +183,11 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: The mechanical checks of CLAUDE.md's safety rules
         run: bash .github/scripts/safety-rules.sh
+      - name: CHANGELOG.md has notes for the crate's version
+        # So a version bump without its changelog section fails here, not at the tag.
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -n1)
+          sh .github/scripts/release-notes.sh "$version" "$GITHUB_REPOSITORY" > /dev/null
       - name: Dependencies (advisories, licences, sources)
         uses: EmbarkStudios/cargo-deny-action@v2
         with:

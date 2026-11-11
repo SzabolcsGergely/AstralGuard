@@ -51,7 +51,9 @@ rust/                     the whole program: one crate, one binary (astralguard)
   build.ps1               Windows GNU build helper
 .github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags), scheduled.yml (weekly)
 .github/scripts/          safety-rules.sh (the mechanical checks of the safety rules), runtime-libs.sh
-                          (the packages install every library the binary loads at runtime)
+                          (the packages install every library the binary loads at runtime),
+                          release-notes.sh (a release's text, from CHANGELOG.md)
+CHANGELOG.md              what changed in each release; each section is that release's notes
 .github/ISSUE_TEMPLATE/   bug report, card report, feature request forms; PULL_REQUEST_TEMPLATE.md
 docs/screenshots/         README images, rendered with --screenshot
 ```
@@ -339,7 +341,11 @@ results are downloadable run artifacts), and `release.yml` runs it for tags.
 
 To cut a release:
 
-1. Bump `version` in `rust/Cargo.toml` (and `pkgver` in the PKGBUILD), and commit.
+1. Bump `version` in `rust/Cargo.toml` (and `pkgver` in the PKGBUILD). In `CHANGELOG.md`,
+   turn `## [Unreleased]` into `## [1.1.0] - <date>` (written for the people who run it, not
+   a list of commits), start a new empty `## [Unreleased]` above it, and update the compare
+   links at the bottom. Preview the release text with
+   `sh .github/scripts/release-notes.sh 1.1.0`, then commit.
 2. Tag and push:
 
    ```sh
@@ -347,8 +353,11 @@ To cut a release:
    git push origin v1.1.0
    ```
 
-The release workflow checks that the tag matches the crate version, builds and tests the
-packages, and publishes them with `SHA256SUMS.txt`. Installed dashboards see the new
+The release workflow checks that the tag matches the crate version and that `CHANGELOG.md`
+has its section (CI checks the section on every push too), builds and tests the packages,
+and publishes them with a zip of `docs/screenshots/` and `SHA256SUMS.txt`. The release text
+is that changelog section, the screenshots shown inline from the tag, and a link to the
+README at the tag. Regenerate the screenshots before tagging when the UI changed. Installed dashboards see the new
 release within a day.
 
 ## Conventions

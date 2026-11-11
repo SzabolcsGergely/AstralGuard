@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like v1.1.0 (matching `version` in rust/Cargo.toml) to build and publish a
-# release. The dashboard's update checker reads the latest release from this repository.
+# Push a tag like v1.1.0 (matching `version` in rust/Cargo.toml, with a "## [1.1.0]" section
+# in CHANGELOG.md) to build and publish a release: the packages, a zip of the README
+# screenshots and SHA256SUMS.txt, with that changelog section and the screenshots as notes.
+# The dashboard's update checker reads the latest release from this repository.
 on:
   push:
     tags: ["v*"]
@@ -26,6 +28,9 @@ jobs:
             exit 1
           fi
           echo "version=$crate" >> "$GITHUB_OUTPUT"
+      # Before the packages are built: a release without its CHANGELOG.md section stops here.
+      - name: Release notes
+        run: sh .github/scripts/release-notes.sh "${{ steps.v.outputs.version }}" "$GITHUB_REPOSITORY"
 
   packages:
     name: Packages
@@ -39,16 +44,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: package-*
           merge-multiple: true
           path: dist
+      - name: Screenshots
+        # The README's screenshots as of this tag; the notes also show them inline.
+        run: |
+          cd docs/screenshots
+          zip -X "$GITHUB_WORKSPACE/dist/AstralGuard-${{ needs.version.outputs.version }}-screenshots.zip" *.png
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes
+        run: sh .github/scripts/release-notes.sh "${{ needs.version.outputs.version }}" "$GITHUB_REPOSITORY" > notes.md
       - uses: softprops/action-gh-release@v3
         with:
           name: AstralGuard ${{ needs.version.outputs.version }}
-          generate_release_notes: true
+          body_path: notes.md
           files: dist/*
