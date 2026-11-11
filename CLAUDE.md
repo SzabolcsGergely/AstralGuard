@@ -297,7 +297,8 @@ Things that have gone wrong before, and how to avoid them.
 - **A new setting:** add it to `Settings`, its default, `SettingsPatch`, the check/merge in
   `config.rs` (with validation), the Protection tab (`ui/settings.rs`), and the README's configuration table.
 - **A new supported card:** add its PCI subsystem ID and length to `ASTRAL_CARDS` in
-  `sensor/mod.rs`, and to the README table. Only Astral cards have the per-pin monitor.
+  `sensor/mod.rs` (the README lists the models by name, without IDs: add a new variant
+  there if it is not covered). Only Astral cards have the per-pin monitor.
 - **Logging:** `logger::{info, warn, error, critical}` to `astralguard.log`; user-visible
   events also go through `shared.event(kind, id, msg)` (Event Log) and `shared.notify`
   (toast). Event IDs are listed in the README; keep the table in sync.

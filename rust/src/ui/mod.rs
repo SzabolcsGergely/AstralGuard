@@ -1212,7 +1212,10 @@ impl App {
             ),
             Confirm::Calibrate => (
                 "Calibrate sag baseline?",
-                vec!["Uses the card's current position as the no-sag reference. Leave the PC where it normally stands and untouched; it takes about 10 s.".into()],
+                vec![
+                    "Sag is measured from the card's position now. Calibrate after installing the card or its support, or after moving the PC.".into(),
+                    "Leave the PC where it normally stands and untouched; it takes about 10 s.".into(),
+                ],
                 "Calibrate",
                 false,
             ),
