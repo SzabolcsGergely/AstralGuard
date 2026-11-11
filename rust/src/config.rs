@@ -815,4 +815,98 @@ mod tests {
         assert_eq!(g(15.0), "15");
         assert_eq!(g(0.25), "0.25");
     }
+
+    // Safety rule 6: the dashboard asks before applying a change that weakens protection.
+    // These pin down which changes ask (a warning) and which are refused (an error).
+
+    #[test]
+    fn raising_any_tier_above_its_default_asks_first() {
+        let d = Settings::default();
+        let cases = [
+            SettingsPatch { threshold_amps: Some(d.threshold_amps + 0.5), ..Default::default() },
+            SettingsPatch {
+                sustained_seconds_required: Some(d.sustained_seconds_required + 5.0),
+                ..Default::default()
+            },
+            SettingsPatch { critical_amps: Some(d.critical_amps + 1.0), ..Default::default() },
+            SettingsPatch { critical_seconds: Some(d.critical_seconds + 1.0), ..Default::default() },
+            SettingsPatch { catastrophic_amps: Some(d.catastrophic_amps + 1.0), ..Default::default() },
+        ];
+        for p in cases {
+            let (errors, warnings) = check(&d, &p);
+            assert!(errors.is_empty(), "{p:?}: {errors:?}");
+            assert_eq!(warnings.len(), 1, "{p:?}");
+            assert!(warnings[0].contains("reduces protection") && warnings[0].contains("Requested"), "{}", warnings[0]);
+        }
+        let all = SettingsPatch {
+            threshold_amps: Some(10.0),
+            sustained_seconds_required: Some(20.0),
+            critical_amps: Some(14.0),
+            critical_seconds: Some(5.0),
+            catastrophic_amps: Some(18.0),
+            ..Default::default()
+        };
+        assert_eq!(check(&d, &all).1.len(), 5, "one warning per weakened value");
+    }
+
+    #[test]
+    fn tightening_or_keeping_the_defaults_does_not_ask() {
+        let d = Settings::default();
+        let tighter = SettingsPatch {
+            threshold_amps: Some(8.5),
+            sustained_seconds_required: Some(10.0),
+            critical_amps: Some(12.0),
+            critical_seconds: Some(2.0),
+            catastrophic_amps: Some(15.0),
+            ..Default::default()
+        };
+        assert_eq!(check(&d, &tighter), (vec![], vec![]));
+        let same = SettingsPatch {
+            threshold_amps: Some(d.threshold_amps),
+            critical_amps: Some(d.critical_amps),
+            ..Default::default()
+        };
+        assert_eq!(check(&d, &same), (vec![], vec![]), "exactly the default is not a weakening");
+        assert_eq!(check(&d, &SettingsPatch::default()), (vec![], vec![]));
+    }
+
+    #[test]
+    fn the_warning_is_measured_against_the_default_not_the_current_value() {
+        // Today's behaviour, pinned so a change to it is deliberate: from a tightened 8.5 A,
+        // going back up to 9.0 A (still under the 9.5 A default) does not ask.
+        let current = Settings { threshold_amps: 8.5, ..Settings::default() };
+        let p = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        assert!(check(&current, &p).1.is_empty());
+    }
+
+    #[test]
+    fn tiers_out_of_order_are_refused() {
+        let d = Settings::default();
+        for p in [
+            SettingsPatch { threshold_amps: Some(13.0), ..Default::default() }, // = tier 2
+            SettingsPatch { critical_amps: Some(17.0), ..Default::default() },  // above tier 3
+            SettingsPatch { catastrophic_amps: Some(9.0), ..Default::default() }, // below tier 1
+        ] {
+            let (errors, _) = check(&d, &p);
+            assert!(errors.iter().any(|e| e.starts_with("Thresholds must rise")), "{p:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn numbers_that_make_no_sense_are_refused() {
+        let d = Settings::default();
+        for p in [
+            SettingsPatch { threshold_amps: Some(f64::NAN), ..Default::default() },
+            SettingsPatch { sustained_seconds_required: Some(0.0), ..Default::default() },
+            SettingsPatch { critical_seconds: Some(-3.0), ..Default::default() },
+            SettingsPatch { imbalance_percent: Some(100.0), ..Default::default() },
+            SettingsPatch { sag_card_length_mm: Some(-1.0), ..Default::default() },
+            SettingsPatch { sag_serious_degrees: Some(d.sag_warn_degrees), ..Default::default() },
+            SettingsPatch { oc_xbar_offset_mhz: Some(5000.0), ..Default::default() },
+        ] {
+            assert!(!check(&d, &p).0.is_empty(), "{p:?} must be refused");
+        }
+        let spec_length = SettingsPatch { sag_card_length_mm: Some(0.0), ..Default::default() };
+        assert!(check(&d, &spec_length).0.is_empty(), "0 mm means the card's spec length");
+    }
 }
