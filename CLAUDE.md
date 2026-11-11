@@ -158,8 +158,8 @@ cargo test
   - **Screenshots and layout**: every tab rendered from the demo on Linux (software OpenGL,
     a virtual display), at phases 35 and 67, with `--check-layout`, which exits 3 when a tab
     would scroll. The PNGs are the run's `screenshots` artifact: look there for a UI change.
-  - **Minimum Rust**: `cargo check` on the `rust-version` in `Cargo.toml` (1.89). Raise it
-    on purpose, not by using a newer API by accident.
+  - **Minimum Rust**: `cargo check` on the `rust-version` in `Cargo.toml` (1.95, what egui
+    0.37 needs). Raise it on purpose, not by using a newer API by accident.
   - **Windows GNU**: `build.ps1` and a start of the exe, so the GNU-specific link setup
     keeps working.
   - **Coverage**: `cargo llvm-cov` on Linux; the run summary has a per-file table and the
