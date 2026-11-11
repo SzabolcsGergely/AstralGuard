@@ -128,7 +128,7 @@ pub fn register_event_source() -> Result<(), String> {
         RegCreateKeyExW(
             HKEY_LOCAL_MACHINE,
             &key_path,
-            0,
+            None,
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             KEY_SET_VALUE,
@@ -141,10 +141,10 @@ pub fn register_event_source() -> Result<(), String> {
         if dll.exists() {
             let wide: Vec<u16> = dll.as_os_str().encode_wide_nul();
             let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
-            let _ = RegSetValueExW(key, w!("EventMessageFile"), 0, REG_EXPAND_SZ, Some(bytes));
+            let _ = RegSetValueExW(key, w!("EventMessageFile"), None, REG_EXPAND_SZ, Some(bytes));
         }
         let types: u32 = 7;
-        let _ = RegSetValueExW(key, w!("TypesSupported"), 0, REG_DWORD, Some(&types.to_le_bytes()));
+        let _ = RegSetValueExW(key, w!("TypesSupported"), None, REG_DWORD, Some(&types.to_le_bytes()));
         let _ = RegCloseKey(key);
     }
     Ok(())
@@ -260,16 +260,7 @@ pub fn relaunch_elevated() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     let Ok(exe) = std::env::current_exe() else { return false };
     let exe = HSTRING::from(exe.as_os_str());
-    let r = unsafe {
-        ShellExecuteW(
-            windows::Win32::Foundation::HWND::default(),
-            w!("runas"),
-            &exe,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
+    let r = unsafe { ShellExecuteW(None, w!("runas"), &exe, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
     r.0 as isize > 32
 }
 
