@@ -681,6 +681,34 @@ fn tick(
     imbalance: &mut ImbalanceMonitor,
     sag: &mut SagMonitor,
 ) -> TickOutcome {
+    let outcome = decide(shared, sensor, crate::now(), response, t1, last_sample, crosscheck, flight, imbalance);
+    if !matches!(outcome, TickOutcome::Continue) {
+        return outcome;
+    }
+    let s = shared.settings();
+    // After the pin decision, never before it.
+    sag.tick(Some(sensor), crate::now(), response.engaged, &s);
+    // Normally a plain sleep; with the dashboard's fast polling the same 0.5 s is spent
+    // reading the accelerometer, still in this thread.
+    sag.idle(Some(sensor), POLL_INTERVAL_SEC, response.engaged, &s);
+    TickOutcome::Continue
+}
+
+/// One sample and what the guard does about it, at `now`: read the pins, the tier 1 timer,
+/// the resume gap, imbalance, the ladder. Everything but the sag step and the wait, so the
+/// tests can run it on a fake card and a clock of their own.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    shared: &Arc<Shared>,
+    sensor: &mut PinSensor,
+    now: f64,
+    response: &mut TieredResponse,
+    t1: &mut Tier1,
+    last_sample: &mut Option<f64>,
+    crosscheck: &mut CrossCheck,
+    flight: &mut FlightRecorder,
+    imbalance: &mut ImbalanceMonitor,
+) -> TickOutcome {
     let pins = match sensor.read_pins() {
         Ok(p) => p,
         Err(ReadError::Transient(e)) => return TickOutcome::Transient(e),
@@ -690,7 +718,7 @@ fn tick(
 
     // A long gap means the machine slept or stalled badly, not that current was high the
     // whole time; readings right after a resume are not trustworthy either.
-    let sample_now = crate::now();
+    let sample_now = now;
     if let Some(last) = *last_sample {
         let gap = sample_now - last;
         if gap > RESUME_GRACE_SEC {
@@ -721,9 +749,8 @@ fn tick(
     shared.record_pins(sample_now, pins.iter().map(|p| p.amps).collect());
 
     // Warn-only and independent of the tiers.
-    imbalance.evaluate(&pins, crate::now(), &s);
+    imbalance.evaluate(&pins, now, &s);
 
-    let now = crate::now();
     let threshold = s.threshold_amps;
     let over = max.amps >= threshold;
     let cleared = max.amps < threshold - CLEAR_HYSTERESIS_AMPS;
@@ -841,12 +868,6 @@ fn tick(
     if let Some(reason) = shutdown {
         return TickOutcome::Shutdown(reason);
     }
-
-    // After the pin decision, never before it.
-    sag.tick(Some(sensor), crate::now(), response.engaged, &s);
-    // Normally a plain sleep; with the dashboard's fast polling the same 0.5 s is spent
-    // reading the accelerometer, still in this thread.
-    sag.idle(Some(sensor), POLL_INTERVAL_SEC, response.engaged, &s);
     TickOutcome::Continue
 }
 
@@ -1192,5 +1213,289 @@ mod tests {
         assert_eq!(opens.load(O::SeqCst), 1, "the start-up apply is not held back by the pause");
         assert_eq!(shared.snapshot().status, Status::Paused);
         assert_eq!(pause.since, Some(now));
+    }
+}
+
+/// The protection loop's per-sample decisions, on a fake card and a clock of their own: the
+/// tier 1 timer, its reset, the resume gap, read failures and the hand-off to the ladder.
+#[cfg(test)]
+mod sample_tests {
+    use super::*;
+    use crate::protocol::{ImbalanceResponse, Settings};
+    use crate::sensor::fake::{Card, Reading};
+    use crate::service::response::Limiter;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Calls {
+        engaged: u32,
+        released: u32,
+    }
+
+    struct FakeLimiter(Arc<Mutex<Calls>>);
+
+    impl Limiter for FakeLimiter {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn unavailable_reason(&self) -> String {
+            String::new()
+        }
+        fn engage(&mut self, _reason: &str) -> bool {
+            self.0.lock().unwrap().engaged += 1;
+            true
+        }
+        fn release(&mut self) -> bool {
+            self.0.lock().unwrap().released += 1;
+            true
+        }
+        fn close(&mut self) {}
+        fn abandon(&mut self) {}
+    }
+
+    /// One guard on one fake card. `at(t)` takes a sample at t seconds.
+    struct Guard {
+        card: Card,
+        sensor: PinSensor,
+        shared: Arc<Shared>,
+        response: TieredResponse,
+        t1: Tier1,
+        last_sample: Option<f64>,
+        crosscheck: CrossCheck,
+        flight: FlightRecorder,
+        imbalance: ImbalanceMonitor,
+        calls: Arc<Mutex<Calls>>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Guard {
+        fn new(name: &str, settings: Settings) -> Guard {
+            let dir = std::env::temp_dir().join(format!("ag-monitor-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let card = Card::new([5.0; 6]);
+            let shared = Shared::new(settings, None, true);
+            let calls = Arc::new(Mutex::new(Calls::default()));
+            let c2 = Arc::clone(&calls);
+            let response =
+                TieredResponse::new(Arc::clone(&shared), Box::new(move |_| Box::new(FakeLimiter(Arc::clone(&c2)))));
+            Guard {
+                sensor: card.sensor(),
+                card,
+                imbalance: ImbalanceMonitor::new(Arc::clone(&shared)),
+                shared,
+                response,
+                t1: Tier1::default(),
+                last_sample: None,
+                crosscheck: CrossCheck::new(),
+                flight: FlightRecorder::in_dir(dir.clone()),
+                calls,
+                dir,
+            }
+        }
+
+        fn at(&mut self, t: f64) -> TickOutcome {
+            decide(
+                &self.shared,
+                &mut self.sensor,
+                1_000_000.0 + t,
+                &mut self.response,
+                &mut self.t1,
+                &mut self.last_sample,
+                &mut self.crosscheck,
+                &mut self.flight,
+                &mut self.imbalance,
+            )
+        }
+
+        /// Samples every 0.5 s over [from, to]; the outcome of the last one.
+        fn run(&mut self, from: f64, to: f64) -> TickOutcome {
+            let mut out = TickOutcome::Continue;
+            let mut t = from;
+            while t <= to + 1e-9 {
+                out = self.at(t);
+                if matches!(out, TickOutcome::Shutdown(_)) {
+                    break;
+                }
+                t += POLL_INTERVAL_SEC;
+            }
+            out
+        }
+
+        fn engaged(&self) -> u32 {
+            self.calls.lock().unwrap().engaged
+        }
+        fn released(&self) -> u32 {
+            self.calls.lock().unwrap().released
+        }
+        fn dumps(&self) -> usize {
+            fs::read_dir(&self.dir).map(|d| d.count()).unwrap_or(0)
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// One pin at `amps`, the rest at 5 A: over the threshold, but not an imbalance alarm
+    /// on its own unless the test asks for one.
+    fn one_pin(amps: f64) -> [f64; 6] {
+        [5.0, 5.0, 5.0, amps, 5.0, 5.0]
+    }
+
+    #[test]
+    fn safe_current_never_limits() {
+        let mut g = Guard::new("safe", Settings::default());
+        g.card.amps([8.0; 6]);
+        assert!(matches!(g.run(0.0, 120.0), TickOutcome::Continue));
+        assert_eq!(g.engaged(), 0);
+        assert_eq!(g.shared.live_field(|l| l.status), Status::Ok);
+        assert_eq!(g.shared.live_field(|l| l.max_val), 8.0);
+    }
+
+    #[test]
+    fn tier1_limits_after_exactly_the_sustained_time() {
+        let s = Settings::default(); // 9.5 A for 15 s
+        let mut g = Guard::new("tier1", s.clone());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, s.sustained_seconds_required - 0.5);
+        assert_eq!(g.engaged(), 0, "14.5 s over is not yet 15 s");
+        assert_eq!(g.shared.live_field(|l| l.status), Status::Over);
+        g.at(s.sustained_seconds_required);
+        assert_eq!(g.engaged(), 1, "limited at 15 s");
+        assert_eq!(g.shared.live_field(|l| (l.status, l.engaged, l.engaged_tier)), (Status::Mitigated, true, Some(1)));
+        assert_eq!(g.dumps(), 1, "the minute before the limit went to the flight recorder");
+    }
+
+    #[test]
+    fn a_dip_shorter_than_a_second_does_not_reset_the_timer() {
+        let mut g = Guard::new("dip-short", Settings::default());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, 10.0);
+        g.card.amps(one_pin(5.0));
+        g.run(10.5, 11.0); // 0.5 s clear: under CLEAR_STABLE_SECONDS
+        g.card.amps(one_pin(9.6));
+        g.run(11.5, 15.0);
+        assert_eq!(g.engaged(), 1, "the timer kept running from t=0");
+    }
+
+    #[test]
+    fn a_second_of_clear_current_resets_the_timer() {
+        let mut g = Guard::new("dip-long", Settings::default());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, 10.0);
+        g.card.amps(one_pin(5.0));
+        g.run(10.5, 12.0); // clear for well over a second
+        g.card.amps(one_pin(9.6));
+        g.run(12.5, 27.0);
+        assert_eq!(g.engaged(), 0, "a new 15 s started at 12.5 s");
+        g.at(27.5);
+        assert_eq!(g.engaged(), 1, "and ran out at 27.5 s");
+    }
+
+    #[test]
+    fn hovering_just_under_the_threshold_does_not_reset_the_timer() {
+        // Between threshold - hysteresis and the threshold the pin is not "cleared": a load
+        // that wobbles around 9.5 A must still trip.
+        let mut g = Guard::new("hover", Settings::default());
+        let mut t = 0.0;
+        while t <= 15.0 {
+            g.card.amps(one_pin(if (t * 2.0) as i64 % 2 == 0 { 9.6 } else { 9.5 - CLEAR_HYSTERESIS_AMPS / 2.0 }));
+            g.at(t);
+            t += POLL_INTERVAL_SEC;
+        }
+        assert_eq!(g.engaged(), 1);
+    }
+
+    #[test]
+    fn a_resume_gap_restarts_the_timer() {
+        let mut g = Guard::new("gap", Settings::default());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, 10.0);
+        // The machine slept: the next sample is 20 s later. Not 30 s of overcurrent.
+        g.run(30.0, 44.5);
+        assert_eq!(g.engaged(), 0, "the timer restarted at the first sample after the gap");
+        g.at(45.0);
+        assert_eq!(g.engaged(), 1);
+    }
+
+    #[test]
+    fn a_resume_gap_releases_a_limit() {
+        let mut g = Guard::new("gap-release", Settings::default());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, 15.0);
+        assert_eq!(g.engaged(), 1);
+        g.card.amps(one_pin(5.0));
+        g.at(60.0);
+        assert_eq!(g.released(), 1, "readings across a sleep say nothing about the plug now");
+        assert!(!g.shared.live_field(|l| l.engaged));
+    }
+
+    #[test]
+    fn tier2_limits_sooner() {
+        let s = Settings::default(); // 13 A for 3 s
+        let mut g = Guard::new("tier2", s.clone());
+        g.card.amps(one_pin(13.5));
+        g.run(0.0, s.critical_seconds - 0.5);
+        assert_eq!(g.engaged(), 0);
+        g.run(s.critical_seconds, s.critical_seconds + 0.5);
+        assert_eq!(g.engaged(), 1, "13 A for 3 s, long before tier 1's 15 s");
+    }
+
+    #[test]
+    fn tier3_shuts_down_on_the_second_sample_in_a_row() {
+        let mut g = Guard::new("tier3", Settings::default());
+        g.card.amps(one_pin(16.5));
+        assert!(matches!(g.at(0.0), TickOutcome::Continue), "one sample is not enough");
+        assert!(matches!(g.at(0.5), TickOutcome::Shutdown(r) if r.contains("Tier 3")));
+        assert_eq!(g.dumps(), 0, "the shutdown path writes its own dump, not decide()");
+    }
+
+    #[test]
+    fn a_single_tier3_spike_does_not_shut_down() {
+        let mut g = Guard::new("tier3-spike", Settings::default());
+        for t in 0..20 {
+            g.card.amps(one_pin(if t % 2 == 0 { 16.5 } else { 8.0 }));
+            assert!(!matches!(g.at(t as f64 * 0.5), TickOutcome::Shutdown(_)), "alternating spikes, t={t}");
+        }
+    }
+
+    #[test]
+    fn a_failed_read_changes_nothing() {
+        let mut g = Guard::new("transient", Settings::default());
+        g.card.amps(one_pin(9.6));
+        g.run(0.0, 10.0);
+        g.card.set(Reading::Fails("NACK".into()));
+        assert!(matches!(g.at(10.5), TickOutcome::Transient(_)));
+        assert_eq!(g.shared.live_field(|l| l.max_val), 9.6, "the last good sample stays shown");
+        g.card.amps(one_pin(9.6));
+        g.run(11.0, 15.0);
+        assert_eq!(g.engaged(), 1, "one lost sample neither resets nor stretches the timer");
+    }
+
+    #[test]
+    fn a_sensor_that_stops_answering_is_gone_not_a_shutdown() {
+        let mut g = Guard::new("gone", Settings::default());
+        g.card.amps(one_pin(15.0)); // over tier 2, about to limit
+        g.at(0.0);
+        g.card.set(Reading::NoRail);
+        let outcomes: Vec<_> = (1..=5).map(|i| g.at(i as f64 * 0.5)).collect();
+        assert!(outcomes[..4].iter().all(|o| matches!(o, TickOutcome::Transient(_))));
+        assert!(matches!(&outcomes[4], TickOutcome::Gone(_)), "five bad samples: the sensor is gone");
+        assert!(!outcomes.iter().any(|o| matches!(o, TickOutcome::Shutdown(_))));
+    }
+
+    #[test]
+    fn imbalance_acts_like_tier1_only_when_set_to_act() {
+        let unbalanced = [8.0, 8.0, 8.0, 8.0, 8.0, 1.0]; // all under 9.5 A, 7 A apart
+        for (mode, limits) in [(ImbalanceResponse::Warn, false), (ImbalanceResponse::Act, true)] {
+            let s = Settings { imbalance_response: mode, ..Settings::default() };
+            let mut g = Guard::new(&format!("imbalance-{limits}"), s.clone());
+            g.card.amps(unbalanced);
+            g.run(0.0, s.imbalance_sustained_seconds + 1.0);
+            assert_eq!(g.engaged() > 0, limits, "{mode:?}");
+        }
     }
 }

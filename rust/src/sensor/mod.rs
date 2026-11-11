@@ -259,9 +259,125 @@ fn open_bus() -> Result<(Box<dyn I2cBus>, CardInfo), String> {
     Err("no I2C backend for this platform".into())
 }
 
+/// A pretend card for the tests of the code that reads it: the chip's pin block is served
+/// from whatever the test last set, so the monitor loop runs without hardware.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// What the next pin read gives: each pin's amps (all at 12.1 V), or a failed read.
+    #[derive(Clone, Debug)]
+    pub enum Reading {
+        Amps([f64; 6]),
+        Fails(String),
+        /// A block the chip really returns when it is not reporting: every pin at 0 V.
+        NoRail,
+    }
+
+    /// The card's state, shared between the test and the sensor it hands out.
+    #[derive(Clone)]
+    pub struct Card(Arc<Mutex<Reading>>);
+
+    impl Card {
+        pub fn new(amps: [f64; 6]) -> Self {
+            Card(Arc::new(Mutex::new(Reading::Amps(amps))))
+        }
+        pub fn set(&self, r: Reading) {
+            *self.0.lock().unwrap() = r;
+        }
+        pub fn amps(&self, amps: [f64; 6]) {
+            self.set(Reading::Amps(amps));
+        }
+        pub fn sensor(&self) -> PinSensor {
+            PinSensor {
+                bus: Box::new(Bus(Arc::clone(&self.0))),
+                info: CardInfo { gpu_name: "Test GPU".into(), subsystem: 0x89E3_1043, model: "ROG Astral RTX 5090 OC" },
+                failures: 0,
+            }
+        }
+    }
+
+    struct Bus(Arc<Mutex<Reading>>);
+
+    impl I2cBus for Bus {
+        fn read(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), String> {
+            if reg != PIN_REG || buf.len() != PIN_DATA_SIZE {
+                return Err(format!("the fake card has nothing at 0x{reg:02X}"));
+            }
+            let block = match &*self.0.lock().unwrap() {
+                Reading::Amps(a) => encode_pin_block(&a.map(|amps| (12.1, amps))),
+                Reading::NoRail => encode_pin_block(&[(0.0, 0.0); 6]),
+                Reading::Fails(e) => return Err(e.clone()),
+            };
+            buf.copy_from_slice(&block);
+            Ok(())
+        }
+    }
+
+    /// The inverse of `parse_pin_block`: pins 1..6 as (volts, amps), stored in reverse order.
+    pub fn encode_pin_block(pins: &[(f64, f64); 6]) -> [u8; PIN_DATA_SIZE] {
+        let mut raw = [0u8; PIN_DATA_SIZE];
+        for (i, (volts, amps)) in pins.iter().enumerate() {
+            let base = (5 - i) * 4;
+            raw[base..base + 2].copy_from_slice(&((volts * 1000.0).round() as u16).to_be_bytes());
+            raw[base + 2..base + 4].copy_from_slice(&((amps * 1000.0).round() as u16).to_be_bytes());
+        }
+        raw
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fake::{encode_pin_block, Card, Reading};
     use super::*;
+
+    #[test]
+    fn the_fake_card_encodes_like_the_chip() {
+        let pins = [(12.1, 1.0), (12.0, 2.5), (11.9, 0.0), (12.05, 9.876), (12.1, 15.999), (12.2, 7.0)];
+        let parsed = parse_pin_block(&encode_pin_block(&pins));
+        for (i, (pin, v, a)) in parsed.iter().enumerate() {
+            assert_eq!(*pin as usize, i + 1);
+            assert!((v - pins[i].0).abs() < 1e-9 && (a - pins[i].1).abs() < 1e-9, "pin {pin}: {v} V {a} A");
+        }
+    }
+
+    #[test]
+    fn a_failed_read_is_transient_until_five_in_a_row() {
+        let card = Card::new([5.0; 6]);
+        let mut s = card.sensor();
+        assert_eq!(s.read_pins().unwrap().len(), 6);
+        card.set(Reading::Fails("NACK".into()));
+        for n in 1..MAX_CONSECUTIVE_FAILURES {
+            assert!(matches!(s.read_pins(), Err(ReadError::Transient(_))), "failure {n} is transient");
+        }
+        let gone = s.read_pins();
+        assert!(matches!(&gone, Err(ReadError::Gone(m)) if m.contains("5 consecutive")), "{gone:?}");
+    }
+
+    #[test]
+    fn one_good_read_resets_the_failure_count() {
+        let card = Card::new([5.0; 6]);
+        let mut s = card.sensor();
+        for _ in 0..3 {
+            card.set(Reading::Fails("NACK".into()));
+            for _ in 1..MAX_CONSECUTIVE_FAILURES {
+                assert!(matches!(s.read_pins(), Err(ReadError::Transient(_))));
+            }
+            card.amps([5.0; 6]);
+            assert!(s.read_pins().is_ok(), "a good read in between: never Gone");
+        }
+    }
+
+    #[test]
+    fn implausible_samples_count_as_failures() {
+        let card = Card::new([5.0; 6]);
+        let mut s = card.sensor();
+        card.amps([5.0, 5.0, 5.0, 60.0, 5.0, 5.0]); // past PLAUSIBLE_MAX_AMPS
+        assert!(matches!(s.read_pins(), Err(ReadError::Transient(m)) if m.contains("implausible")));
+        card.set(Reading::NoRail);
+        assert!(matches!(s.read_pins(), Err(ReadError::Transient(m)) if m.contains("12 V rail")));
+    }
 
     #[test]
     fn pin_block_is_reverse_order_be() {
