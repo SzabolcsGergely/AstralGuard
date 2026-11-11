@@ -16,7 +16,7 @@ depends=('gcc-libs' 'glibc' 'openssl' 'libxkbcommon' 'wayland' 'libglvnd'
 makedepends=('cargo' 'pkgconf')
 optdepends=('nvidia-utils: NVML and NVAPI, for limiting the GPU and for the overclock')
 install=astralguard.install
-options=('!lto')
+options=('!lto' '!debug')
 source=("AstralGuard-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

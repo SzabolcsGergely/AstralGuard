@@ -141,6 +141,10 @@ jobs:
           chown -R builder "$build"
           su builder -c "cd $build && makepkg --noconfirm --nodeps"
           cp "$build"/*.pkg.tar.zst dist/
+          # One package and nothing else: everything in dist/ is published with a release
+          # (makepkg's empty -debug package once was, before the PKGBUILD said '!debug').
+          ls dist/
+          test "$(ls dist/*.pkg.tar.zst | wc -l)" -eq 1
       - name: Install test
         run: |
           pacman -U --noconfirm dist/*.pkg.tar.zst
