@@ -849,7 +849,11 @@ fn setting_value(s: &Settings, key: &str) -> String {
 }
 
 fn log_tail(max_bytes: u64) -> String {
-    let Some(path) = logger::path() else { return String::new() };
+    logger::path().map(|p| log_tail_of(&p, max_bytes)).unwrap_or_default()
+}
+
+/// The last `max_bytes` of the log, from the first whole line.
+fn log_tail_of(path: &std::path::Path, max_bytes: u64) -> String {
     let Ok(mut f) = fs::File::open(path) else { return String::new() };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(max_bytes);
@@ -1311,5 +1315,174 @@ mod tests {
         assert_eq!(f.opened.load(Ordering::SeqCst), 0);
         f.shared.update(|l| l.card_subsystem = Some(0x12345678));
         assert!(f.shared.overclock_managed().is_empty(), "another card's marker says nothing here");
+    }
+}
+
+/// The dashboard's requests, as the IPC thread hands them to the service.
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn quiet() -> Arc<Shared> {
+        Shared::new(Settings::default(), None, true)
+    }
+
+    fn notices(shared: &Shared) -> Vec<String> {
+        lock(&shared.state).notices.iter().map(|n| n.message.clone()).collect()
+    }
+
+    fn live(shared: &Shared) -> Live {
+        let Response::Live { live } = shared.handle(Request::Live) else { panic!("not a live answer") };
+        *live
+    }
+
+    #[test]
+    fn pause_and_resume_show_in_the_live_state() {
+        let shared = quiet();
+        assert!(!live(&shared).paused, "a new service protects");
+        assert!(matches!(shared.handle(Request::SetPaused { paused: true }), Response::Ok));
+        assert!(live(&shared).paused);
+        assert!(shared.paused.load(Ordering::Relaxed), "the monitor loop reads this flag");
+        shared.handle(Request::SetPaused { paused: false });
+        assert!(!live(&shared).paused);
+    }
+
+    #[test]
+    fn check_answers_without_changing_anything() {
+        let shared = quiet();
+        let weaker = SettingsPatch { threshold_amps: Some(11.0), ..Default::default() };
+        let Response::Check { errors, warnings } = shared.handle(Request::Check { changes: weaker }) else {
+            panic!("not a check answer")
+        };
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "a higher threshold weakens protection: {warnings:?}");
+        let bad = SettingsPatch { critical_seconds: Some(0.0), ..Default::default() };
+        let Response::Check { errors, .. } = shared.handle(Request::Check { changes: bad }) else { panic!() };
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(shared.settings(), Settings::default(), "a check is only a question");
+    }
+
+    #[test]
+    fn an_invalid_change_is_refused_whole() {
+        let shared = quiet();
+        let patch = SettingsPatch { threshold_amps: Some(9.0), critical_seconds: Some(0.0), ..Default::default() };
+        let Response::Applied { failures } = shared.handle(Request::Apply { changes: patch }) else { panic!() };
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(shared.settings(), Settings::default(), "not even the valid half is applied");
+    }
+
+    #[test]
+    fn an_applied_change_takes_effect_even_when_it_cannot_be_saved() {
+        let shared = quiet();
+        let patch = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        let failures = shared.apply_with(&patch, &|_, keys| {
+            assert_eq!(keys, ["threshold_amps"]);
+            Err(std::io::Error::other("disk full"))
+        });
+        assert_eq!(failures, ["not saved to config.ini (disk full)"]);
+        assert_eq!(shared.settings().threshold_amps, 9.0, "the ladder uses the new value now");
+    }
+
+    #[test]
+    fn switching_the_response_mode_says_what_overcurrent_now_does() {
+        let shared = quiet();
+        shared.update(|l| l.mitigation = "ready".into());
+        let to = |m| SettingsPatch { response_mode: Some(m), ..Default::default() };
+        shared.handle(Request::Apply { changes: to(ResponseMode::ShutdownOnly) });
+        shared.handle(Request::Apply { changes: to(ResponseMode::Tiered) });
+        shared.update(|l| l.mitigation = "NVML not found".into());
+        shared.handle(Request::Apply { changes: to(ResponseMode::ShutdownOnly) });
+        shared.handle(Request::Apply { changes: to(ResponseMode::Tiered) });
+        let n = notices(&shared);
+        assert_eq!(n.len(), 4, "{n:?}");
+        assert!(n[0].contains("without limiting the GPU first"), "{}", n[0]);
+        assert!(n[1].contains("slow the GPU down first"), "{}", n[1]);
+        assert!(n[3].contains("cannot be limited right now (NVML not found)"), "{}", n[3]);
+        assert!(n[3].contains("still means shutdown"), "{}", n[3]);
+    }
+
+    #[test]
+    fn switching_the_imbalance_response_says_what_an_imbalance_now_does() {
+        let shared = quiet();
+        let to = |r| SettingsPatch { imbalance_response: Some(r), ..Default::default() };
+        shared.update(|l| l.mitigation = "ready".into());
+        shared.handle(Request::Apply { changes: to(ImbalanceResponse::Act) });
+        shared.handle(Request::Apply { changes: to(ImbalanceResponse::Warn) });
+        shared.update(|l| l.mitigation = "not elevated".into());
+        shared.handle(Request::Apply { changes: to(ImbalanceResponse::Act) });
+        let n = notices(&shared);
+        assert_eq!(n.len(), 3, "{n:?}");
+        assert!(n[0].ends_with("(limit the GPU first)."), "{}", n[0]);
+        assert_eq!(n[1], "A pin imbalance now only warns.");
+        assert!(n[2].ends_with("(shutdown-only)."), "no limiter: an imbalance shuts down: {}", n[2]);
+    }
+
+    #[test]
+    fn an_unchanged_mode_says_nothing() {
+        let shared = quiet();
+        let same = SettingsPatch { response_mode: Some(ResponseMode::Tiered), ..Default::default() };
+        shared.handle(Request::Apply { changes: same });
+        assert!(notices(&shared).is_empty());
+    }
+
+    #[test]
+    fn defaults_are_the_built_in_ones_whatever_is_set() {
+        let shared = Shared::new(Settings { threshold_amps: 8.0, ..Default::default() }, None, true);
+        let Response::Settings { settings } = shared.handle(Request::Defaults) else { panic!() };
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn events_returns_only_the_notices_after_since() {
+        let shared = quiet();
+        shared.notify("t", "first");
+        shared.notify("t", "second");
+        let Response::Events { notices } = shared.handle(Request::Events { since: 0 }) else { panic!() };
+        assert_eq!(notices.len(), 2);
+        let Response::Events { notices } = shared.handle(Request::Events { since: notices[0].seq }) else { panic!() };
+        assert_eq!(notices.iter().map(|n| n.message.as_str()).collect::<Vec<_>>(), ["second"]);
+    }
+
+    #[test]
+    fn fast_imu_polling_is_capped_and_can_be_turned_off() {
+        let shared = quiet();
+        shared.handle(Request::ImuFast { seconds: 1.0e6 });
+        let left = shared.fast_until() - crate::now();
+        assert!(left > SAG_FAST_MAX_SECONDS - 5.0 && left <= SAG_FAST_MAX_SECONDS, "{left}");
+        shared.handle(Request::ImuFast { seconds: 0.0 });
+        assert_eq!(shared.fast_until(), 0.0);
+        shared.handle(Request::ImuFast { seconds: -5.0 });
+        assert_eq!(shared.fast_until(), 0.0, "a negative time is off, not the past");
+    }
+
+    #[test]
+    fn exit_and_calibrate_only_raise_their_flags() {
+        let shared = quiet();
+        assert!(matches!(shared.handle(Request::CalibrateSag), Response::Ok));
+        assert!(shared.calibrate_request.load(Ordering::Relaxed));
+        assert!(!shared.stop.load(Ordering::Relaxed));
+        assert!(matches!(shared.handle(Request::Exit), Response::Ok));
+        assert!(shared.stop.load(Ordering::Relaxed), "the service loop exits on this");
+    }
+
+    #[test]
+    fn a_flight_dump_name_outside_the_log_folder_is_refused() {
+        let shared = quiet();
+        for name in ["../../etc/shadow", "flight_x/../../config.ini", "astralguard.log"] {
+            let Response::Error { message } = shared.handle(Request::ReadFlight { name: name.into() }) else {
+                panic!("{name} was read")
+            };
+            assert_eq!(message, "no such flight dump");
+        }
+    }
+
+    #[test]
+    fn the_log_tail_starts_at_a_whole_line() {
+        let path = std::env::temp_dir().join(format!("ag-logtail-{}.log", std::process::id()));
+        fs::write(&path, "line one\nline two\nline three\n").unwrap();
+        assert_eq!(log_tail_of(&path, 1000), "line one\nline two\nline three\n", "all of a short log");
+        assert_eq!(log_tail_of(&path, 15), "line three\n", "the cut line is dropped");
+        assert_eq!(log_tail_of(&path.with_extension("missing"), 100), "");
+        let _ = fs::remove_file(&path);
     }
 }
