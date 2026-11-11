@@ -23,7 +23,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
   src/sensor/             IT8915 per-pin + accelerometer reads: mod.rs (ASTRAL_CARDS, parsing, plausibility),
                           nvapi.rs (Windows), i2cdev.rs (Linux),
                           detect.rs (Linux sensor scan: probe --detect / dashboard Scan)
-  src/mitigation.rs       NVML clock lock + power limit, and putting them back
+  src/mitigation.rs       NVML clock lock + power limit, and putting them back; mitigation_hw_test.rs = the
+                          opt-in real-card test (root, ASTRALGUARD_HW_TEST=1)
   src/nvapi.rs            the one shared NVAPI binding (Windows pin reads, V/F curve calls), one lock;
                           loaded once, never unloaded, Initialize again on every Windows sensor
                           connect (recovers after a driver reset)
