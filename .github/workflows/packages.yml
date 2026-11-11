@@ -95,6 +95,9 @@ jobs:
       matrix:
         image: ["debian:bookworm", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:latest"]
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
       - uses: actions/download-artifact@v8
         with:
           name: package-deb
@@ -111,6 +114,8 @@ jobs:
           test -f /lib/systemd/system/astralguard.service || test -f /usr/lib/systemd/system/astralguard.service
           # Every shared library resolves (the binary needs no display to start up to here).
           if ldd /usr/bin/astralguard | grep 'not found'; then exit 1; fi
+          # And every library it loads at runtime (the window's), which ldd cannot see.
+          sh .github/scripts/runtime-libs.sh
           astralguard status || true
           apt-get remove -y astralguard
 
@@ -146,3 +151,30 @@ jobs:
           name: package-arch
           path: dist/*.pkg.tar.zst
           if-no-files-found: error
+
+  # In a clean image, not the build one: that one already has the window's libraries, so a
+  # dependency the PKGBUILD forgot would go unnoticed there.
+  arch-test:
+    name: Install Arch package on archlinux:base
+    needs: arch
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-arch
+          path: dist
+      - name: Install, check, remove
+        run: |
+          pacman -Syu --noconfirm
+          pacman -U --noconfirm dist/*.pkg.tar.zst
+          getent group astralguard
+          test -x /usr/bin/astralguard
+          test -f /usr/lib/systemd/system/astralguard.service
+          if ldd /usr/bin/astralguard | grep 'not found'; then exit 1; fi
+          sh .github/scripts/runtime-libs.sh
+          astralguard status || true
+          pacman -R --noconfirm astralguard

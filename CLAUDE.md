@@ -50,7 +50,8 @@ rust/                     the whole program: one crate, one binary (astralguard)
   .cargo/config.toml      Windows GNU toolchain linker settings (see below)
   build.ps1               Windows GNU build helper
 .github/workflows/        ci.yml (checks), packages.yml (installers), release.yml (tags), scheduled.yml (weekly)
-.github/scripts/          safety-rules.sh (the mechanical checks of the safety rules)
+.github/scripts/          safety-rules.sh (the mechanical checks of the safety rules), runtime-libs.sh
+                          (the packages install every library the binary loads at runtime)
 .github/ISSUE_TEMPLATE/   bug report, card report, feature request forms; PULL_REQUEST_TEMPLATE.md
 docs/screenshots/         README images, rendered with --screenshot
 ```
@@ -154,6 +155,13 @@ cargo test
     or TLS crate in the service-only build and no network code outside `src/ui/` (2),
     shutdown by absolute path (4), the V/F write only from `overclock/` (9), and only the
     checked commands on the XBAR / SYS channel (10). Changing a check goes with changing its rule.
+  - **Package dependencies** (`.github/scripts/runtime-libs.sh`, in `packages.yml`): after
+    installing the `.deb` (Debian 12, Ubuntu 22.04 / 24.04 / latest) and the Arch package
+    (a clean `archlinux:base`, not the build image), every library named in the binary must
+    be installed. The window's libraries (Wayland, X11, EGL / GL, xkbcommon) are loaded at
+    runtime, so `ldd`, makepkg and dpkg-shlibdeps miss them: a new one goes into both the
+    PKGBUILD's `depends` and `[package.metadata.deb] depends`. The NVIDIA driver's
+    libraries are skipped (optional).
   - **cargo deny** (`rust/deny.toml`): security advisories, licences (a new licence is a
     decision), crate sources.
   - **Screenshots and layout**: every tab rendered from the demo on Linux (software OpenGL,
