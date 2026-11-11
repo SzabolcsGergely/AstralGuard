@@ -47,6 +47,25 @@ impl Supervised {
     }
 }
 
+/// What the watchdog does when a child exits.
+#[derive(Debug, PartialEq)]
+enum AfterExit {
+    /// The service stopped on purpose (exit, a shutdown it fired, another guard running).
+    StopEverything,
+    /// The dashboard was closed by its user: the service keeps running.
+    StayClosed,
+    /// Anything else is a crash.
+    Restart,
+}
+
+fn after_exit(mode: &str, code: Option<i32>) -> AfterExit {
+    match (mode, code) {
+        ("service", Some(0)) => AfterExit::StopEverything,
+        (_, Some(0)) => AfterExit::StayClosed,
+        _ => AfterExit::Restart,
+    }
+}
+
 pub fn describe_exit(code: Option<i32>) -> String {
     let Some(code) = code else { return "killed by a signal".into() };
     let c = code as u32;
@@ -120,7 +139,7 @@ pub fn run(args: &[String]) -> i32 {
         }
 
         if let Some(code) = poll(&mut service) {
-            if code == Some(0) {
+            if after_exit(service.mode, code) == AfterExit::StopEverything {
                 logger::info(format!(
                     "Service exited cleanly after {:.1} min; watchdog stopping.",
                     service.started.elapsed().as_secs_f64() / 60.0
@@ -134,7 +153,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         if let Some(sup) = ui.as_mut() {
             if let Some(code) = poll(sup) {
-                if code == Some(0) {
+                if after_exit(sup.mode, code) == AfterExit::StayClosed {
                     logger::info("UI closed; the service keeps running.");
                     sup.restart_at = None;
                 } else {
@@ -268,5 +287,71 @@ mod job {
                 Ok(())
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_service_exit_stops_everything_and_anything_else_restarts() {
+        assert_eq!(after_exit("service", Some(0)), AfterExit::StopEverything);
+        assert_eq!(after_exit("service", Some(1)), AfterExit::Restart);
+        assert_eq!(after_exit("service", Some(101)), AfterExit::Restart, "a panic is a crash");
+        assert_eq!(after_exit("service", None), AfterExit::Restart, "killed by a signal");
+        assert_eq!(after_exit("ui", Some(0)), AfterExit::StayClosed, "the dashboard closed by its user");
+        assert_eq!(after_exit("ui", Some(101)), AfterExit::Restart);
+        assert_eq!(after_exit("ui", None), AfterExit::Restart);
+    }
+
+    /// The restart delay `schedule_restart` set, in whole seconds.
+    fn delay(sup: &Supervised) -> u64 {
+        let d = sup.restart_at.unwrap().saturating_duration_since(Instant::now());
+        (d.as_secs_f64() + 0.5) as u64
+    }
+
+    #[test]
+    fn restarts_back_off_while_it_keeps_failing() {
+        let mut sup = Supervised::new("service");
+        let mut delays = Vec::new();
+        for _ in 0..6 {
+            sup.started = Instant::now(); // crashed straight after starting
+            schedule_restart(&mut sup, Some(101));
+            delays.push(delay(&sup));
+        }
+        assert_eq!(delays, [5, 10, 30, 60, 60, 60], "stays at the last value, never gives up");
+    }
+
+    #[test]
+    fn a_long_healthy_run_resets_the_backoff() {
+        let mut sup = Supervised::new("service");
+        for _ in 0..3 {
+            schedule_restart(&mut sup, Some(1));
+        }
+        assert_eq!(delay(&sup), 30);
+        let Some(long_ago) = Instant::now().checked_sub(Duration::from_secs(STABLE_RUN_SEC)) else {
+            return; // a clock this young cannot go back 10 minutes; nothing to test
+        };
+        sup.started = long_ago;
+        schedule_restart(&mut sup, Some(1));
+        assert_eq!(delay(&sup), 5, "a crash after 10 minutes of running starts the backoff over");
+    }
+
+    #[test]
+    fn the_restart_tells_the_service_why() {
+        let mut sup = Supervised::new("service");
+        schedule_restart(&mut sup, Some(0xC000_0005u32 as i32));
+        let why = sup.restart_reason.as_deref().unwrap();
+        assert!(why.starts_with("exit code 0xC0000005 (access violation) after 0.0 h"), "{why}");
+    }
+
+    #[test]
+    fn exit_codes_read_like_their_cause() {
+        assert_eq!(describe_exit(None), "killed by a signal");
+        assert_eq!(describe_exit(Some(101)), "exit code 0x00000065 (panic)");
+        assert_eq!(describe_exit(Some(0xC000_00FDu32 as i32)), "exit code 0xC00000FD (stack overflow)");
+        assert_eq!(describe_exit(Some(-1)), "exit code 0xFFFFFFFF", "could not start: no name");
+        assert_eq!(describe_exit(Some(3)), "exit code 0x00000003");
     }
 }
