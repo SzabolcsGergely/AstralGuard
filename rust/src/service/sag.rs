@@ -97,10 +97,13 @@ pub struct SagMonitor {
     day: Option<String>,
     day_samples: Vec<(f64, f64)>,
     samples_since_minute: usize,
+    /// sag_history.csv; None for a quiet service, which writes nothing.
+    history: Option<std::path::PathBuf>,
 }
 
 impl SagMonitor {
     pub fn new(shared: Arc<Shared>, baseline: Option<SagBaseline>) -> Self {
+        let shared_quiet = shared.quiet;
         SagMonitor {
             shared,
             baseline: baseline.map(|b| unit(b.vector)),
@@ -120,6 +123,7 @@ impl SagMonitor {
             calibrating: None,
             day: None,
             day_samples: Vec::new(),
+            history: (!shared_quiet).then(history_path),
             samples_since_minute: 0,
         }
     }
@@ -470,12 +474,12 @@ impl SagMonitor {
     /// Append the day's medians to sag_history.csv. Returns the median deviation.
     fn write_history_row(&mut self) -> Option<f64> {
         let samples = std::mem::take(&mut self.day_samples);
-        if samples.len() < 10 || self.baseline.is_none() || self.shared.quiet {
+        let path = self.history.clone()?;
+        if samples.len() < 10 || self.baseline.is_none() {
             return None;
         }
         let median_dev = median(samples.iter().map(|s| s.0).collect());
         let median_off = median(samples.iter().map(|s| s.1).collect());
-        let path = history_path();
         let mut rows: Vec<String> = fs::read_to_string(&path)
             .map(|t| t.lines().skip(1).filter(|r| !r.trim().is_empty()).map(String::from).collect())
             .unwrap_or_default();
@@ -495,7 +499,8 @@ impl SagMonitor {
 
     /// Warn when sag grew by DRIFT_DEGREES against a day 7-30 days back.
     fn check_drift(&self, current_dev: f64) {
-        let Ok(text) = fs::read_to_string(history_path()) else { return };
+        let Some(path) = &self.history else { return };
+        let Ok(text) = fs::read_to_string(path) else { return };
         let key = self.baseline_key();
         let today = Local::now().date_naive();
         let oldest = text.lines().skip(1).find_map(|row| {
@@ -624,6 +629,116 @@ mod scenario_tests {
         fn deg(&self) -> Option<f64> {
             self.shared.live_field(|l| l.sag_deg)
         }
+    }
+
+    /// The rig's sag history in a file of its own; the test removes it at the end.
+    fn history(r: &mut Rig, name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("ag-sag-{name}-{}.csv", std::process::id()));
+        let _ = fs::remove_file(&p);
+        r.sag.history = Some(p.clone());
+        p
+    }
+
+    const LEVEL_KEY: &str = "\"0.00000,0.00000,1.00000\"";
+
+    fn days_ago(n: i64) -> String {
+        (Local::now().date_naive() - chrono::Duration::days(n)).format("%Y-%m-%d").to_string()
+    }
+
+    fn creep_notices(r: &Rig) -> usize {
+        r.shared.state.lock().unwrap().notices.iter().filter(|n| n.message.contains("creeping")).count()
+    }
+
+    #[test]
+    fn a_quiet_service_keeps_no_history() {
+        let r = Rig::new(Rig::level_baseline());
+        assert!(r.sag.history.is_none(), "tests and dry runs never touch sag_history.csv");
+    }
+
+    #[test]
+    fn a_days_minutes_become_one_history_row_when_the_date_changes() {
+        let mut r = Rig::new(Rig::level_baseline());
+        let path = history(&mut r, "rollover");
+        r.card.gravity(Some(tilted(0.5)));
+        r.run(11.0 * 60.0);
+        assert!(!path.exists(), "nothing is written during the day");
+        r.sag.day = Some("2000-01-01".into()); // the next sample is on another day
+        r.run(0.5);
+        let text = fs::read_to_string(&path).unwrap();
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[0], "date,sag_deg,off_level_deg,minutes,baseline");
+        assert_eq!(rows.len(), 2);
+        let parts: Vec<&str> = rows[1].splitn(5, ',').collect();
+        assert_eq!(parts[0], "2000-01-01");
+        assert!((parts[1].parse::<f64>().unwrap() - 0.5).abs() < 0.01, "the median sag: {}", parts[1]);
+        assert!(parts[3].parse::<usize>().unwrap() >= 10, "one sample per minute");
+        assert_eq!(parts[4], LEVEL_KEY, "tied to the baseline it was measured against");
+        assert!(r.sag.day_samples.is_empty(), "the new day starts empty");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn under_ten_minutes_or_no_baseline_writes_no_row() {
+        let mut r = Rig::new(Rig::level_baseline());
+        let path = history(&mut r, "short");
+        r.card.gravity(Some(tilted(0.5)));
+        r.run(5.0 * 60.0);
+        r.sag.close();
+        assert!(!path.exists(), "five minutes is not a day's median");
+
+        let mut r = Rig::new(None);
+        let path = history(&mut r, "nobaseline");
+        r.sag.day_samples = vec![(0.5, 0.0); 30];
+        r.sag.close();
+        assert!(!path.exists(), "sag means nothing without a baseline");
+    }
+
+    #[test]
+    fn close_flushes_the_partial_day_and_history_keeps_the_last_400_rows() {
+        let mut r = Rig::new(Rig::level_baseline());
+        let path = history(&mut r, "keep");
+        let old: Vec<String> = (0..405).map(|i| format!("old-{i},0.100,0.000,600,{LEVEL_KEY}")).collect();
+        fs::write(&path, format!("date,sag_deg,off_level_deg,minutes,baseline\n{}\n", old.join("\n"))).unwrap();
+        r.sag.day = Some("2026-11-12".into());
+        r.sag.day_samples = vec![(0.4, 0.1); 12];
+        r.sag.close();
+        let text = fs::read_to_string(&path).unwrap();
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), HISTORY_KEEP_ROWS);
+        assert!(rows[0].starts_with("old-6,"), "the oldest rows go first: {}", rows[0]);
+        assert!(rows[399].starts_with("2026-11-12,0.400,0.100,12,"), "{}", rows[399]);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// History rows, then a minute of the card at `now_deg`: the first full minute checks drift.
+    fn drift_after(name: &str, rows: &[String], now_deg: f64) -> usize {
+        let mut r = Rig::new(Rig::level_baseline());
+        let path = history(&mut r, name);
+        fs::write(&path, format!("date,sag_deg,off_level_deg,minutes,baseline\n{}\n", rows.join("\n"))).unwrap();
+        r.card.gravity(Some(tilted(now_deg)));
+        r.run(65.0);
+        let _ = fs::remove_file(&path);
+        creep_notices(&r)
+    }
+
+    #[test]
+    fn sag_growing_against_a_day_7_to_30_days_back_warns_that_it_is_creeping() {
+        let rows = vec![
+            format!("{},0.100,0.000,600,{LEVEL_KEY}", days_ago(40)), // too old to compare with
+            format!("{},0.200,0.000,600,{LEVEL_KEY}", days_ago(20)),
+            format!("{},0.450,0.000,600,{LEVEL_KEY}", days_ago(2)),
+        ];
+        assert_eq!(drift_after("creep", &rows, 0.6), 1, "0.2 -> 0.6 against 20 days back");
+    }
+
+    #[test]
+    fn no_creep_warning_below_the_drift_or_outside_the_window_or_baseline() {
+        let near = |deg: f64, days: i64, key: &str| vec![format!("{},{deg:.3},0.000,600,{key}", days_ago(days))];
+        assert_eq!(drift_after("small", &near(0.4, 10, LEVEL_KEY), 0.6), 0, "0.2° more is under DRIFT_DEGREES");
+        assert_eq!(drift_after("recent", &near(0.0, 3, LEVEL_KEY), 0.6), 0, "3 days is too recent");
+        assert_eq!(drift_after("old", &near(0.0, 45, LEVEL_KEY), 0.6), 0, "45 days is outside the window");
+        let other = "\"0.10000,0.00000,0.99499\"";
+        assert_eq!(drift_after("other", &near(0.0, 10, other), 0.6), 0, "another baseline is not comparable");
     }
 
     #[test]
