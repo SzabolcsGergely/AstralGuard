@@ -138,9 +138,15 @@ sudo usermod -aG astralguard $USER    # then log out and back in
 Or build it yourself with [`rust/packaging/linux/arch/PKGBUILD`](rust/packaging/linux/arch/PKGBUILD)
 (`makepkg -si`).
 
-> **Linux status: experimental.** Verified on a ROG Astral RTX 5090 OC (driver 620.70). Run
-> `sudo astralguard probe` once and check that it prints about 12 V and sensible currents on
-> every pin. If the pins don't read, see [Troubleshooting](#troubleshooting).
+> **Linux status: tested.** Used daily on a ROG Astral RTX 5090 OC with CachyOS (kernel 7.3,
+> NVIDIA 620.70 open kernel module, KDE Plasma on Wayland): the pin monitor over SMBus and the
+> sensor scan, the guard as a systemd service, the tray and dashboard, and the whole overclock
+> (V/F curve, power limit, memory, XBAR / SYS, re-applied after a resume from sleep). The
+> packages are built and install-tested in CI. On a new install, run `sudo astralguard probe`
+> once and check that it prints about 12 V and sensible currents on every pin; if the pins
+> don't read, see [Troubleshooting](#troubleshooting). On Wayland, **Always on top** is not
+> offered: Wayland lets no program keep its own window above others (on KDE, the title bar's
+> **More Actions → Keep Above Others** does it).
 
 ### Updating and uninstalling
 
