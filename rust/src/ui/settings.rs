@@ -352,9 +352,13 @@ impl SettingsView {
                     });
                     l.add_space(w::GAP);
                     w::card(l, t, "What this does", |ui| {
-                        for line in self.ladder_text(&base) {
+                        // Spaced between lines only: with Linux's Pin sensor card below and a banner
+                        // showing, the left column had 1 px too little height.
+                        for (i, line) in self.ladder_text(&base).into_iter().enumerate() {
+                            if i > 0 {
+                                ui.add_space(1.0);
+                            }
                             ui.add(egui::Label::new(RichText::new(line).color(t.muted()).size(12.5)).wrap());
-                            ui.add_space(2.0);
                         }
                     });
                     // Linux only: on Windows the driver addresses the pin monitor directly.
