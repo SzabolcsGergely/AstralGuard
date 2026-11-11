@@ -140,6 +140,8 @@ impl Theme {
 }
 
 pub const FAMILY_SEMIBOLD: &str = "semibold";
+/// egui's built-in monospace font, the last resort for glyphs the UI fonts lack.
+const FALLBACK_FONT: &str = "Hack";
 
 pub fn semibold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(FAMILY_SEMIBOLD.into()))
@@ -190,6 +192,14 @@ pub fn install_fonts(ctx: &egui::Context) {
         }
     }
     let _ = base_mono;
+    // egui's own UI font (Ubuntu Light) has no arrows: "→" (the Sag hints) drew as an empty
+    // box wherever Segoe UI is missing, i.e. on Linux. Its monospace font, Hack, has them, so it
+    // goes last in the text families as the fallback for any glyph the others lack.
+    for family in [fonts.families.get_mut(&FontFamily::Proportional), Some(&mut semibold)].into_iter().flatten() {
+        if !family.iter().any(|f| f == FALLBACK_FONT) {
+            family.push(FALLBACK_FONT.into());
+        }
+    }
     fonts.families.insert(FontFamily::Name(FAMILY_SEMIBOLD.into()), semibold);
     ctx.set_fonts(fonts);
 }
@@ -275,4 +285,49 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
     // the same style whatever egui thinks the OS theme is
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     ctx.set_style_of(egui::Theme::Light, style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every non-ASCII character the program shows (outside comments) has a glyph in the text
+    /// fonts as installed here, so none draws as an empty box. On Linux that is egui's own fonts
+    /// alone: Segoe UI is Windows-only, so this checks the weakest set.
+    #[test]
+    fn every_symbol_in_the_ui_has_a_glyph() {
+        let mut used = std::collections::BTreeSet::new();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    for line in std::fs::read_to_string(&path).unwrap().lines() {
+                        let code = line.trim_start();
+                        if code.starts_with("//") {
+                            continue;
+                        }
+                        let code = code.split(" // ").next().unwrap_or(code);
+                        used.extend(code.chars().filter(|c| !c.is_ascii()));
+                    }
+                }
+            }
+        }
+        assert!(used.contains(&'°'), "the scan found the UI's symbols");
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        // One frame applies the fonts; its texture upload is not needed here.
+        ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
+        let missing: Vec<String> = ctx.fonts_mut(|f| {
+            used.iter()
+                .filter(|&&c| !f.has_glyph(&FontId::proportional(14.0), c) || !f.has_glyph(&semibold(14.0), c))
+                .map(|c| format!("U+{:04X} {c}", *c as u32))
+                .collect()
+        });
+        assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
 }
