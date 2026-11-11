@@ -2,12 +2,13 @@
 # job (.github/scripts/coverage.py). Raise a floor when coverage rises; never lower one to let
 # a change through. Hardware, FFI and GUI code is reported but has no floor.
 #
-# The values are what Linux CI measured; 0 = not measured yet (reported only).
-src/service/response.rs 0
-src/service/imbalance.rs 0
-src/service/sag.rs 0
-src/overclock/curve.rs 0
-src/overclock/load.rs 0
-src/overclock/mod.rs 0
-src/overclock/clkctl.rs 0
-src/config.rs 0
+# Each floor sits about 2 points under what Linux CI measured (40de416, 2026-11-11, in
+# brackets), so moving a few lines in a refactor passes and dropping a test does not.
+src/service/response.rs 84    # (85.9)
+src/service/imbalance.rs 80   # (82.1)
+src/service/sag.rs 37         # (38.9) the lowest: worth more tests
+src/overclock/curve.rs 96     # (98.2)
+src/overclock/load.rs 98      # (100.0)
+src/overclock/mod.rs 91       # (93.1)
+src/overclock/clkctl.rs 76    # (78.5)
+src/config.rs 88              # (90.2)
