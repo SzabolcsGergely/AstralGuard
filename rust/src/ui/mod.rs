@@ -392,6 +392,8 @@ struct Shot {
     check_layout: bool,
     /// How far the tab's content ran past the window on the last frame, px (0 = it fits).
     overflow: f32,
+    /// Filled by the screenshot callback once the frame is captured.
+    image: Arc<Mutex<Option<Arc<egui::ColorImage>>>>,
 }
 
 struct App {
@@ -500,6 +502,7 @@ impl App {
                 requested: false,
                 check_layout: opts.check_layout,
                 overflow: 0.0,
+                image: Arc::default(),
             }),
             live: None,
             connected: false,
@@ -706,14 +709,14 @@ impl App {
         }
         if shot.ready_frames == 8 && !shot.requested {
             shot.requested = true;
-            ctx.send_viewport_cmd(ViewportCommand::Screenshot(Default::default()));
+            let slot = shot.image.clone();
+            let repaint = ctx.clone();
+            ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+                *slot.lock().unwrap() = Some(img);
+                repaint.request_repaint();
+            })));
         }
-        let image = ctx.input(|i| {
-            i.raw.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
+        let image = shot.image.lock().unwrap().take();
         if let Some(img) = image {
             let path = shot.path.clone();
             if let Err(e) = save_png(&path, &img) {
@@ -747,7 +750,8 @@ impl eframe::App for App {
         self.theme.background.to_normalized_gamma_f32()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // Everything but drawing: also runs while the window is hidden (the tray, the service link).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame += 1;
         self.apply_theme(ctx);
 
@@ -770,8 +774,6 @@ impl eframe::App for App {
             self.send(Job::AutostartGet);
         }
 
-        self.ui(ctx);
-        self.modals(ctx);
         self.screenshot(ctx);
         // the GPU's state is read only while this tab is on screen
         if self.tab == Tab::Overclock && self.shown && self.connected {
@@ -788,17 +790,24 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(1000));
     }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+        let ctx = ui.ctx().clone();
+        self.modals(&ctx);
+    }
 }
 
 // ---------------------------------------------------------------------------- drawing
 
 impl App {
-    fn ui(&mut self, ctx: &egui::Context) {
+    fn draw(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
         let t = self.theme;
         let live = self.live.clone();
         let l = live.as_deref();
 
-        egui::TopBottomPanel::top("header")
+        egui::Panel::top("header")
             .frame(egui::Frame::new().fill(t.background).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -806,7 +815,7 @@ impl App {
                 bottom: 0,
             }))
             .show_separator_line(false)
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 self.header(ui, &t, l);
                 self.banners(ui, &t, l);
                 self.sensor_banner(ui, &t, l);
@@ -815,7 +824,7 @@ impl App {
             });
 
         if self.tab == Tab::Protection {
-            egui::TopBottomPanel::bottom("settings_bar")
+            egui::Panel::bottom("settings_bar")
                 .frame(egui::Frame::new().fill(t.background).inner_margin(Margin {
                     left: 16,
                     right: 16,
@@ -823,7 +832,7 @@ impl App {
                     bottom: 10,
                 }))
                 .show_separator_line(false)
-                .show(ctx, |ui| {
+                .show(root, |ui| {
                     let r = ui.max_rect();
                     ui.painter().line_segment(
                         [Pos2::new(r.min.x - 16.0, r.min.y - 8.0), Pos2::new(r.max.x + 16.0, r.min.y - 8.0)],
@@ -842,7 +851,7 @@ impl App {
                 top: 12,
                 bottom: 12,
             }))
-            .show(ctx, |ui| match self.tab {
+            .show(root, |ui| match self.tab {
                 Tab::Live => {
                     let out = egui::ScrollArea::vertical()
                         .id_salt("live")
@@ -1113,7 +1122,7 @@ impl App {
             let g =
                 p.layout_no_wrap(label, if selected { theme::semibold(14.0) } else { theme::regular(14.0) }, t.text);
             let r = egui::Rect::from_min_size(Pos2::new(x, bar.min.y), Vec2::new(g.size().x + 24.0, bar.height()));
-            let resp = ui.interact(r, ui.id().with(tab.key()), Sense::click());
+            let resp = ui.interact(r, ui.scope_id().with(tab.key()), Sense::click());
             let color = if selected {
                 t.text
             } else if resp.hovered() {
@@ -1194,7 +1203,7 @@ impl App {
             ),
         };
         let mut result: Option<bool> = None;
-        let modal = egui::Modal::new(egui::Id::new("confirm"))
+        let modal = egui::Modal::new(egui::Id::unique("confirm"))
             .frame(
                 egui::Frame::new()
                     .fill(t.surface)

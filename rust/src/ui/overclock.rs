@@ -734,12 +734,16 @@ fn field_w(ui: &mut Ui, t: &Theme, text: &mut String, base: Option<f64>, width: 
     };
     ui.add(
         TextEdit::singleline(text)
-            .desired_width(width)
-            .horizontal_align(Align::RIGHT)
+            // `width` is the text's; egui counts the margin in (since 0.37)
+            .desired_width(width + FIELD_MARGIN.sum().x)
+            .align(egui::Align2::RIGHT_CENTER)
             .text_color(color)
-            .margin(egui::Margin::symmetric(6, 3)),
+            .margin(FIELD_MARGIN),
     );
 }
+
+/// The number fields' padding, shared with the Protection tab's fields.
+pub(super) const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(6, 3);
 
 const GRAPH_H: f32 = 200.0;
 const GRAPH_MIN_H: f32 = 90.0;

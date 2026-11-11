@@ -551,10 +551,10 @@ impl SettingsView {
         label_row(ui, t, n.label, |ui| {
             ui.add(
                 TextEdit::singleline(&mut self.texts[i])
-                    .desired_width(62.0)
-                    .horizontal_align(Align::RIGHT)
+                    .desired_width(62.0 + super::overclock::FIELD_MARGIN.sum().x)
+                    .align(egui::Align2::RIGHT_CENTER)
                     .text_color(color)
-                    .margin(egui::Margin::symmetric(6, 3)),
+                    .margin(super::overclock::FIELD_MARGIN),
             );
             let unit = hint.unwrap_or_else(|| n.unit.to_string());
             ui.label(RichText::new(unit).color(t.muted()).size(12.0));

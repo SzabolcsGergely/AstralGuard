@@ -245,7 +245,7 @@ impl Thermal {
                     pixels.push(ramp32(field(x, y, &hot)));
                 }
             }
-            let img = ColorImage { size: [tw, th], pixels };
+            let img = ColorImage::new([tw, th], pixels);
             match &mut self.tex {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
                 None => self.tex = Some(ui.ctx().load_texture("thermal", img, TextureOptions::LINEAR)),
