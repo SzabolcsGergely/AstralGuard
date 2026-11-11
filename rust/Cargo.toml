@@ -86,8 +86,9 @@ and shuts the machine down as a last resort. Runs as a root systemd service with
 icon and dashboard for the desktop user."""
 section = "admin"
 priority = "optional"
-# The window's libraries are loaded at runtime (winit, glutin), so dpkg-shlibdeps cannot see them.
-depends = "$auto, libxkbcommon0, libwayland-client0, libegl1"
+# The window's libraries are loaded at runtime (winit, glutin), so dpkg-shlibdeps cannot see them:
+# Wayland (libwayland-*, libxkbcommon0, EGL) and an X11 session (the libx* ones, libxkbcommon-x11-0).
+depends = "$auto, libxkbcommon0, libwayland-client0, libwayland-egl1, libwayland-cursor0, libegl1, libgl1, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxrender1, libxkbcommon-x11-0"
 recommends = "kmod"
 # The astralguard group is created in postinst (works on releases without systemd-sysusers).
 maintainer-scripts = "packaging/linux/debian/"
