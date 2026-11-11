@@ -34,7 +34,7 @@ native-tls = { version = "0.2", optional = true }
 tray-icon = { version = "0.19", optional = true }
 # Not tauri-winrt-notification: linking it made every binary crash at startup on the
 # GNU toolchain. Toasts go through the windows crate's WinRT bindings instead.
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Data_Xml_Dom",
     "Foundation",
     "UI_Notifications",
