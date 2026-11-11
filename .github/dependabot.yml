@@ -1,0 +1,16 @@
+# Weekly update PRs for the Rust dependencies and the workflow actions. Each runs CI;
+# merge when green.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /rust
+    schedule:
+      interval: weekly
+    groups:
+      # one PR for the routine minor / patch bumps, separate ones for majors
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

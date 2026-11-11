@@ -11,6 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in step with ci.yml.
+  RUST_TOOLCHAIN: "1.99.1"
 
 jobs:
   windows:
@@ -18,13 +20,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Build
         working-directory: rust
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Installer
         shell: pwsh
         run: |
@@ -51,12 +55,14 @@ jobs:
     steps:
       - name: Build tools and libraries
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git build-essential \
+          apt-get -o Acquire::Retries=5 update
+          apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl git build-essential \
             dpkg-dev pkg-config libssl-dev \
             libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -68,7 +74,7 @@ jobs:
         working-directory: rust
         run: |
           mkdir -p ../dist
-          cargo deb --output ../dist/
+          cargo deb --locked --output ../dist/
       - name: Inspect
         run: |
           dpkg-deb --info dist/*.deb
@@ -98,8 +104,8 @@ jobs:
           # Without starting the service: there is no Astral card on a CI runner.
           printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
           chmod +x /usr/sbin/policy-rc.d
-          apt-get update
-          apt-get install -y ./dist/*.deb
+          apt-get -o Acquire::Retries=5 update
+          apt-get -o Acquire::Retries=5 install -y ./dist/*.deb
           getent group astralguard
           test -x /usr/bin/astralguard
           test -f /lib/systemd/system/astralguard.service || test -f /usr/lib/systemd/system/astralguard.service

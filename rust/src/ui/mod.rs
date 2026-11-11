@@ -12,7 +12,7 @@
 //!   --show                 open the window even if "Open on start" is off
 //!   --demo                 simulated service instead of IPC (--phase <s>, --offline,
 //!                          --no-sensor: card found, pin monitor unreadable until Scan)
-//!   --screenshot <png>     render, save a PNG, exit (--tab, --theme, --scale, --size WxH,
+//!   --screenshot <png>     render, save a PNG, exit (--tab, --theme, --scale, --size WxH, --check-layout,
 //!                          --confirm pause|exit|reset|calibrate|warnings|scan|scan-result)
 
 mod backend;
@@ -121,6 +121,9 @@ struct Opts {
     scale: Option<f32>,
     size: Option<(f32, f32)>,
     confirm: Option<String>,
+    /// With --screenshot: exit 3 instead of 0 when the tab does not fit the window (it would
+    /// scroll). CI renders every tab this way.
+    check_layout: bool,
 }
 
 impl Opts {
@@ -147,6 +150,7 @@ impl Opts {
                     })
                 }
                 "--confirm" => o.confirm = it.next().cloned(),
+                "--check-layout" => o.check_layout = true,
                 _ => {}
             }
         }
@@ -385,6 +389,9 @@ struct Shot {
     path: String,
     ready_frames: u32,
     requested: bool,
+    check_layout: bool,
+    /// How far the tab's content ran past the window on the last frame, px (0 = it fits).
+    overflow: f32,
 }
 
 struct App {
@@ -487,7 +494,13 @@ impl App {
             scanning: false,
             scan_auto: false,
             close_quits: false,
-            shot: opts.screenshot.map(|path| Shot { path, ready_frames: 0, requested: false }),
+            shot: opts.screenshot.map(|path| Shot {
+                path,
+                ready_frames: 0,
+                requested: false,
+                check_layout: opts.check_layout,
+                overflow: 0.0,
+            }),
             live: None,
             connected: false,
             started: Instant::now(),
@@ -558,6 +571,13 @@ impl App {
         self.save_prefs();
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.shown = false;
+    }
+
+    /// For --check-layout: how far a tab's content ran past its scroll area this frame.
+    fn note_overflow<R>(&mut self, out: &egui::scroll_area::ScrollAreaOutput<R>) {
+        if let Some(shot) = &mut self.shot {
+            shot.overflow = (out.content_size.y - out.inner_rect.height()).max(0.0);
+        }
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -699,6 +719,14 @@ impl App {
             if let Err(e) = save_png(&path, &img) {
                 eprintln!("screenshot: {e}");
             }
+            if shot.check_layout && shot.overflow > 0.5 {
+                eprintln!(
+                    "layout: {path}: the {} tab scrolls ({:.0} px more than the window)",
+                    self.tab.key(),
+                    shot.overflow
+                );
+                std::process::exit(3);
+            }
             self.quit(ctx);
         }
     }
@@ -816,19 +844,22 @@ impl App {
             }))
             .show(ctx, |ui| match self.tab {
                 Tab::Live => {
-                    egui::ScrollArea::vertical().id_salt("live").auto_shrink([false, false]).show(ui, |ui| {
-                        if live::show(ui, &t, l, self.prefs.connector_mirror, &mut self.thermal) {
-                            self.tab = Tab::Protection;
-                        }
-                    });
+                    let out = egui::ScrollArea::vertical()
+                        .id_salt("live")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| live::show(ui, &t, l, self.prefs.connector_mirror, &mut self.thermal));
+                    self.note_overflow(&out);
+                    if out.inner {
+                        self.tab = Tab::Protection;
+                    }
                 }
                 Tab::Imu => {
-                    let action = egui::ScrollArea::vertical()
+                    let out = egui::ScrollArea::vertical()
                         .id_salt("imu")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| imu::show(ui, &t, l))
-                        .inner;
-                    match action {
+                        .show(ui, |ui| imu::show(ui, &t, l));
+                    self.note_overflow(&out);
+                    match out.inner {
                         Some(imu::ImuAction::Fast(s)) => self.send(Job::ImuFast(s)),
                         Some(imu::ImuAction::Calibrate) => self.confirm = Some(Confirm::Calibrate),
                         Some(imu::ImuAction::Edit) => self.tab = Tab::Protection,
@@ -838,13 +869,12 @@ impl App {
                 Tab::Protection | Tab::Settings => {
                     let protection = self.tab == Tab::Protection;
                     let card_mm = l.map(|l| l.card_length_mm).unwrap_or(0.0);
-                    let (ask, changed) = egui::ScrollArea::vertical()
-                        .id_salt("settings")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                    let out =
+                        egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
                             self.settings.show(ui, &t, &mut self.prefs, card_mm, self.updates.as_ref(), protection)
-                        })
-                        .inner;
+                        });
+                    self.note_overflow(&out);
+                    let (ask, changed) = out.inner;
                     if let Some(ask) = ask {
                         self.handle_ask(ask);
                     }
@@ -862,12 +892,12 @@ impl App {
                     }
                 }
                 Tab::Overclock => {
-                    let job = egui::ScrollArea::vertical()
+                    let out = egui::ScrollArea::vertical()
                         .id_salt("overclock")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.overclock.ui(ui, &t, l))
-                        .inner;
-                    if let Some(job) = job {
+                        .show(ui, |ui| self.overclock.ui(ui, &t, l));
+                    self.note_overflow(&out);
+                    if let Some(job) = out.inner {
                         self.send(job);
                     }
                 }

@@ -1,0 +1,13 @@
+# Line coverage floors (percent) for the code that makes decisions, checked by CI's coverage
+# job (.github/scripts/coverage.py). Raise a floor when coverage rises; never lower one to let
+# a change through. Hardware, FFI and GUI code is reported but has no floor.
+#
+# The values are what Linux CI measured; 0 = not measured yet (reported only).
+src/service/response.rs 0
+src/service/imbalance.rs 0
+src/service/sag.rs 0
+src/overclock/curve.rs 0
+src/overclock/load.rs 0
+src/overclock/mod.rs 0
+src/overclock/clkctl.rs 0
+src/config.rs 0
