@@ -98,12 +98,54 @@ pub fn judge(samples: &[Result<Sample, String>]) -> Result<String, String> {
     Ok(format!("rail {vmin:.2}-{vmax:.2} V, {g_last:.2} g, {power}"))
 }
 
-fn sample(bus: &mut I2cDev, power: Option<&crate::mitigation::BoardPower>) -> Result<Sample, String> {
+/// One adapter as the scan uses it: the SMBus receive byte, then (only where that was
+/// acknowledged) register reads. Both read-only; there is no write here to call.
+pub(super) trait Probe: I2cBus {
+    fn answers(&mut self) -> bool;
+}
+
+impl Probe for I2cDev {
+    fn answers(&mut self) -> bool {
+        I2cDev::answers(self)
+    }
+}
+
+/// NVML's board power, in W; None when it cannot be read this time.
+pub(super) type BoardWatts = Box<dyn Fn() -> Option<f64>>;
+
+/// What a scan needs from the system: the real adapters, NVML and the clock in the guard;
+/// fakes in the tests.
+pub(super) trait ScanEnv {
+    fn adapters(&mut self) -> Result<Vec<Adapter>, String>;
+    fn open(&mut self, num: u32) -> Result<Box<dyn Probe>, String>;
+    fn board_power(&mut self, subsystem: u32) -> Result<BoardWatts, String>;
+    fn pause(&mut self, d: Duration);
+}
+
+struct System;
+
+impl ScanEnv for System {
+    fn adapters(&mut self) -> Result<Vec<Adapter>, String> {
+        adapters()
+    }
+    fn open(&mut self, num: u32) -> Result<Box<dyn Probe>, String> {
+        Ok(Box::new(I2cDev::open(num)?))
+    }
+    fn board_power(&mut self, subsystem: u32) -> Result<BoardWatts, String> {
+        let p = crate::mitigation::BoardPower::open(subsystem)?;
+        Ok(Box::new(move || p.watts().ok()))
+    }
+    fn pause(&mut self, d: Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+fn sample(bus: &mut dyn Probe, power: Option<&BoardWatts>) -> Result<Sample, String> {
     let mut raw = [0u8; PIN_DATA_SIZE];
     bus.read(PIN_REG, &mut raw)?;
     let mut graw = [0u8; GSENSOR_DATA_SIZE];
     bus.read(GSENSOR_REG, &mut graw)?;
-    let board_w = power.and_then(|p| p.watts().ok());
+    let board_w = power.and_then(|p| p());
     Ok(Sample { pins: parse_pin_block(&raw), g: parse_gsensor_block(&graw), board_w })
 }
 
@@ -114,8 +156,8 @@ enum Outcome {
     Accepted(String),
 }
 
-fn try_adapter(a: &Adapter, power: Option<&crate::mitigation::BoardPower>) -> Outcome {
-    let mut bus = match I2cDev::open(a.num) {
+fn try_adapter(env: &mut dyn ScanEnv, a: &Adapter, power: Option<&BoardWatts>) -> Outcome {
+    let mut bus = match env.open(a.num) {
         Ok(b) => b,
         Err(e) => return Outcome::Unopenable(e),
     };
@@ -125,9 +167,9 @@ fn try_adapter(a: &Adapter, power: Option<&crate::mitigation::BoardPower>) -> Ou
     let mut samples = Vec::with_capacity(SAMPLES);
     for i in 0..SAMPLES {
         if i > 0 {
-            std::thread::sleep(SAMPLE_GAP);
+            env.pause(SAMPLE_GAP);
         }
-        samples.push(sample(&mut bus, power));
+        samples.push(sample(bus.as_mut(), power));
     }
     match judge(&samples) {
         Ok(s) => Outcome::Accepted(s),
@@ -143,8 +185,12 @@ fn card_of(name: &str) -> &str {
 /// Scan the card's adapters; with `save`, store the one that passes. Every outcome is a
 /// report, never a panic or an exit: the service runs this on the dashboard's request.
 pub fn scan(save: bool) -> ScanReport {
+    scan_with(&mut System, save, &config::config_path())
+}
+
+fn scan_with(env: &mut dyn ScanEnv, save: bool, path: &std::path::Path) -> ScanReport {
     let fail = |message: String, lines: Vec<String>| ScanReport { found: false, message, lines };
-    let all = match adapters() {
+    let all = match env.adapters() {
         Ok(a) if !a.is_empty() => a,
         Ok(_) => return fail("No supported ASUS ROG Astral GPU found on any I2C adapter.".into(), vec![]),
         Err(e) => return fail(e, vec![]),
@@ -163,7 +209,7 @@ pub fn scan(save: bool) -> ScanReport {
         first.subsystem,
         all.len()
     )];
-    let power = match crate::mitigation::BoardPower::open(first.subsystem) {
+    let power = match env.board_power(first.subsystem) {
         Ok(p) => Some(p),
         Err(e) => {
             lines.push(format!("note: NVML unavailable ({e}); board power not compared"));
@@ -172,7 +218,7 @@ pub fn scan(save: bool) -> ScanReport {
     };
     let mut accepted = Vec::new();
     for a in &all {
-        let verdict = match try_adapter(a, power.as_ref()) {
+        let verdict = match try_adapter(env, a, power.as_ref()) {
             Outcome::Silent => "nothing at 0x2B".to_string(),
             Outcome::Unopenable(e) => format!("skipped: {e}"),
             Outcome::Rejected(e) => format!("not the pin monitor: {e}"),
@@ -198,9 +244,8 @@ pub fn scan(save: bool) -> ScanReport {
     if !save {
         return ScanReport { found: true, message: format!("Pin monitor on {at}. Not saved (dry run)."), lines };
     }
-    let path = config::config_path();
     let choice = I2cChoice { adapter: chosen.name.clone(), subsystem: chosen.subsystem };
-    match config::save_i2c_choice(&path, &choice) {
+    match config::save_i2c_choice(path, &choice) {
         Ok(()) => {
             ScanReport { found: true, message: format!("Pin monitor on {at}, saved to {}.", path.display()), lines }
         }
@@ -290,5 +335,228 @@ mod tests {
     #[test]
     fn card_part_of_the_adapter_name() {
         assert_eq!(card_of("NVIDIA i2c adapter 3 at 1:00.0"), "1:00.0");
+    }
+
+    // ---- whole scans on fake adapters: safety rule 1's order, and what gets saved.
+
+    use crate::sensor::fake::encode_pin_block;
+    use crate::sensor::GSENSOR_COUNTS_PER_G;
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    #[derive(Clone, Copy)]
+    enum Chip {
+        /// Nothing acknowledges 0x2B.
+        Silent,
+        /// The IT8915, every pin at `amps` on 12.1 V, level.
+        Monitor { amps: f64 },
+        /// Something at 0x2B that is not the pin monitor (it answers with zeros).
+        Other,
+        /// The device node cannot be opened.
+        Locked,
+    }
+
+    struct FakeProbe {
+        num: u32,
+        chip: Chip,
+        log: Log,
+    }
+
+    impl I2cBus for FakeProbe {
+        fn read(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("i2c-{} read 0x{reg:02X}", self.num));
+            let Chip::Monitor { amps } = self.chip else {
+                buf.fill(0);
+                return Ok(());
+            };
+            match reg {
+                PIN_REG => buf.copy_from_slice(&encode_pin_block(&[(12.1, amps); 6])),
+                GSENSOR_REG => {
+                    let g = |v: f64| ((v * GSENSOR_COUNTS_PER_G) as i16).to_be_bytes();
+                    buf[..6].copy_from_slice(&[g(0.0), g(0.0), g(1.0)].concat());
+                    buf[6] = 0;
+                }
+                _ => return Err("no such register".into()),
+            }
+            Ok(())
+        }
+    }
+
+    impl Probe for FakeProbe {
+        fn answers(&mut self) -> bool {
+            self.log.lock().unwrap().push(format!("i2c-{} receive byte", self.num));
+            !matches!(self.chip, Chip::Silent)
+        }
+    }
+
+    struct FakeEnv {
+        adapters: Vec<(u32, &'static str, u32, Chip)>,
+        board_w: Option<f64>,
+        log: Log,
+    }
+
+    impl FakeEnv {
+        /// Card 0x89E31043 at 1:00.0 with these chips on adapters 9, 10, ...
+        fn card(chips: &[Chip]) -> FakeEnv {
+            let names = ["1", "2", "3", "4", "5", "6", "7"];
+            FakeEnv {
+                adapters: chips.iter().enumerate().map(|(i, &c)| (9 + i as u32, names[i], 0x89E3_1043, c)).collect(),
+                board_w: Some(6.0 * 12.1 * 8.0 + 30.0), // the pins plus some slot power
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn ops(&self, num: u32) -> Vec<String> {
+            let p = format!("i2c-{num} ");
+            self.log.lock().unwrap().iter().filter(|l| l.starts_with(&p)).map(|l| l[p.len()..].to_string()).collect()
+        }
+    }
+
+    impl ScanEnv for FakeEnv {
+        fn adapters(&mut self) -> Result<Vec<Adapter>, String> {
+            Ok(self
+                .adapters
+                .iter()
+                .map(|&(num, n, subsystem, _)| Adapter {
+                    num,
+                    name: format!("NVIDIA i2c adapter {n} at {}:00.0", if subsystem == 0x89E3_1043 { 1 } else { 2 }),
+                    subsystem,
+                    model: "ROG Astral RTX 5090 OC",
+                    gpu_name: "NVIDIA GPU".into(),
+                })
+                .collect())
+        }
+        fn open(&mut self, num: u32) -> Result<Box<dyn Probe>, String> {
+            self.log.lock().unwrap().push(format!("i2c-{num} open"));
+            let chip = self.adapters.iter().find(|a| a.0 == num).unwrap().3;
+            if matches!(chip, Chip::Locked) {
+                return Err("Permission denied".into());
+            }
+            Ok(Box::new(FakeProbe { num, chip, log: Arc::clone(&self.log) }))
+        }
+        fn board_power(&mut self, _subsystem: u32) -> Result<BoardWatts, String> {
+            let w = self.board_w.ok_or("NVML unavailable (no driver)")?;
+            Ok(Box::new(move || Some(w)))
+        }
+        fn pause(&mut self, _d: Duration) {}
+    }
+
+    struct TempIni(std::path::PathBuf);
+    impl TempIni {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("ag-scan-{name}-{}.ini", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            TempIni(p)
+        }
+        fn saved(&self) -> Option<I2cChoice> {
+            config::load_i2c_choice(&self.0)
+        }
+    }
+    impl Drop for TempIni {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const MONITOR: Chip = Chip::Monitor { amps: 8.0 };
+
+    #[test]
+    fn the_one_adapter_with_the_pin_monitor_is_found_and_saved() {
+        let ini = TempIni::new("found");
+        let mut env = FakeEnv::card(&[Chip::Silent, MONITOR, Chip::Other, Chip::Silent]);
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(r.found, "{}", r.message);
+        assert!(r.message.contains("/dev/i2c-10"), "{}", r.message);
+        let saved = ini.saved().expect("saved");
+        assert_eq!((saved.adapter.as_str(), saved.subsystem), ("NVIDIA i2c adapter 2 at 1:00.0", 0x89E3_1043));
+        assert!(r.lines.iter().any(|l| l.contains("i2c-11") && l.contains("not the pin monitor")), "{:?}", r.lines);
+    }
+
+    #[test]
+    fn a_silent_adapter_gets_the_receive_byte_and_nothing_else() {
+        // Safety rule 1: no register pointer is written to an adapter until something at
+        // 0x2B has acknowledged the plain receive byte.
+        let ini = TempIni::new("order");
+        let mut env = FakeEnv::card(&[Chip::Silent, MONITOR, Chip::Other]);
+        scan_with(&mut env, true, &ini.0);
+        assert_eq!(env.ops(9), ["open", "receive byte"]);
+        for num in [10, 11] {
+            let ops = env.ops(num);
+            assert_eq!(&ops[..2], ["open", "receive byte"], "the receive byte first on i2c-{num}");
+            assert_eq!(ops.len(), 2 + 2 * SAMPLES, "then the pin and accelerometer reads, {SAMPLES} samples");
+            assert!(ops[2..].iter().all(|o| o == "read 0x80" || o == "read 0x70"), "only those two: {ops:?}");
+        }
+    }
+
+    #[test]
+    fn two_adapters_that_pass_save_nothing() {
+        let ini = TempIni::new("ambiguous");
+        let mut env = FakeEnv::card(&[MONITOR, Chip::Silent, MONITOR]);
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(!r.found);
+        assert!(r.message.contains("2 adapters passed") && r.message.contains("nothing saved"), "{}", r.message);
+        assert!(ini.saved().is_none(), "a guess would be worse than no answer");
+    }
+
+    #[test]
+    fn no_adapter_that_passes_saves_nothing() {
+        let ini = TempIni::new("none");
+        let mut env = FakeEnv::card(&[Chip::Silent, Chip::Other, Chip::Silent]);
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(!r.found && r.message.contains("Nothing saved"), "{}", r.message);
+        assert!(ini.saved().is_none());
+    }
+
+    #[test]
+    fn two_cards_are_refused_before_any_bus_is_touched() {
+        let ini = TempIni::new("two-cards");
+        let mut env = FakeEnv::card(&[MONITOR, Chip::Silent]);
+        env.adapters.push((20, "1", 0x89FF_1043, MONITOR)); // a second Astral
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(!r.found && r.message.contains("More than one Astral card"), "{}", r.message);
+        assert!(env.log.lock().unwrap().is_empty(), "not one adapter opened");
+        assert!(ini.saved().is_none());
+    }
+
+    #[test]
+    fn a_dry_run_finds_but_does_not_save() {
+        let ini = TempIni::new("dry");
+        let mut env = FakeEnv::card(&[MONITOR]);
+        let r = scan_with(&mut env, false, &ini.0);
+        assert!(r.found && r.message.contains("Not saved (dry run)"), "{}", r.message);
+        assert!(ini.saved().is_none());
+    }
+
+    #[test]
+    fn without_nvml_the_monitor_is_judged_on_the_pins_alone() {
+        let ini = TempIni::new("no-nvml");
+        let mut env = FakeEnv::card(&[MONITOR]);
+        env.board_w = None;
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(r.found, "{}", r.message);
+        assert!(r.lines.iter().any(|l| l.contains("board power not compared")), "{:?}", r.lines);
+    }
+
+    #[test]
+    fn an_adapter_that_cannot_be_opened_is_skipped_not_fatal() {
+        let ini = TempIni::new("locked");
+        let mut env = FakeEnv::card(&[Chip::Locked, MONITOR]);
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(r.found, "{}", r.message);
+        assert!(
+            r.lines.iter().any(|l| l.contains("i2c-9") && l.contains("skipped: Permission denied")),
+            "{:?}",
+            r.lines
+        );
+    }
+
+    #[test]
+    fn board_power_that_does_not_fit_the_pins_rejects_the_chip() {
+        let ini = TempIni::new("power");
+        let mut env = FakeEnv::card(&[MONITOR]);
+        env.board_w = Some(2000.0); // the pins carry ~580 W: not this card's pins
+        let r = scan_with(&mut env, true, &ini.0);
+        assert!(!r.found);
+        assert!(r.lines.iter().any(|l| l.contains("board draws 2000 W")), "{:?}", r.lines);
     }
 }

@@ -175,8 +175,13 @@ pub(super) struct Adapter {
 
 /// Every adapter of every supported card, by adapter number. Reads sysfs only.
 pub(super) fn adapters() -> Result<Vec<Adapter>, String> {
-    let entries = fs::read_dir("/sys/bus/i2c/devices")
-        .map_err(|e| format!("no I2C adapters visible ({e}); is the i2c-dev module loaded?"))?;
+    adapters_in(Path::new("/sys/bus/i2c/devices"))
+}
+
+/// `adapters()` on a sysfs tree of the tests' own.
+fn adapters_in(devices: &Path) -> Result<Vec<Adapter>, String> {
+    let entries =
+        fs::read_dir(devices).map_err(|e| format!("no I2C adapters visible ({e}); is the i2c-dev module loaded?"))?;
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -283,6 +288,51 @@ mod tests {
         std::os::unix::fs::symlink(&dev, adapter.join("device")).unwrap();
         let found = pci_device_of(&adapter).unwrap();
         assert_eq!(subsystem_of(&found), Some(0x89E31043));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A PCI device with its I2C adapters as children, linked from `bus/i2c-N` like sysfs.
+    fn device(root: &Path, addr: &str, vendor: &str, subsystem: (&str, &str), adapters: &[(u32, &str)]) {
+        let dev = root.join(addr);
+        fs::create_dir_all(&dev).unwrap();
+        fs::write(dev.join("vendor"), format!("{vendor}\n")).unwrap();
+        fs::write(dev.join("subsystem_vendor"), format!("{}\n", subsystem.0)).unwrap();
+        fs::write(dev.join("subsystem_device"), format!("{}\n", subsystem.1)).unwrap();
+        let bus = root.join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        for (num, name) in adapters {
+            let a = dev.join(format!("i2c-{num}"));
+            fs::create_dir_all(&a).unwrap();
+            fs::write(a.join("name"), format!("{name}\n")).unwrap();
+            std::os::unix::fs::symlink(&a, bus.join(format!("i2c-{num}"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn only_the_astral_cards_own_adapters_are_listed() {
+        // Safety rule 1: the scan may only ever touch the GPU's buses. An ASUS motherboard's
+        // SMBus carries the same subsystem vendor (0x1043) and must never be listed.
+        let root = std::env::temp_dir().join(format!("ag-i2c-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        device(
+            &root,
+            "0000:01:00.0",
+            "0x10de",
+            ("0x1043", "0x89e3"),
+            &[(10, "NVIDIA i2c adapter 2 at 1:00.0"), (9, "NVIDIA i2c adapter 1 at 1:00.0")],
+        );
+        device(&root, "0000:00:1f.4", "0x8086", ("0x1043", "0x89e3"), &[(0, "SMBus I801 adapter at efa0")]);
+        device(&root, "0000:02:00.0", "0x10de", ("0x1462", "0x5170"), &[(20, "NVIDIA i2c adapter 1 at 2:00.0")]);
+        device(&root, "0000:01:00.1", "0x10de", ("0x1043", "0x89e3"), &[(30, "i2c-nvidia-gpu")]);
+        let found = adapters_in(&root.join("bus")).unwrap();
+        let nums: Vec<u32> = found.iter().map(|a| a.num).collect();
+        assert_eq!(
+            nums,
+            [9, 10],
+            "the Astral's two adapters, sorted; not the SMBus, another card or another driver's adapter"
+        );
+        assert!(found.iter().all(|a| a.subsystem == 0x89E3_1043 && a.model == "ROG Astral RTX 5090 OC"));
+        assert!(matches!(adapters_in(&root.join("nope")), Err(e) if e.contains("i2c-dev")));
         fs::remove_dir_all(&root).unwrap();
     }
 
