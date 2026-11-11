@@ -1,5 +1,5 @@
 ; AstralGuard setup (Inno Setup 6). The release workflow builds it:
-;   iscc /DAppVersion=2.0.0 /DSourceExe=<path to astralguard.exe> /DRepoRoot=<repo> /O<out> astralguard.iss
+;   iscc /DAppVersion=1.0.0 /DSourceExe=<path to astralguard.exe> /DRepoRoot=<repo> /O<out> astralguard.iss
 ;
 ; Setup first asks who to install for (Inno Setup's install mode dialog):
 ;   All users  (administrator): Program Files, Start menu for everyone, and a logon task

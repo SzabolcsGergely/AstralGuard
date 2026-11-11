@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v2.1.0 (matching `version` in rust/Cargo.toml) to build and publish a
+# Push a tag like v1.1.0 (matching `version` in rust/Cargo.toml) to build and publish a
 # release. The dashboard's update checker reads the latest release from this repository.
 on:
   push:

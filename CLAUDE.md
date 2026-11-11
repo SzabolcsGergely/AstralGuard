@@ -343,8 +343,8 @@ To cut a release:
 2. Tag and push:
 
    ```sh
-   git tag v2.1.0
-   git push origin v2.1.0
+   git tag v1.1.0
+   git push origin v1.1.0
    ```
 
 The release workflow checks that the tag matches the crate version, builds and tests the

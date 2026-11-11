@@ -24,7 +24,7 @@ body:
     id: system
     attributes:
       label: AstralGuard version, OS and NVIDIA driver
-      placeholder: v2.0.0, Windows 11, driver 621.14
+      placeholder: v1.0.0, Windows 11, driver 621.14
     validations:
       required: true
   - type: textarea

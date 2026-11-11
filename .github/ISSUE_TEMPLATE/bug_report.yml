@@ -14,7 +14,7 @@ body:
     attributes:
       label: AstralGuard version
       description: Shown in the dashboard header, and in the log's "Starting AstralGuard v…" line.
-      placeholder: v2.0.0
+      placeholder: v1.0.0
     validations:
       required: true
   - type: dropdown
