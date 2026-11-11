@@ -1,7 +1,7 @@
 //! The few Win32 calls the UI needs. Window handles travel between threads as isize.
 
-use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HANDLE, HWND};
+use windows::core::{w, BOOL, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::{
@@ -167,6 +167,6 @@ pub fn listen_for_show(hwnd: std::sync::Arc<std::sync::atomic::AtomicIsize>, ctx
 pub fn open_path(path: &str) {
     let file = HSTRING::from(path);
     unsafe {
-        ShellExecuteW(HWND::default(), w!("open"), &file, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        ShellExecuteW(None, w!("open"), &file, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
 }

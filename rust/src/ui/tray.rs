@@ -289,7 +289,6 @@ fn refresh(link: &Link, it: &mut Items) {
 
 #[cfg(windows)]
 fn run(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) {
-    use windows::Win32::Foundation::{BOOL, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT,
         WM_QUIT,
@@ -299,7 +298,7 @@ fn run(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) {
     'outer: loop {
         unsafe {
             let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
                     break 'outer;
                 }
@@ -315,7 +314,7 @@ fn run(link: Arc<Link>, actions: Actions, hwnd: Arc<AtomicIsize>) {
             last = std::time::Instant::now();
         }
         unsafe {
-            MsgWaitForMultipleObjects(None, BOOL::from(false), 250, QS_ALLINPUT);
+            MsgWaitForMultipleObjects(None, false, 250, QS_ALLINPUT);
         }
     }
     MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
