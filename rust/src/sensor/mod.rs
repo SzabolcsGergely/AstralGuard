@@ -275,13 +275,21 @@ pub(crate) mod fake {
         NoRail,
     }
 
+    /// The accelerometer: gravity in g (None: it does not answer), and how often it was read.
+    #[derive(Default)]
+    pub struct Accel {
+        pub g: Option<[f64; 3]>,
+        pub reads: u32,
+    }
+
     /// The card's state, shared between the test and the sensor it hands out.
     #[derive(Clone)]
-    pub struct Card(Arc<Mutex<Reading>>);
+    pub struct Card(Arc<Mutex<Reading>>, Arc<Mutex<Accel>>);
 
     impl Card {
         pub fn new(amps: [f64; 6]) -> Self {
-            Card(Arc::new(Mutex::new(Reading::Amps(amps))))
+            let level = Accel { g: Some([0.0, 0.0, 1.0]), reads: 0 };
+            Card(Arc::new(Mutex::new(Reading::Amps(amps))), Arc::new(Mutex::new(level)))
         }
         pub fn set(&self, r: Reading) {
             *self.0.lock().unwrap() = r;
@@ -289,19 +297,41 @@ pub(crate) mod fake {
         pub fn amps(&self, amps: [f64; 6]) {
             self.set(Reading::Amps(amps));
         }
+        /// Gravity as the accelerometer reports it (None: it stops answering).
+        pub fn gravity(&self, g: Option<[f64; 3]>) {
+            self.1.lock().unwrap().g = g;
+        }
+        pub fn accel_reads(&self) -> u32 {
+            self.1.lock().unwrap().reads
+        }
+        /// A sensor on another card model, for the tests that need a card change.
+        pub fn sensor_of(&self, subsystem: u32) -> PinSensor {
+            let mut s = self.sensor();
+            s.info.subsystem = subsystem;
+            s
+        }
         pub fn sensor(&self) -> PinSensor {
             PinSensor {
-                bus: Box::new(Bus(Arc::clone(&self.0))),
+                bus: Box::new(Bus(Arc::clone(&self.0), Arc::clone(&self.1))),
                 info: CardInfo { gpu_name: "Test GPU".into(), subsystem: 0x89E3_1043, model: "ROG Astral RTX 5090 OC" },
                 failures: 0,
             }
         }
     }
 
-    struct Bus(Arc<Mutex<Reading>>);
+    struct Bus(Arc<Mutex<Reading>>, Arc<Mutex<Accel>>);
 
     impl I2cBus for Bus {
         fn read(&mut self, reg: u8, buf: &mut [u8]) -> Result<(), String> {
+            if reg == GSENSOR_REG && buf.len() == GSENSOR_DATA_SIZE {
+                let mut a = self.1.lock().unwrap();
+                a.reads += 1;
+                let g = a.g.ok_or("the accelerometer did not answer")?;
+                let s16 = |v: f64| ((v * GSENSOR_COUNTS_PER_G).round() as i16).to_be_bytes();
+                buf[..6].copy_from_slice(&[s16(g[0]), s16(g[1]), s16(g[2])].concat());
+                buf[6] = 0;
+                return Ok(());
+            }
             if reg != PIN_REG || buf.len() != PIN_DATA_SIZE {
                 return Err(format!("the fake card has nothing at 0x{reg:02X}"));
             }

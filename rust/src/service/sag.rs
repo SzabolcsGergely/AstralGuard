@@ -570,3 +570,173 @@ mod tests {
         assert_eq!(m.level, 1);
     }
 }
+
+/// Sag through tick(), as the monitor loop drives it: the fake card's accelerometer, a clock
+/// of the test's own, one call per 0.5 s pin tick.
+#[cfg(test)]
+mod scenario_tests {
+    use super::*;
+    use crate::sensor::fake::Card;
+
+    /// Gravity with the card's far end tilted `deg` down.
+    fn tilted(deg: f64) -> [f64; 3] {
+        let r = deg.to_radians();
+        [0.0, r.sin(), r.cos()]
+    }
+
+    struct Rig {
+        card: Card,
+        sensor: PinSensor,
+        shared: Arc<Shared>,
+        sag: SagMonitor,
+        t: f64,
+        s: Settings,
+    }
+
+    impl Rig {
+        fn new(baseline: Option<SagBaseline>) -> Rig {
+            let s = Settings::default(); // warn 1°, serious 2°, sustained 60 s
+            let shared = Shared::new(s.clone(), None, true);
+            let card = Card::new([5.0; 6]);
+            Rig {
+                sensor: card.sensor(),
+                card,
+                sag: SagMonitor::new(Arc::clone(&shared), baseline),
+                shared,
+                t: 1.0e6,
+                s,
+            }
+        }
+        fn level_baseline() -> Option<SagBaseline> {
+            Some(SagBaseline { vector: [0.0, 0.0, 1.0], subsystem: 0x89E3_1043 })
+        }
+        /// Pin ticks every 0.5 s for `seconds`.
+        fn run(&mut self, seconds: f64) {
+            let end = self.t + seconds;
+            while self.t < end {
+                self.sag.tick(Some(&mut self.sensor), self.t, false, &self.s);
+                self.t += 0.5;
+            }
+        }
+        fn status(&self) -> SagStatus {
+            self.shared.live_field(|l| l.sag_status)
+        }
+        fn deg(&self) -> Option<f64> {
+            self.shared.live_field(|l| l.sag_deg)
+        }
+    }
+
+    #[test]
+    fn a_level_card_takes_its_first_baseline_by_itself() {
+        let mut r = Rig::new(None);
+        r.card.gravity(Some(tilted(0.4)));
+        r.run(30.0);
+        assert_eq!(r.status(), SagStatus::Uncalibrated, "half a minute: not yet");
+        r.run(35.0);
+        assert!(r.sag.baseline.is_some(), "a minute of samples near level");
+        assert_eq!(r.status(), SagStatus::Ok);
+        assert!(r.shared.baseline.lock().unwrap().is_some(), "and handed to the service to save");
+    }
+
+    #[test]
+    fn a_card_already_off_level_is_not_calibrated_by_itself() {
+        let mut r = Rig::new(None);
+        r.card.gravity(Some(tilted(3.0))); // over AUTO_BASELINE_MAX_OFFAXIS: may already sag
+        r.run(300.0);
+        assert!(r.sag.baseline.is_none());
+        assert_eq!(r.status(), SagStatus::Uncalibrated, "asks for a calibration instead");
+    }
+
+    #[test]
+    fn gradual_sag_warns_after_the_sustained_time_and_clears_with_hysteresis() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.run(120.0);
+        assert_eq!(r.status(), SagStatus::Ok);
+        // Creeping in small steps (never a jump) to 1.3°, over the 1° warning.
+        for step in 1..=13 {
+            r.card.gravity(Some(tilted(step as f64 * 0.1)));
+            r.run(10.0);
+        }
+        assert_eq!(r.status(), SagStatus::Ok, "not yet held for the sustained 60 s");
+        r.run(90.0);
+        assert_eq!(r.status(), SagStatus::Warning);
+        assert!((r.deg().unwrap() - 1.3).abs() < 0.05, "{:?}", r.deg());
+        // Back to 0.8°: under the warning but over 70 % of it, so it holds.
+        r.card.gravity(Some(tilted(0.8)));
+        r.run(120.0);
+        assert_eq!(r.status(), SagStatus::Warning, "hysteresis: no flapping around 1°");
+        r.card.gravity(Some(tilted(0.5)));
+        r.run(120.0);
+        assert_eq!(r.status(), SagStatus::Ok);
+    }
+
+    #[test]
+    fn a_sudden_change_is_reported_once_it_settles_without_the_sustained_wait() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.run(120.0);
+        r.card.gravity(Some(tilted(2.5))); // the PC was knocked or moved: one big jump
+        r.run(40.0);
+        assert_eq!(r.status(), SagStatus::Ok, "re-evaluated only after a full minute");
+        r.run(30.0);
+        assert_eq!(r.status(), SagStatus::Serious, "then at once: no 60 s sustained wait");
+    }
+
+    #[test]
+    fn calibrate_takes_the_current_position_as_the_baseline() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.card.gravity(Some(tilted(3.0)));
+        r.run(120.0);
+        assert_ne!(r.status(), SagStatus::Ok, "3° from the old baseline");
+        r.shared.calibrate_request.store(true, Ordering::Relaxed);
+        r.run(10.0); // CALIBRATION_SAMPLES at the pin rate
+        let b = r.sag.baseline.unwrap();
+        assert!(angle_deg(b, unit(tilted(3.0))) < 0.05, "even off level: the person asked for it");
+        r.run(120.0);
+        assert_eq!(r.status(), SagStatus::Ok);
+        assert!(r.deg().unwrap() < 0.05);
+    }
+
+    #[test]
+    fn a_baseline_from_another_card_is_dropped() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.sensor = r.card.sensor_of(0x89FF_1043); // another Astral model in the slot
+        r.run(1.0);
+        assert!(r.sag.baseline.is_none(), "re-taken for this card");
+    }
+
+    #[test]
+    fn nothing_is_read_while_the_gpu_is_limited() {
+        let mut r = Rig::new(Rig::level_baseline());
+        let before = r.card.accel_reads();
+        for _ in 0..240 {
+            r.sag.tick(Some(&mut r.sensor), r.t, true, &r.s);
+            r.t += 0.5;
+        }
+        assert_eq!(r.card.accel_reads(), before, "only the pin reads touch the bus then");
+    }
+
+    #[test]
+    fn a_dead_accelerometer_pauses_sag_and_comes_back() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.run(60.0);
+        r.card.gravity(None);
+        r.run(5.0 * MAX_CONSECUTIVE_FAILURES as f64 + 1.0);
+        assert_eq!(r.status(), SagStatus::Unavailable);
+        let reads = r.card.accel_reads();
+        r.card.gravity(Some(tilted(0.0)));
+        r.run(RETRY_AFTER_SEC - 10.0);
+        assert_eq!(r.card.accel_reads(), reads, "paused: not retried every tick");
+        r.run(80.0);
+        assert!(r.card.accel_reads() > reads, "retried after the pause");
+        assert_eq!(r.status(), SagStatus::Ok);
+    }
+
+    #[test]
+    fn switched_off_it_says_so_and_reads_nothing() {
+        let mut r = Rig::new(Rig::level_baseline());
+        r.s.sag_enabled = false;
+        r.run(60.0);
+        assert_eq!(r.status(), SagStatus::Disabled);
+        assert_eq!(r.card.accel_reads(), 0);
+    }
+}
