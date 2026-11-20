@@ -405,10 +405,16 @@ mod tests {
     struct Log {
         engaged: u32,
         released: u32,
+        closed: u32,
+        abandoned: u32,
     }
 
     struct FakeLimiter {
         available: bool,
+        /// An available card whose limit write fails anyway (a driver error).
+        engage_fails: bool,
+        /// The restore fails: the card may still be limited.
+        release_fails: bool,
         log: Arc<Mutex<Log>>,
     }
 
@@ -425,23 +431,52 @@ mod tests {
         }
         fn engage(&mut self, _reason: &str) -> bool {
             self.log.lock().unwrap().engaged += 1;
-            self.available
+            self.available && !self.engage_fails
         }
         fn release(&mut self) -> bool {
             self.log.lock().unwrap().released += 1;
-            true
+            !self.release_fails
         }
-        fn close(&mut self) {}
-        fn abandon(&mut self) {}
+        fn close(&mut self) {
+            self.log.lock().unwrap().closed += 1;
+        }
+        fn abandon(&mut self) {
+            self.log.lock().unwrap().abandoned += 1;
+        }
     }
 
     fn ladder(available: bool) -> (TieredResponse, Arc<Mutex<Log>>, Settings) {
+        ladder_with(available, false, false)
+    }
+
+    fn ladder_with(
+        available: bool,
+        engage_fails: bool,
+        release_fails: bool,
+    ) -> (TieredResponse, Arc<Mutex<Log>>, Settings) {
         let shared = Shared::new(Settings::default(), None, true);
         let log = Arc::new(Mutex::new(Log::default()));
         let l2 = Arc::clone(&log);
-        let r =
-            TieredResponse::new(shared, Box::new(move |_| Box::new(FakeLimiter { available, log: Arc::clone(&l2) })));
+        let r = TieredResponse::new(
+            shared,
+            Box::new(move |_| Box::new(FakeLimiter { available, engage_fails, release_fails, log: Arc::clone(&l2) })),
+        );
         (r, log, Settings::default())
+    }
+
+    /// (abandoned, closed), read under one lock.
+    fn exits(log: &Mutex<Log>) -> (u32, u32) {
+        let l = log.lock().unwrap();
+        (l.abandoned, l.closed)
+    }
+
+    /// Limited by a tier 1 trip at t=0, the current back down, released after the hold.
+    fn limited_then_released(r: &mut TieredResponse, s: &Settings) {
+        assert!(r.evaluate(&tick(0.0, 10.0, true), s).is_none());
+        assert!(r.engaged);
+        assert!(r.evaluate(&tick(10.0, 1.0, false), s).is_none());
+        assert!(r.evaluate(&tick(121.0, 1.0, false), s).is_none());
+        assert!(!r.engaged, "released after the minimum hold");
     }
 
     fn tick(now: f64, amps: f64, tier1: bool) -> Tick<'static> {
@@ -519,5 +554,175 @@ mod tests {
         assert!(reason.contains("response mode is shutdown-only"), "{reason}");
         assert!(r.limiter.is_none());
         assert_eq!(log.lock().unwrap().engaged, 0);
+    }
+
+    #[test]
+    fn a_limit_that_fails_on_an_available_card_shuts_down_instead() {
+        let (mut r, log, s) = ladder_with(true, true, false);
+        let reason = r.evaluate(&tick(0.0, 10.0, true), &s).expect("shutdown");
+        assert!(reason.contains("Tried to limit the GPU and failed"), "{reason}");
+        assert!(!r.engaged);
+        assert_eq!(log.lock().unwrap().engaged, 1, "it did try");
+    }
+
+    #[test]
+    fn a_failed_limit_on_tier2_shuts_down_too() {
+        let (mut r, _log, s) = ladder_with(true, true, false);
+        assert!(r.evaluate(&tick(0.0, 14.0, false), &s).is_none(), "the tier 2 window starts");
+        let reason = r.evaluate(&tick(3.0, 14.0, false), &s).expect("shutdown");
+        assert!(reason.starts_with("Tier 2:") && reason.contains("failed"), "{reason}");
+    }
+
+    #[test]
+    fn switching_to_shutdown_only_while_limited_gives_the_gpu_back_without_arming_the_retrigger() {
+        let (mut r, log, mut s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 10.0, true), &s).is_none());
+        assert!(r.engaged);
+        s.response_mode = ResponseMode::ShutdownOnly;
+        assert!(r.evaluate(&tick(5.0, 1.0, false), &s).is_none());
+        assert!(!r.engaged);
+        assert_eq!(log.lock().unwrap().released, 1);
+        // The user's switch is not evidence about the connector: the next trip is an
+        // ordinary shutdown-only trip, not a "persistent fault".
+        let reason = r.evaluate(&tick(20.0, 10.0, true), &s).expect("shutdown");
+        assert!(reason.contains("response mode is shutdown-only"), "{reason}");
+        assert!(!reason.contains("re-triggered"), "{reason}");
+    }
+
+    #[test]
+    fn a_release_the_user_asked_for_does_not_arm_the_retrigger() {
+        let (mut r, log, s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 10.0, true), &s).is_none());
+        r.release(5.0, "monitoring paused", false, &s);
+        assert!(!r.engaged);
+        // A new trip right after limits again instead of shutting down.
+        assert!(r.evaluate(&tick(10.0, 10.0, true), &s).is_none());
+        assert!(r.engaged);
+        assert_eq!(log.lock().unwrap().engaged, 2);
+    }
+
+    #[test]
+    fn the_retrigger_window_ends() {
+        let (mut r, _log, s) = ladder(true);
+        limited_then_released(&mut r, &s);
+        // One second past the window: limited again, not a persistent fault.
+        let later = 121.0 + s.retrigger_window_seconds + 1.0;
+        assert!(r.evaluate(&tick(later, 10.0, true), &s).is_none());
+        assert!(r.engaged);
+    }
+
+    #[test]
+    fn a_retrigger_in_tiered_mode_limits_on_the_way_down() {
+        let (mut r, log, s) = ladder(true);
+        limited_then_released(&mut r, &s);
+        let reason = r.evaluate(&tick(200.0, 10.0, true), &s).expect("persistent fault");
+        assert!(reason.contains("re-triggered") && reason.contains("GPU limited and shutting down"), "{reason}");
+        assert!(r.engaged, "limited through the shutdown");
+        assert_eq!(log.lock().unwrap().engaged, 2);
+    }
+
+    #[test]
+    fn reset_timers_forgets_a_release_across_a_suspend() {
+        let (mut r, _log, s) = ladder(true);
+        limited_then_released(&mut r, &s);
+        r.reset_timers();
+        assert!(r.evaluate(&tick(200.0, 10.0, true), &s).is_none(), "limited again, not shut down");
+        assert!(r.engaged);
+    }
+
+    #[test]
+    fn tier3_limits_on_the_way_down_in_tiered_mode_only() {
+        let (mut r, log, s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 17.0, false), &s).is_none());
+        let reason = r.evaluate(&tick(0.5, 17.0, false), &s).expect("shutdown");
+        assert!(reason.contains("GPU limited and shutting down immediately"), "{reason}");
+        assert_eq!(log.lock().unwrap().engaged, 1);
+
+        let (mut r, log, mut s) = ladder(true);
+        s.response_mode = ResponseMode::ShutdownOnly;
+        r.evaluate(&tick(0.0, 17.0, false), &s);
+        let reason = r.evaluate(&tick(0.5, 17.0, false), &s).expect("shutdown");
+        assert!(reason.ends_with("shutting down immediately."), "{reason}");
+        assert!(!reason.contains("GPU limited"), "{reason}");
+        assert_eq!(log.lock().unwrap().engaged, 0);
+    }
+
+    #[test]
+    fn tier3_samples_must_be_consecutive() {
+        let (mut r, _log, s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 17.0, false), &s).is_none());
+        assert!(r.evaluate(&tick(0.5, 8.0, false), &s).is_none());
+        assert!(r.evaluate(&tick(1.0, 17.0, false), &s).is_none(), "the count started over");
+        assert!(r.evaluate(&tick(1.5, 17.0, false), &s).is_some());
+    }
+
+    #[test]
+    fn a_tier2_dip_restarts_its_window() {
+        let (mut r, _log, s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 14.0, false), &s).is_none());
+        assert!(r.evaluate(&tick(2.0, 12.0, false), &s).is_none());
+        assert!(r.evaluate(&tick(2.5, 14.0, false), &s).is_none());
+        assert!(r.evaluate(&tick(4.0, 14.0, false), &s).is_none(), "1.5 s into the new window");
+        assert!(!r.engaged);
+        assert!(r.evaluate(&tick(5.5, 14.0, false), &s).is_none());
+        assert!(r.engaged, "3 s into the new window: limited");
+    }
+
+    #[test]
+    fn current_just_under_the_threshold_does_not_count_as_clear() {
+        let (mut r, _log, s) = ladder(true);
+        assert!(r.evaluate(&tick(0.0, 10.0, true), &s).is_none());
+        // Inside the hysteresis band: under the threshold, but not by enough.
+        let near = s.threshold_amps - CLEAR_HYSTERESIS_AMPS / 2.0;
+        assert!(r.evaluate(&tick(10.0, near, false), &s).is_none(), "under the threshold at the grace deadline");
+        assert!(r.evaluate(&tick(300.0, near, false), &s).is_none());
+        assert!(r.engaged, "never clear, so never released");
+    }
+
+    #[test]
+    fn a_failed_restore_still_ends_the_limit_and_arms_the_retrigger() {
+        let (mut r, log, s) = ladder_with(true, false, true);
+        limited_then_released(&mut r, &s);
+        assert_eq!(log.lock().unwrap().released, 1);
+        let reason = r.evaluate(&tick(200.0, 10.0, true), &s).expect("persistent fault");
+        assert!(reason.contains("re-triggered"), "{reason}");
+    }
+
+    #[test]
+    fn at_exit_the_card_stays_limited_only_through_a_shutdown() {
+        // Shutting down while limited: abandon, the marker restores it at the next start.
+        let (mut r, log, s) = ladder(true);
+        r.evaluate(&tick(0.0, 10.0, true), &s);
+        r.finish(true);
+        assert_eq!(exits(&log), (1, 0));
+
+        // Stopping while limited: put it back.
+        let (mut r, log, s) = ladder(true);
+        r.evaluate(&tick(0.0, 10.0, true), &s);
+        r.finish(false);
+        assert_eq!(exits(&log), (0, 1));
+
+        // Shutting down unlimited: nothing to leave behind.
+        let (mut r, log, s) = ladder(true);
+        r.evaluate(&tick(0.0, 1.0, false), &s);
+        r.finish(true);
+        assert_eq!(exits(&log), (0, 1));
+
+        // Shutdown-only never opened NVML, so there is nothing to close.
+        let (mut r, log, mut s) = ladder(true);
+        s.response_mode = ResponseMode::ShutdownOnly;
+        r.evaluate(&tick(0.0, 1.0, false), &s);
+        r.finish(true);
+        assert_eq!(exits(&log), (0, 0));
+    }
+
+    #[test]
+    fn an_unavailable_limiter_says_why_in_the_dashboard() {
+        let (mut r, _log, s) = ladder(false);
+        r.evaluate(&tick(0.0, 1.0, false), &s);
+        assert_eq!(r.shared.mitigation_unavailable(), "not elevated");
+        let (mut r, _log, s) = ladder(true);
+        r.evaluate(&tick(0.0, 1.0, false), &s);
+        assert_eq!(r.shared.mitigation_unavailable(), "");
     }
 }

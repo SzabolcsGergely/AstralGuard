@@ -60,20 +60,23 @@ fn shutdown_note_path() -> std::path::PathBuf {
 /// Leave a note for the next start: a shutdown while the user is away is otherwise a
 /// mystery, Windows gets the blame, and the bad cable goes straight back under load.
 fn note_shutdown_reason(reason: &str) {
+    write_shutdown_note(&shutdown_note_path(), reason);
+}
+
+fn write_shutdown_note(path: &std::path::Path, reason: &str) {
     let note = ShutdownNote {
         time: crate::now(),
         time_human: crate::clock::human(&crate::clock::now()),
         reason: reason.into(),
         version: APP_VERSION.into(),
     };
-    let path = shutdown_note_path();
     let tmp = path.with_extension("json.tmp");
     if let Ok(bytes) = serde_json::to_vec(&note) {
         use std::io::Write;
         if let Ok(mut f) = fs::File::create(&tmp) {
             let _ = f.write_all(&bytes);
             let _ = f.sync_all();
-            let _ = fs::rename(&tmp, &path);
+            let _ = fs::rename(&tmp, path);
         }
     }
 }
@@ -81,11 +84,19 @@ fn note_shutdown_reason(reason: &str) {
 /// One-shot at startup: if the guard ended the last session, say so loudly. A corrupt
 /// note still announces, because it still means the guard shut this machine down.
 fn announce_last_shutdown(shared: &Shared) {
-    let path = shutdown_note_path();
+    let Some(msg) = take_shutdown_note(&shutdown_note_path()) else { return };
+    logger::warn(&msg);
+    shared.event(EventKind::Warning, 5091, &msg);
+    shared.notify(&format!("{APP_NAME} - read this"), &msg);
+}
+
+/// The message for a note left by the last session, and the note removed so it is told
+/// once; None when the last session did not shut the machine down.
+fn take_shutdown_note(path: &std::path::Path) -> Option<String> {
     if !path.exists() {
-        return;
+        return None;
     }
-    let note: ShutdownNote = fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let note: ShutdownNote = fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let when = if note.time_human.is_empty() { "an earlier session".to_string() } else { note.time_human };
     let reason =
         if note.reason.is_empty() { "sustained overcurrent on a 12VHPWR pin".to_string() } else { note.reason };
@@ -93,11 +104,9 @@ fn announce_last_shutdown(shared: &Shared) {
         "The last shutdown was an emergency stop by {APP_NAME} ({when}): {reason} Check the connector and \
          cable seating before the next heavy load."
     );
-    logger::warn(&msg);
-    shared.event(EventKind::Warning, 5091, &msg);
-    shared.notify(&format!("{APP_NAME} - read this"), &msg);
     let _ = fs::remove_file(path.with_extension("json.tmp"));
     let _ = fs::remove_file(path);
+    Some(msg)
 }
 
 fn shutdown_system(shared: &Shared, reason: &str) {
@@ -1213,6 +1222,188 @@ mod tests {
         assert_eq!(opens.load(O::SeqCst), 1, "the start-up apply is not held back by the pause");
         assert_eq!(shared.snapshot().status, Status::Paused);
         assert_eq!(pause.since, Some(now));
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ag-monitor-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn an_emergency_shutdown_is_told_once_at_the_next_start() {
+        let dir = temp_dir("note");
+        let path = dir.join("last_shutdown.json");
+        assert_eq!(take_shutdown_note(&path), None, "no note, nothing to tell");
+
+        write_shutdown_note(&path, "Tier 3 (catastrophic): Pin2=17.10A.");
+        assert!(path.exists() && !path.with_extension("json.tmp").exists(), "written whole, then renamed");
+        let msg = take_shutdown_note(&path).expect("told");
+        assert!(msg.contains("emergency stop") && msg.contains("Pin2=17.10A"), "{msg}");
+        assert!(!msg.contains("an earlier session"), "the time is in it: {msg}");
+        assert_eq!(take_shutdown_note(&path), None, "told once");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_shutdown_note_is_still_told() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join("last_shutdown.json");
+        fs::write(&path, b"{not json").unwrap();
+        fs::write(path.with_extension("json.tmp"), b"half").unwrap();
+        let msg = take_shutdown_note(&path).expect("still told");
+        assert!(msg.contains("an earlier session") && msg.contains("sustained overcurrent"), "{msg}");
+        assert!(!path.exists() && !path.with_extension("json.tmp").exists(), "both cleaned up");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A ladder over `NoLimiter`, limited by a tier 1 trip.
+    fn limited_ladder(shared: &Arc<Shared>) -> TieredResponse {
+        let mut r = TieredResponse::new(Arc::clone(shared), Box::new(|_| Box::new(NoLimiter)));
+        let t = Tick { now: 0.0, max_val: 10.0, max_label: "Pin1", tier1_expired: true, tier1_reason: "sustained" };
+        assert!(r.evaluate(&t, &shared.settings()).is_none());
+        assert!(r.engaged);
+        r
+    }
+
+    #[test]
+    fn pausing_gives_a_limited_gpu_back_and_reminds_every_half_hour() {
+        use crate::protocol::Settings;
+        let shared = Shared::new(Settings::default(), None, true);
+        let mut response = limited_ladder(&shared);
+        let (mut oc, mut pause) = (OcLoop::new(0.0, 3600.0), Pause::default());
+        let s = shared.settings();
+
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, 100.0, &s);
+        assert!(!response.engaged, "released when paused");
+        assert_eq!(pause.since, Some(100.0));
+        assert_eq!(shared.snapshot().status, Status::Paused);
+        assert!(!shared.snapshot().engaged);
+
+        // Not a fault: a trip right after resuming limits again rather than shutting down.
+        let t = Tick { now: 110.0, max_val: 10.0, max_label: "Pin1", tier1_expired: true, tier1_reason: "x" };
+        assert!(response.evaluate(&t, &s).is_none());
+        assert!(response.engaged);
+
+        // The reminder: at the half hour, and then not again for another half hour.
+        let mut pause = Pause::default();
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, 0.0, &s);
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, PAUSE_REMINDER_EVERY_SEC - 1.0, &s);
+        assert_eq!(pause.last_reminder, 0.0);
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, PAUSE_REMINDER_EVERY_SEC, &s);
+        assert_eq!(pause.last_reminder, PAUSE_REMINDER_EVERY_SEC);
+        paused_tick(&shared, &mut response, &mut oc, &mut pause, PAUSE_REMINDER_EVERY_SEC + 60.0, &s);
+        assert_eq!(pause.last_reminder, PAUSE_REMINDER_EVERY_SEC, "once per half hour");
+        assert_eq!(pause.since, Some(0.0), "the pause started at the first tick");
+    }
+
+    fn xbar_settings() -> crate::protocol::Settings {
+        crate::protocol::Settings {
+            oc_xbar_enabled: true,
+            oc_xbar_offset_mhz: 150.0,
+            oc_clk_load_only: true,
+            oc_clk_load_watts: 250.0,
+            oc_clk_load_seconds: 10.0,
+            oc_clk_idle_seconds: 30.0,
+            ..Default::default()
+        }
+    }
+
+    /// Feed the load step once a second from `from` to `to`.
+    fn feed(f: &crate::service::tests::FakeService, oc: &mut OcLoop, engaged: bool, from: u32, to: u32) {
+        for t in from..=to {
+            load_step(&f.shared, oc, engaged, 10_000.0 + t as f64);
+        }
+    }
+
+    #[test]
+    fn the_loop_applies_xbar_only_under_sustained_load_and_puts_it_back_at_idle() {
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(test_marker("xbar-load"), xbar_settings());
+        let mut oc = due();
+        overclock_step(&f.shared, &mut oc, false);
+        assert!(oc.timer.applied);
+        f.gpu.clear_calls();
+        let xbar = |f: &crate::service::tests::FakeService| f.gpu.state().clocks[0].0;
+
+        // Draw 280 W: under load only after the full 10 s.
+        f.gpu.state().power_w = 300;
+        feed(&f, &mut oc, false, 0, 8);
+        assert_eq!(xbar(&f), 0, "not yet: {:?}", f.gpu.calls());
+        feed(&f, &mut oc, false, 9, 12);
+        assert_eq!(xbar(&f), 150_000, "applied under load: {:?}", f.gpu.calls());
+
+        // Draw 80 W: back to idle only after the full 30 s.
+        f.gpu.state().power_w = 100;
+        feed(&f, &mut oc, false, 13, 30);
+        assert_eq!(xbar(&f), 150_000, "a short idle keeps it");
+        feed(&f, &mut oc, false, 31, 50);
+        assert_eq!(xbar(&f), 0, "put back at idle: {:?}", f.gpu.calls());
+    }
+
+    #[test]
+    fn the_load_gate_waits_for_the_start_up_apply_and_holds_while_limited() {
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(test_marker("xbar-hold"), xbar_settings());
+        f.gpu.state().power_w = 300;
+
+        // Before the start-up apply the driver may not have settled: no reads, no writes.
+        let mut oc = OcLoop::new(crate::now(), 3600.0);
+        feed(&f, &mut oc, false, 0, 20);
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+        assert_eq!(f.opened.load(Ordering::SeqCst), 0);
+
+        // Applied, but the guard limits the GPU: the gate holds.
+        let mut oc = due();
+        overclock_step(&f.shared, &mut oc, false);
+        f.gpu.clear_calls();
+        feed(&f, &mut oc, true, 0, 20);
+        assert!(f.gpu.calls().is_empty(), "{:?}", f.gpu.calls());
+    }
+
+    #[test]
+    fn unticking_only_under_load_resets_the_gate() {
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(test_marker("xbar-untick"), xbar_settings());
+        let mut oc = due();
+        overclock_step(&f.shared, &mut oc, false);
+        f.gpu.state().power_w = 300;
+        feed(&f, &mut oc, false, 0, 12);
+        assert!(oc.gate.loaded());
+        *super::super::lock(&f.shared.settings) =
+            crate::protocol::Settings { oc_clk_load_only: false, ..xbar_settings() };
+        feed(&f, &mut oc, false, 13, 13);
+        assert!(!oc.gate.loaded(), "the gate starts from idle if it is ticked again");
+    }
+
+    #[test]
+    fn a_long_gap_between_steps_is_a_resume_and_applies_again_after_the_delay() {
+        use crate::service::tests::{fake_service, test_marker};
+        let f = fake_service(
+            test_marker("resume"),
+            crate::protocol::Settings {
+                oc_power_enabled: true,
+                oc_power_w: 520.0,
+                oc_apply_delay_seconds: 30.0,
+                ..Default::default()
+            },
+        );
+        let mut oc = due();
+        overclock_step(&f.shared, &mut oc, false);
+        assert!(oc.timer.applied);
+
+        // The machine slept: the last step is long ago.
+        oc.last_step = Some(crate::now() - RESUME_GRACE_SEC - 60.0);
+        f.gpu.state().power_w = 600; // the driver put the limit back on wake-up
+        f.gpu.clear_calls();
+        overclock_step(&f.shared, &mut oc, false);
+        assert!(f.gpu.calls().is_empty(), "waits the apply delay first: {:?}", f.gpu.calls());
+        assert!(!oc.timer.applied && oc.timer.due > crate::now() + 25.0);
+
+        oc.timer.due = 0.0;
+        overclock_step(&f.shared, &mut oc, false);
+        assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()]);
     }
 }
 
