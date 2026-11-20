@@ -458,3 +458,123 @@ mod tests {
         assert_eq!(argb(vec![0xFF, 0x00, 0x00, 0x80, 1, 2, 3, 4]), vec![0x80, 0xFF, 0x00, 0x00, 4, 1, 2, 3]);
     }
 }
+
+#[cfg(test)]
+mod tooltip_tests {
+    use super::*;
+
+    fn live(status: Status) -> Live {
+        Live {
+            status,
+            max_val: 8.234,
+            max_label: "GPU 12VHPWR Pin4 Current".into(),
+            min_val: Some(6.1),
+            min_label: "GPU 12VHPWR Pin1 Current".into(),
+            card_length_mm: 357.6,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_the_service_it_says_unknown() {
+        assert_eq!(tray_title(None, true), "AstralGuard: Unknown (service not running)");
+        let l = live(Status::Ok);
+        assert_eq!(
+            tray_title(Some(&l), false),
+            "AstralGuard: Unknown (service not running)",
+            "a stale reading is not shown"
+        );
+        assert_eq!(icon_status(Some(&l), false), Status::Missing);
+        assert_eq!(icon_status(None, true), Status::Missing);
+    }
+
+    #[test]
+    fn safe_shows_the_readings_and_never_hides_shutdown_only() {
+        let mut l = live(Status::Ok);
+        assert_eq!(tray_title(Some(&l), true), "AstralGuard: Safe | Max 8.23A, Min 6.10A");
+        l.effective_shutdown_only = true;
+        l.min_val = None;
+        assert_eq!(tray_title(Some(&l), true), "AstralGuard: Safe | Max 8.23A | shutdown-only");
+    }
+
+    #[test]
+    fn trouble_names_the_pins() {
+        let l = live(Status::Over);
+        assert_eq!(
+            tray_title(Some(&l), true),
+            "AstralGuard: Warning (over threshold) | Max Pin4 8.23A, Min Pin1 6.10A"
+        );
+        let l = live(Status::Mitigated);
+        assert!(tray_title(Some(&l), true).starts_with("AstralGuard: Protecting (GPU limited) | Max Pin4"));
+        let l = live(Status::Shutdown);
+        assert!(tray_title(Some(&l), true).starts_with("AstralGuard: Danger (shutting down)"));
+    }
+
+    #[test]
+    fn imbalance_shows_only_while_it_warns_and_not_while_limited() {
+        let mut l = live(Status::Ok);
+        l.imbalance_pct = Some(41.6);
+        assert!(!tray_title(Some(&l), true).contains("IMBALANCE"), "the idle spread is noise");
+        l.imbalance_active = true;
+        assert!(tray_title(Some(&l), true).ends_with(" | IMBALANCE 42%"));
+        l.status = Status::Over;
+        assert!(tray_title(Some(&l), true).ends_with(" | IMBALANCE 42%"));
+        l.status = Status::Mitigated;
+        assert!(!tray_title(Some(&l), true).contains("IMBALANCE"), "the limit says enough");
+    }
+
+    #[test]
+    fn sag_is_shouted_only_when_it_warns() {
+        let mut l = live(Status::Ok);
+        l.sag_deg = Some(0.4);
+        l.sag_status = SagStatus::Ok;
+        let t = tray_title(Some(&l), true);
+        assert!(t.ends_with(&format!(" | sag {}", fmt_tilt(0.4, 357.6))), "{t}");
+        l.sag_status = SagStatus::Serious;
+        l.sag_offaxis = Some(1.2);
+        let t = tray_title(Some(&l), true);
+        assert!(t.contains(" | SAG ") && t.contains(&format!(", abs {}", fmt_tilt(1.2, 357.6))), "{t}");
+    }
+
+    #[test]
+    fn paused_wins_over_the_reading() {
+        let mut l = live(Status::Over);
+        l.paused = true;
+        assert_eq!(tray_title(Some(&l), true), "AstralGuard: Unprotected (monitoring paused)");
+        assert_eq!(icon_status(Some(&l), true), Status::Paused);
+        l.paused = false;
+        assert_eq!(icon_status(Some(&l), true), Status::Over);
+        let l = live(Status::Error);
+        assert_eq!(tray_title(Some(&l), true), "AstralGuard: Unknown (waiting for pin sensors)");
+    }
+
+    #[test]
+    fn a_long_tooltip_is_cut_to_what_windows_holds() {
+        let mut l = live(Status::Ok);
+        l.imbalance_active = true;
+        l.imbalance_pct = Some(40.0);
+        l.sag_deg = Some(12.345);
+        l.sag_offaxis = Some(23.456);
+        l.effective_shutdown_only = true;
+        l.max_val = 12345678901234.0;
+        l.min_val = Some(98765432109876.0);
+        assert!(tray_title(Some(&l), true).chars().count() > TOOLTIP_MAX);
+        let tip = tray_tooltip(Some(&l), true);
+        assert_eq!(tip.chars().count(), TOOLTIP_MAX);
+        assert!(tip.ends_with("..."));
+        let short = live(Status::Ok);
+        assert_eq!(tray_tooltip(Some(&short), true), tray_title(Some(&short), true));
+    }
+
+    #[test]
+    fn the_dot_is_round_coloured_and_highlighted() {
+        let px = dot_rgba([200, 0, 0], 64);
+        assert_eq!(px.len(), 64 * 64 * 4);
+        let at = |x: usize, y: usize| &px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(at(0, 0)[3], 0, "the corner is transparent");
+        assert_eq!(at(44, 44), [200, 0, 0, 255], "the body is the status colour, opaque");
+        let hl = at(24, 22);
+        assert!(hl[0] > 200 && hl[1] > 50 && hl[3] == 255, "the highlight is lighter: {hl:?}");
+        assert!(px.chunks(4).any(|p| p[3] > 0 && p[3] < 255), "the rim is antialiased");
+    }
+}

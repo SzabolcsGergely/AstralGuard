@@ -354,3 +354,97 @@ mod tests {
         assert!(missing.is_empty(), "no glyph for {missing:?}");
     }
 }
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    /// WCAG 2 relative luminance and contrast ratio.
+    fn luminance(c: Color32) -> f64 {
+        let ch = |v: u8| {
+            let s = v as f64 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    fn themes() -> Vec<(&'static str, Theme)> {
+        PRESETS.iter().filter(|(k, _)| *k != "system").map(|(k, _)| (*k, preset(k))).collect()
+    }
+
+    #[test]
+    fn text_is_readable_on_every_theme() {
+        for (key, t) in themes() {
+            for (what, bg) in [("background", t.background), ("surface", t.surface), ("field", t.field())] {
+                let c = contrast(t.text, bg);
+                assert!(c >= 7.0, "{key}: text on {what} is {c:.1}:1");
+            }
+            let c = contrast(t.muted(), t.surface);
+            assert!(c >= 3.0, "{key}: muted text on a card is {c:.1}:1");
+            for (what, col) in [("danger", t.danger), ("accent", t.accent), ("pending", t.pending)] {
+                let c = contrast(col, t.surface);
+                assert!(c >= 3.0, "{key}: {what} on a card is {c:.1}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn cards_stand_out_from_the_background() {
+        for (key, t) in themes() {
+            // The card or its border has to differ: OLED's cards are black on black, outlined.
+            let c = contrast(t.surface, t.background).max(contrast(t.border, t.background));
+            assert!(c >= 1.2, "{key}: cards vanish ({c:.2}:1)");
+            assert_eq!(t.dark, luminance(t.background) < 0.2, "{key}: dark flag matches the background");
+        }
+    }
+
+    #[test]
+    fn lerp_ends_and_middle() {
+        let (a, b) = (Color32::from_rgb(0, 100, 200), Color32::from_rgb(100, 200, 0));
+        assert_eq!(lerp(a, b, 0.0), a);
+        assert_eq!(lerp(a, b, 1.0), b);
+        assert_eq!(lerp(a, b, 0.5), Color32::from_rgb(50, 150, 100));
+    }
+
+    #[test]
+    fn derived_colours_sit_between_their_sources() {
+        for (key, t) in themes() {
+            let between = |c: Color32, a: Color32, b: Color32| {
+                let l = luminance(c);
+                l >= luminance(a).min(luminance(b)) - 1e-9 && l <= luminance(a).max(luminance(b)) + 1e-9
+            };
+            assert!(between(t.muted(), t.text, t.surface), "{key}: muted");
+            assert!(between(t.faint(), t.text, t.surface), "{key}: faint");
+            assert!(contrast(t.faint(), t.surface) < contrast(t.muted(), t.surface), "{key}: faint is fainter");
+            assert!(between(t.grid(), t.border, t.surface), "{key}: grid");
+            assert!(between(t.tint_bg(t.red), t.surface, t.red), "{key}: tint");
+            assert_eq!(t.field(), if t.dark { t.background } else { Color32::WHITE });
+            assert_ne!(t.raised(), t.surface, "{key}: raised controls differ from the card");
+        }
+    }
+
+    #[test]
+    fn apply_puts_the_theme_into_egui() {
+        for (key, t) in themes() {
+            let ctx = egui::Context::default();
+            apply(&ctx, &t);
+            // Both of egui's light and dark styles: the same look whatever egui thinks the OS uses.
+            assert_eq!(ctx.style_of(egui::Theme::Dark).visuals, ctx.style_of(egui::Theme::Light).visuals, "{key}");
+            let v = ctx.style_of(egui::Theme::Dark).visuals.clone();
+            assert_eq!(v.dark_mode, t.dark, "{key}");
+            assert_eq!((v.panel_fill, v.window_fill), (t.background, t.surface), "{key}");
+            assert_eq!(v.hyperlink_color, t.accent);
+            assert_eq!(v.error_fg_color, t.danger);
+            assert_eq!(v.widgets.noninteractive.fg_stroke.color, t.text);
+        }
+    }
+}
