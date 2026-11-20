@@ -457,6 +457,105 @@ mod tests {
         // red, half transparent -> alpha first
         assert_eq!(argb(vec![0xFF, 0x00, 0x00, 0x80, 1, 2, 3, 4]), vec![0x80, 0xFF, 0x00, 0x00, 4, 1, 2, 3]);
     }
+
+    use ksni::Tray as _;
+
+    fn sni(paused: bool, connected: bool) -> Sni {
+        Sni {
+            link: Link::new(),
+            actions: Arc::default(),
+            status: Status::Mitigated,
+            tip: "AstralGuard: Protecting (GPU limited)".into(),
+            paused,
+            connected,
+        }
+    }
+
+    fn items(t: &Sni) -> Vec<(String, bool)> {
+        t.menu()
+            .iter()
+            .filter_map(|m| match m {
+                ksni::MenuItem::Standard(s) => Some((s.label.clone(), s.enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Click the menu item labelled `label`; the actions it asked the dashboard for.
+    fn click(t: &mut Sni, label: &str) -> Vec<TrayAction> {
+        let menu = t.menu();
+        let item = menu
+            .iter()
+            .find_map(|m| match m {
+                ksni::MenuItem::Standard(s) if s.label == label => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {label} in the menu"));
+        (item.activate)(t);
+        std::mem::take(&mut *t.actions.lock().unwrap())
+    }
+
+    #[test]
+    fn the_menu_reads_like_the_windows_one() {
+        let version = format!("{APP_NAME} v{APP_VERSION}");
+        let want = |pause: &str, enabled: bool| {
+            vec![
+                (version.clone(), false),
+                ("Open Dashboard".to_string(), true),
+                ("Open Log".to_string(), true),
+                (pause.to_string(), enabled),
+                ("Exit".to_string(), true),
+            ]
+        };
+        assert_eq!(items(&sni(false, true)), want("Pause protection", true));
+        assert_eq!(items(&sni(true, true)), want("Resume protection", true));
+        assert_eq!(items(&sni(false, false)), want("Pause protection", false), "no service: nothing to pause");
+    }
+
+    #[test]
+    fn menu_items_ask_the_dashboard_and_pausing_asks_first() {
+        let mut t = sni(false, true);
+        assert_eq!(click(&mut t, "Open Dashboard"), [TrayAction::Open]);
+        assert_eq!(click(&mut t, "Open Log"), [TrayAction::OpenLogTab], "no log file yet: the Log tab");
+        assert_eq!(click(&mut t, "Pause protection"), [TrayAction::ConfirmPause]);
+        assert_eq!(click(&mut t, "Exit"), [TrayAction::ConfirmExit]);
+        t.activate(0, 0);
+        assert_eq!(std::mem::take(&mut *t.actions.lock().unwrap()), [TrayAction::Open], "a left click opens it");
+        // Resuming needs no confirmation: it goes straight to the service.
+        let mut t = sni(true, true);
+        assert!(click(&mut t, "Resume protection").is_empty());
+    }
+
+    #[test]
+    fn the_icon_and_tooltip_follow_the_status() {
+        let t = sni(false, true);
+        assert_eq!((t.id(), t.title()), ("astralguard".to_string(), APP_NAME.to_string()));
+        assert!(matches!(t.category(), ksni::Category::Hardware));
+        assert_eq!(t.tool_tip().description, "AstralGuard: Protecting (GPU limited)");
+        let icons = t.icon_pixmap();
+        assert_eq!(icons.iter().map(|i| i.width).collect::<Vec<_>>(), [22, 32, 48]);
+        for i in &icons {
+            assert_eq!(i.data.len(), (i.width * i.height * 4) as usize);
+        }
+        // The middle of the 48 px dot, below the highlight: opaque, the Protecting colour.
+        let px = &icons[2].data[(36 * 48 + 24) * 4..(36 * 48 + 24) * 4 + 4];
+        let [r, g, b] = Status::Mitigated.color();
+        assert_eq!(px, [255, r, g, b]);
+    }
+
+    #[test]
+    fn the_tray_state_comes_from_the_link() {
+        let link = Link::new();
+        assert_eq!(Sni::state(&link).0, Status::Missing, "nothing yet");
+        {
+            let mut s = link.shared.lock().unwrap();
+            s.live = Some(Arc::new(Live { status: Status::Ok, paused: true, ..Live::default() }));
+            s.connected = true;
+        }
+        let (status, tip, paused, connected) = Sni::state(&link);
+        assert_eq!((status, paused, connected), (Status::Paused, true, true));
+        assert_eq!(tip, "AstralGuard: Unprotected (monitoring paused)");
+    }
 }
 
 #[cfg(test)]
