@@ -769,6 +769,19 @@ impl eframe::App for App {
 
     // Everything but drawing: also runs while the window is hidden (the tray, the service link).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+        let ctx = ui.ctx().clone();
+        self.modals(&ctx);
+    }
+}
+
+impl App {
+    /// eframe's logic() without its Frame, so a test can drive whole frames headless.
+    fn tick(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         self.apply_theme(ctx);
 
@@ -813,12 +826,6 @@ impl eframe::App for App {
             self.log.tick(&mut |j| link.send(j));
         }
         ctx.request_repaint_after(Duration::from_millis(1000));
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.draw(ui);
-        let ctx = ui.ctx().clone();
-        self.modals(&ctx);
     }
 }
 
@@ -1344,5 +1351,103 @@ mod tests {
         assert!(!loop_stalled(&live(1000.0), 1005.0), "exactly 5 s is not yet stalled");
         assert!(loop_stalled(&live(1000.0), 1005.1));
         assert!(loop_stalled(&live(1000.0), 1600.0));
+    }
+}
+
+/// Whole frames of the dashboard against the demo service, headless: every tab, theme and
+/// confirmation drawn without a window. CI's screenshot job checks how they look; this
+/// checks the drawing code runs (no panic, no empty frame) wherever cargo test runs.
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    struct Rig {
+        app: App,
+        ctx: egui::Context,
+        link: Arc<Link>,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.link.quit.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn rig(phase: f64, offline: bool, tab: Tab, theme: &str, confirm: Option<&str>) -> Rig {
+        let link = Link::new();
+        backend::start(link.clone(), Box::new(demo::Demo::new(phase, offline, false)));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !offline && link.live().0.is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ctx = egui::Context::default();
+        let prefs = Prefs { last_tab: tab.key().into(), theme: theme.into(), ..Prefs::default() };
+        let opts = Opts { demo: true, confirm: confirm.map(Into::into), ..Opts::default() };
+        let app = App::new(&ctx, link.clone(), Arc::default(), Arc::new(AtomicIsize::new(0)), prefs, opts, true, None);
+        Rig { app, ctx, link }
+    }
+
+    impl Rig {
+        /// `n` frames at `size`, a little apart so the demo answers what the tab asked for.
+        fn frames(&mut self, n: usize, size: Vec2) {
+            for _ in 0..n {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+                    ..Default::default()
+                };
+                let app = &mut self.app;
+                let mut out = self.ctx.run_ui(input, |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.tick(&ctx);
+                    app.draw(ui);
+                    app.modals(&ctx);
+                });
+                assert!(!out.shapes.is_empty(), "an empty frame");
+                // No GPU to upload fonts and images to.
+                out.textures_delta.clear();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
+    }
+
+    #[test]
+    fn every_tab_draws_idle_and_while_protecting() {
+        for phase in [35.0, 67.0] {
+            for tab in Tab::ALL {
+                let mut r = rig(phase, false, tab, "dark", None);
+                r.frames(4, DEFAULT_SIZE);
+                assert!(r.app.connected, "{tab:?}: the demo answered");
+                r.frames(2, MIN_SIZE);
+            }
+        }
+    }
+
+    #[test]
+    fn every_theme_draws() {
+        for (key, _) in theme::PRESETS {
+            let mut r = rig(35.0, false, Tab::Live, key, None);
+            r.frames(2, DEFAULT_SIZE);
+            if key != "system" {
+                assert_eq!(r.app.theme, theme::preset(key), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_confirmation_draws() {
+        for confirm in ["pause", "exit", "reset", "calibrate", "scan", "scan-result", "warnings"] {
+            let mut r = rig(35.0, false, Tab::Protection, "dark", Some(confirm));
+            r.frames(2, DEFAULT_SIZE);
+            assert!(r.app.confirm.is_some(), "{confirm}: still open, nobody answered");
+        }
+    }
+
+    #[test]
+    fn every_tab_draws_without_the_service() {
+        for tab in Tab::ALL {
+            let mut r = rig(35.0, true, tab, "light", None);
+            r.frames(3, DEFAULT_SIZE);
+            assert!(!r.app.connected, "{tab:?}");
+        }
     }
 }
