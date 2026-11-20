@@ -114,6 +114,29 @@ fn answer(
     Ok(Some(release))
 }
 
+/// A scheduled check: on, past the first wait after start, and a day after the last one.
+/// (Check now runs regardless.)
+fn due(enabled: bool, since_start: Duration, since_last: Option<Duration>) -> bool {
+    enabled && since_start >= FIRST_CHECK_AFTER && since_last.is_none_or(|d| d >= CHECK_EVERY)
+}
+
+/// What a check found, for the Settings tab; `notify` once per newly found version (not
+/// again every day while it stays the newest).
+fn outcome(found: Result<Option<Release>, String>, notified: &mut String, notify: &impl Fn(&str)) -> UpdateState {
+    match found {
+        Ok(Some(r)) => {
+            let version = r.tag_name.trim_start_matches(['v', 'V']).to_string();
+            if *notified != version {
+                notified.clone_from(&version);
+                notify(&version);
+            }
+            UpdateState::Available { version, url: r.html_url }
+        }
+        Ok(None) => UpdateState::UpToDate { checked: crate::clock::now() },
+        Err(error) => UpdateState::Failed { error },
+    }
+}
+
 impl Updates {
     /// Start the background checker. `notify` is called once per newly found version.
     pub fn spawn(ctx: egui::Context, enabled: bool, notify: impl Fn(&str) + Send + 'static) -> Updates {
@@ -130,27 +153,13 @@ impl Updates {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let forced = worker.check_now.swap(false, Ordering::Relaxed);
-                let due = worker.enabled.load(Ordering::Relaxed)
-                    && started.elapsed() >= FIRST_CHECK_AFTER
-                    && last.is_none_or(|t| t.elapsed() >= CHECK_EVERY);
-                if !forced && !due {
+                let enabled = worker.enabled.load(Ordering::Relaxed);
+                if !forced && !due(enabled, started.elapsed(), last.map(|t| t.elapsed())) {
                     continue;
                 }
                 last = Some(Instant::now());
                 worker.set(UpdateState::Checking, &ctx);
-                let next = match check() {
-                    Ok(Some(r)) => {
-                        let version = r.tag_name.trim_start_matches(['v', 'V']).to_string();
-                        if notified != version {
-                            notified = version.clone();
-                            notify(&version);
-                        }
-                        UpdateState::Available { version, url: r.html_url }
-                    }
-                    Ok(None) => UpdateState::UpToDate { checked: crate::clock::now() },
-                    Err(error) => UpdateState::Failed { error },
-                };
-                worker.set(next, &ctx);
+                worker.set(outcome(check(), &mut notified, &notify), &ctx);
             }
         });
         u
@@ -233,6 +242,61 @@ mod tests {
         assert!(err.starts_with("unexpected answer"), "{err}");
         let cut = answer(200, || Err("connection reset".into()), "1.0.0").err().unwrap();
         assert_eq!(cut, "connection reset");
+    }
+
+    #[test]
+    fn checks_wait_for_the_start_and_then_a_day() {
+        let (s, h) = (Duration::from_secs(1), Duration::from_secs(3600));
+        assert!(!due(true, 29 * s, None), "not in the first half minute");
+        assert!(due(true, 30 * s, None));
+        assert!(!due(false, 30 * s, None), "turned off");
+        assert!(!due(true, 48 * h, Some(23 * h)));
+        assert!(due(true, 48 * h, Some(24 * h)), "once a day");
+    }
+
+    fn release(tag: &str) -> Result<Option<Release>, String> {
+        Ok(Some(Release {
+            tag_name: tag.into(),
+            html_url: format!("https://example/{tag}"),
+            draft: false,
+            prerelease: false,
+        }))
+    }
+
+    #[test]
+    fn a_new_version_is_announced_once() {
+        let told = std::cell::RefCell::new(Vec::new());
+        let notify = |v: &str| told.borrow_mut().push(v.to_string());
+        let mut notified = String::new();
+        let state = outcome(release("v1.2.0"), &mut notified, &notify);
+        assert_eq!(state, UpdateState::Available { version: "1.2.0".into(), url: "https://example/v1.2.0".into() });
+        outcome(release("v1.2.0"), &mut notified, &notify);
+        outcome(release("V1.2.0"), &mut notified, &notify);
+        assert_eq!(*told.borrow(), ["1.2.0"], "not again every day");
+        outcome(release("v1.3.0"), &mut notified, &notify);
+        assert_eq!(*told.borrow(), ["1.2.0", "1.3.0"], "a newer one is");
+
+        assert!(matches!(outcome(Ok(None), &mut notified, &notify), UpdateState::UpToDate { .. }));
+        let failed = outcome(Err("offline? (dns)".into()), &mut notified, &notify);
+        assert_eq!(failed, UpdateState::Failed { error: "offline? (dns)".into() });
+        assert_eq!(told.borrow().len(), 2);
+    }
+
+    #[test]
+    fn the_settings_tab_turns_checks_on_off_and_asks_for_one() {
+        let u = Updates {
+            state: Arc::new(Mutex::new(UpdateState::Idle)),
+            enabled: Arc::new(AtomicBool::new(false)),
+            check_now: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(u.state(), UpdateState::Idle);
+        u.set_enabled(true);
+        assert!(u.enabled.load(Ordering::Relaxed));
+        u.check_now();
+        assert!(u.check_now.load(Ordering::Relaxed));
+        let ctx = egui::Context::default();
+        u.set(UpdateState::Checking, &ctx);
+        assert_eq!(u.clone().state(), UpdateState::Checking, "the worker's clone shares the state");
     }
 }
 
