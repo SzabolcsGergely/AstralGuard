@@ -12,7 +12,8 @@ src/service/monitor.rs 72     # (74.2) the rest is the run() loop: threads and r
 src/service/response.rs 93    # (95.9)
 src/service/imbalance.rs 88   # (90.3)
 src/service/flight.rs 91      # (93.8)
-src/service/mod.rs 86         # (88.8) the dashboard's requests: pause, check, apply
+src/service/mod.rs 87         # (89.4) the dashboard's requests: pause, check, apply
+src/service/crosscheck.rs 95  # (97.3) the HWiNFO comparison and its SM2 parser; observational only
 src/service/sag.rs 93         # (95.0) daily history and the creep warning included
 src/sensor/mod.rs 87          # (89.2)
 src/sensor/detect.rs 86       # (88.3) the sensor scan: safety rule 1's decisions
@@ -21,9 +22,13 @@ src/overclock/load.rs 98      # (100.0)
 src/overclock/mod.rs 91       # (93.5)
 src/overclock/clkctl.rs 86    # (88.0) the write gate of safety rule 10 included
 src/ipc.rs 81                 # (83.0) the socket: round trip, bad requests, 0660
+src/protocol.rs 96            # (98.7) the status words, the config / JSON keys
 src/config.rs 93              # (95.6)
 src/clock.rs 98               # (100.0) dates for the sag history
 src/logger.rs 84              # (86.7) the line format and rotation
 src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
 src/ui/settings.rs 35         # (37.5) the form -> change -> confirm path; the rest draws it
 src/ui/update.rs 40           # (42.1) reading GitHub's answer; the rest is the network call and its thread
+src/ui/tray.rs 62             # (64.9) the tooltip (shutdown-only never hidden) and the status dot; the rest is the OS tray
+src/ui/theme.rs 84            # (86.7) text contrast on every theme; the rest loads fonts
+src/ui/prefs.rs 75            # (77.9) ui.json: older files and broken ones load
