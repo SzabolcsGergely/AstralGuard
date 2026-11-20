@@ -486,11 +486,16 @@ fn match_gpu(nvml: &Nvml, subsystem_id: Option<u32>) -> Result<Option<(Handle, u
             Some((h, nvml.subsystem_id(h).ok()?))
         })
         .collect();
-    let pick = subsystem_id
-        .and_then(|want| handles.iter().find(|(_, s)| *s == want))
-        .or_else(|| handles.iter().find(|(_, s)| crate::sensor::model_for(*s).is_some()))
-        .or(if handles.len() == 1 { handles.first() } else { None });
-    Ok(pick.copied())
+    Ok(pick_gpu(&handles, subsystem_id))
+}
+
+/// `match_gpu`'s choice among (handle, subsystem id) pairs.
+fn pick_gpu<H: Copy>(gpus: &[(H, u32)], subsystem_id: Option<u32>) -> Option<(H, u32)> {
+    subsystem_id
+        .and_then(|want| gpus.iter().find(|(_, s)| *s == want))
+        .or_else(|| gpus.iter().find(|(_, s)| crate::sensor::model_for(*s).is_some()))
+        .or(if gpus.len() == 1 { gpus.first() } else { None })
+        .copied()
 }
 
 /// Applies and removes the emergency slowdown.
@@ -818,6 +823,9 @@ mod tests {
         lock_refused_below: u32,
         power_set_refused: bool,
         power_read_fails: bool,
+        reset_fails: bool,
+        /// The card's minimum power limit; 0 when NVML did not report one.
+        min_mw: u32,
         reachable: bool,
         opened: u32,
         log: Vec<String>,
@@ -854,6 +862,9 @@ mod tests {
         }
         fn reset_locked_clocks(&self) -> Result<(), String> {
             let mut c = self.0.lock().unwrap();
+            if c.reset_fails {
+                return Err("GPU_IS_LOST".into());
+            }
             c.locked = None;
             c.log.push("reset clocks".into());
             Ok(())
@@ -870,12 +881,16 @@ mod tests {
         fn new(name: &str) -> Rig {
             let marker = std::env::temp_dir().join(format!("ag-mitigation-{name}-{}.active", std::process::id()));
             clear_marker(&marker);
-            let card = Card { power_limit_mw: 520_000, reachable: true, ..Card::default() };
+            let card = Card { power_limit_mw: 520_000, min_mw: 400_000, reachable: true, ..Card::default() };
             Rig { card: Arc::new(Mutex::new(card)), marker }
         }
 
         /// A guard process: a new mitigator on the same card and marker file.
         fn mitigator(&self) -> GpuMitigator {
+            self.mitigator_at(self.marker.clone(), Some(180))
+        }
+
+        fn mitigator_at(&self, marker: PathBuf, clock_floor_mhz: Option<u32>) -> GpuMitigator {
             let card = Arc::clone(&self.card);
             let open: Opener = Box::new(move |_sub| {
                 let mut c = card.lock().unwrap();
@@ -887,12 +902,12 @@ mod tests {
                     gpu: Box::new(FakeGpu(Arc::clone(&card))),
                     gpu_name: "NVIDIA GeForce RTX 5090".into(),
                     subsystem_id: Some(0x89E3_1043),
-                    power_limit_min_mw: 400_000,
+                    power_limit_min_mw: c.min_mw,
                     power_limit_max_mw: 600_000,
-                    clock_floor_mhz: Some(180),
+                    clock_floor_mhz,
                 })
             });
-            GpuMitigator::new(open, self.marker.clone())
+            GpuMitigator::new(open, marker)
         }
 
         fn card(&self) -> std::sync::MutexGuard<'_, Card> {
@@ -1091,5 +1106,110 @@ mod tests {
         assert_eq!(m.unavailable_reason.as_deref(), Some("NVML unavailable (driver not loaded)"));
         assert!(!m.engage("tier 1"), "shutdown-only");
         assert!(rig.card().log.is_empty());
+    }
+
+    #[test]
+    fn the_card_is_picked_by_its_id_then_as_an_astral_then_as_the_only_one() {
+        const ASTRAL: u32 = 0x89E3_1043;
+        const OTHER: u32 = 0x1234_10DE;
+        let two = [(1, OTHER), (2, ASTRAL)];
+        assert_eq!(pick_gpu(&two, Some(OTHER)), Some((1, OTHER)), "the sensor's own card");
+        assert_eq!(pick_gpu(&two, None), Some((2, ASTRAL)), "unidentified: the Astral");
+        assert_eq!(pick_gpu(&two, Some(0xDEAD_BEEF)), Some((2, ASTRAL)), "an id NVML doesn't list");
+        assert_eq!(pick_gpu(&[(1, OTHER)], None), Some((1, OTHER)), "the only GPU");
+        assert_eq!(pick_gpu(&[(1, OTHER), (2, OTHER + 1)], None), None, "several, none known: no guess");
+        assert_eq!(pick_gpu::<u8>(&[], Some(ASTRAL)), None);
+    }
+
+    #[test]
+    fn connecting_again_keeps_the_open_card() {
+        let rig = Rig::new("reconnect");
+        let mut m = rig.mitigator();
+        assert!(m.connect(None) && m.connect(None));
+        assert_eq!(rig.card().opened, 1);
+        assert_eq!(m.gpu_name, "NVIDIA GeForce RTX 5090");
+    }
+
+    #[test]
+    fn a_failed_restore_is_reported_and_the_limit_still_ends() {
+        let rig = Rig::new("restore-fails");
+        let mut m = rig.mitigator();
+        m.connect(None);
+        m.engage("tier 1");
+        rig.card().power_set_refused = true;
+        rig.card().reset_fails = true;
+        assert!(!m.release(), "not restored");
+        assert!(!m.engaged, "the ladder counts it as released either way");
+        assert!(rig.marker().is_none());
+        assert_eq!(rig.card().power_limit_mw, 400_000);
+
+        // The clock reset alone failing is a failure too.
+        rig.card().power_set_refused = false;
+        rig.card().reset_fails = false;
+        rig.card().power_limit_mw = 520_000; // the user fixed it by hand
+        m.engage("tier 1");
+        rig.card().reset_fails = true;
+        assert!(!m.release());
+        assert_eq!(rig.card().power_limit_mw, 520_000, "the power limit is still put back");
+    }
+
+    #[test]
+    fn a_card_without_a_minimum_power_limit_is_limited_by_its_clocks_only() {
+        let rig = Rig::new("no-min");
+        rig.card().min_mw = 0;
+        let mut m = rig.mitigator();
+        m.connect(None);
+        assert!(m.engage("tier 1"));
+        assert_eq!(rig.card().log, ["lock 180"], "no 0 W limit is ever sent");
+        assert!(!rig.marker().unwrap().applied_power_limit);
+    }
+
+    #[test]
+    fn a_floor_already_on_the_ladder_is_tried_once() {
+        let rig = Rig::new("floor-dup");
+        rig.card().lock_refused_below = 600;
+        let mut m = rig.mitigator_at(rig.marker.clone(), Some(500));
+        m.connect(None);
+        assert!(m.engage("tier 1"));
+        assert_eq!(rig.card().locked, Some((700, 700)));
+    }
+
+    #[test]
+    fn recovery_lists_what_it_could_not_put_back() {
+        let rig = Rig::new("recovery-fails");
+        let mut first = rig.mitigator();
+        first.connect(None);
+        first.engage("tier 2");
+        drop(first);
+        rig.card().reset_fails = true;
+        rig.card().power_set_refused = true;
+        let msg = rig.mitigator().startup_recovery().unwrap();
+        assert!(msg.contains("clock reset failed") && msg.contains("power limit restore failed"), "{msg}");
+        assert!(!msg.contains("restored"), "{msg}");
+        assert!(rig.marker().is_none(), "told once, not at every start");
+    }
+
+    #[test]
+    fn recovery_without_a_saved_limit_says_how_to_fix_it() {
+        let rig = Rig::new("recovery-unknown");
+        rig.card().power_read_fails = true;
+        let mut first = rig.mitigator();
+        first.connect(None);
+        first.engage("tier 1");
+        drop(first);
+        let msg = rig.mitigator().startup_recovery().unwrap();
+        assert!(msg.contains("no saved power limit") && msg.contains("nvidia-smi -pl"), "{msg}");
+        assert_eq!(rig.card().locked, None, "the clocks are still put back");
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_does_not_stop_the_limit() {
+        let rig = Rig::new("no-marker");
+        let path = std::env::temp_dir().join(format!("ag-no-such-dir-{}", std::process::id())).join("m.active");
+        let mut m = rig.mitigator_at(path.clone(), Some(180));
+        m.connect(None);
+        assert!(m.engage("tier 1"), "the marker only matters after a crash");
+        assert!(!path.exists());
+        assert!(m.release());
     }
 }

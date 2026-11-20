@@ -90,15 +90,25 @@ fn check() -> Result<Option<Release>, String> {
         .header("Accept", "application/vnd.github+json")
         .call()
         .map_err(|e| format!("offline? ({e})"))?;
-    match response.status().as_u16() {
+    let status = response.status().as_u16();
+    answer(status, || response.body_mut().read_to_string().map_err(|e| e.to_string()), APP_VERSION)
+}
+
+/// What GitHub's answer means for a dashboard running `current`. The body is read only
+/// for a success.
+fn answer(
+    status: u16,
+    body: impl FnOnce() -> Result<String, String>,
+    current: &str,
+) -> Result<Option<Release>, String> {
+    match status {
         200..=299 => {}
         // No release published yet.
         404 => return Ok(None),
         code => return Err(format!("GitHub answered {code}")),
     }
-    let body = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    let release: Release = serde_json::from_str(&body).map_err(|e| format!("unexpected answer ({e})"))?;
-    if release.draft || release.prerelease || !is_newer(&release.tag_name, APP_VERSION) {
+    let release: Release = serde_json::from_str(&body()?).map_err(|e| format!("unexpected answer ({e})"))?;
+    if release.draft || release.prerelease || !is_newer(&release.tag_name, current) {
         return Ok(None);
     }
     Ok(Some(release))
@@ -197,6 +207,32 @@ mod tests {
         assert!(!is_newer("v2.0.0", "2.0.0"));
         assert!(!is_newer("v1.9.9", "2.0.0"));
         assert!(!is_newer("nightly", "2.0.0"));
+    }
+
+    fn body(json: &str) -> impl FnOnce() -> Result<String, String> + '_ {
+        move || Ok(json.to_string())
+    }
+
+    #[test]
+    fn githubs_answer() {
+        let release = r#"{"tag_name":"v1.2.0","html_url":"https://example/r","draft":false,"prerelease":false}"#;
+        let found = answer(200, body(release), "1.1.0").unwrap().expect("newer");
+        assert_eq!((found.tag_name.as_str(), found.html_url.as_str()), ("v1.2.0", "https://example/r"));
+        assert!(answer(200, body(release), "1.2.0").unwrap().is_none(), "up to date");
+
+        let pre = r#"{"tag_name":"v9.0.0","html_url":"u","prerelease":true}"#;
+        assert!(answer(200, body(pre), "1.0.0").unwrap().is_none(), "a pre-release is not offered");
+        let draft = r#"{"tag_name":"v9.0.0","html_url":"u","draft":true}"#;
+        assert!(answer(200, body(draft), "1.0.0").unwrap().is_none());
+
+        let unread = || -> Result<String, String> { panic!("the body is read only for a success") };
+        assert!(answer(404, unread, "1.0.0").unwrap().is_none(), "no release yet");
+        assert_eq!(answer(403, unread, "1.0.0").err().unwrap(), "GitHub answered 403");
+
+        let err = answer(200, body("<html>"), "1.0.0").err().unwrap();
+        assert!(err.starts_with("unexpected answer"), "{err}");
+        let cut = answer(200, || Err("connection reset".into()), "1.0.0").err().unwrap();
+        assert_eq!(cut, "connection reset");
     }
 }
 
