@@ -17,7 +17,7 @@ pub fn install(log_dir: &Path) {
             let _ = writeln!(
                 f,
                 "=== {} pid {} ===\n{msg}\n{backtrace}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                crate::clock::human(&crate::clock::now()),
                 std::process::id()
             );
         }

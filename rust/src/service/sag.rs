@@ -12,8 +12,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Local, NaiveDate, TimeZone};
-
 use super::Shared;
 use crate::config::{self, SagBaseline};
 use crate::logger;
@@ -455,8 +453,7 @@ impl SagMonitor {
     }
 
     fn history_add(&mut self, dev: f64, off_axis: f64, now: f64) {
-        let day =
-            Local.timestamp_opt(now as i64, 0).single().map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default();
+        let day = crate::clock::local(now as i64).map(|t| crate::clock::day(&t)).unwrap_or_default();
         if self.day.as_ref().is_some_and(|d| *d != day) {
             if let Some(median_dev) = self.write_history_row() {
                 self.check_drift(median_dev);
@@ -502,14 +499,14 @@ impl SagMonitor {
         let Some(path) = &self.history else { return };
         let Ok(text) = fs::read_to_string(path) else { return };
         let key = self.baseline_key();
-        let today = Local::now().date_naive();
+        let today = crate::clock::now().date();
         let oldest = text.lines().skip(1).find_map(|row| {
             let parts: Vec<&str> = row.splitn(5, ',').collect();
             if parts.len() < 5 || parts[4].trim_matches('"') != key {
                 return None;
             }
-            let date = NaiveDate::parse_from_str(parts[0], "%Y-%m-%d").ok()?;
-            let age = (today - date).num_days() as f64;
+            let date = crate::clock::parse_day(parts[0])?;
+            let age = crate::clock::days_between(date, today) as f64;
             // Rows are chronological, so the first match is the oldest.
             (DRIFT_MIN_DAYS..=DRIFT_WINDOW_DAYS).contains(&age).then(|| parts[1].parse::<f64>().ok()).flatten()
         });
@@ -642,7 +639,8 @@ mod scenario_tests {
     const LEVEL_KEY: &str = "\"0.00000,0.00000,1.00000\"";
 
     fn days_ago(n: i64) -> String {
-        (Local::now().date_naive() - chrono::Duration::days(n)).format("%Y-%m-%d").to_string()
+        let today = crate::clock::now().date();
+        today.checked_sub(jiff::Span::new().days(n)).unwrap().to_string()
     }
 
     fn creep_notices(r: &Rig) -> usize {

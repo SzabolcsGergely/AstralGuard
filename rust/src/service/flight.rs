@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, TimeZone};
+use crate::clock;
 
 use crate::config::log_dir;
 use crate::logger;
@@ -44,18 +44,14 @@ impl FlightRecorder {
     pub fn dump(&self, event: &str) -> Option<PathBuf> {
         let first = self.buf.front()?;
         let n = first.1.len();
-        let path = self.dir.join(format!("flight_{}_{event}.csv", Local::now().format("%Y%m%d_%H%M%S")));
+        let path = self.dir.join(format!("flight_{}_{event}.csv", clock::now().strftime("%Y%m%d_%H%M%S")));
         let mut out = String::from("time,");
         out += &(1..=n).map(|i| format!("pin{i}")).collect::<Vec<_>>().join(",");
         out += ",sag_deg\n";
         for (ts, vals, sag) in &self.buf {
             let secs = ts.floor() as i64;
             let ms = ((ts - ts.floor()) * 1000.0) as u32;
-            let when = Local
-                .timestamp_opt(secs, 0)
-                .single()
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
+            let when = clock::local(secs).map(|t| clock::human(&t)).unwrap_or_default();
             out += &format!(
                 "{when}.{ms:03},{},{}\n",
                 vals.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(","),

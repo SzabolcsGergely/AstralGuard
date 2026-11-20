@@ -502,7 +502,7 @@ impl SettingsView {
                                     UpdateState::Idle => (format!("v{current}"), t.muted()),
                                     UpdateState::Checking => ("checking…".into(), t.muted()),
                                     UpdateState::UpToDate { checked } => {
-                                        (format!("v{current} is the latest · {}", checked.format("%H:%M")), t.muted())
+                                        (format!("v{current} is the latest · {}", checked.strftime("%H:%M")), t.muted())
                                     }
                                     UpdateState::Available { version, .. } => {
                                         (format!("v{version} available"), t.accent)

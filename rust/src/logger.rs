@@ -56,8 +56,7 @@ pub fn log(level: Level, msg: &str) {
     if level < sink.min {
         return;
     }
-    let now = chrono::Local::now();
-    let line = format!("{} | {} | {}\n", now.format("%Y-%m-%d %H:%M:%S,%3f"), level.name(), msg);
+    let line = format!("{} | {} | {}\n", crate::clock::human_ms(&crate::clock::now()), level.name(), msg);
     if sink.file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0) + line.len() as u64 > MAX_BYTES
     {
         rotate(sink);

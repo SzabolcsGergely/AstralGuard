@@ -25,7 +25,7 @@ pub enum UpdateState {
     Idle,
     Checking,
     UpToDate {
-        checked: chrono::DateTime<chrono::Local>,
+        checked: jiff::ZonedDateTime,
     },
     Available {
         version: String,
@@ -137,7 +137,7 @@ impl Updates {
                         }
                         UpdateState::Available { version, url: r.html_url }
                     }
-                    Ok(None) => UpdateState::UpToDate { checked: chrono::Local::now() },
+                    Ok(None) => UpdateState::UpToDate { checked: crate::clock::now() },
                     Err(error) => UpdateState::Failed { error },
                 };
                 worker.set(next, &ctx);

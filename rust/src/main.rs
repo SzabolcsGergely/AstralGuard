@@ -1,6 +1,7 @@
 // No console window on Windows: every mode logs to a file or shows a window.
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod clock;
 mod config;
 mod crash;
 mod ipc;

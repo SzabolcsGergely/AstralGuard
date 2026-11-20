@@ -62,7 +62,7 @@ fn shutdown_note_path() -> std::path::PathBuf {
 fn note_shutdown_reason(reason: &str) {
     let note = ShutdownNote {
         time: crate::now(),
-        time_human: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        time_human: crate::clock::human(&crate::clock::now()),
         reason: reason.into(),
         version: APP_VERSION.into(),
     };
