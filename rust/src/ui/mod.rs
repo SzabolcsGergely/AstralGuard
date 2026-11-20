@@ -289,7 +289,8 @@ pub fn run(args: &[String]) -> i32 {
     let size = opts
         .size
         .map(|(w, h)| Vec2::new(w, h))
-        .or(prefs.window.filter(|_| !shot).map(|g| Vec2::new(g[2], g[3])))
+        // An empty size saved by an older version opens at the default, not the minimum.
+        .or(prefs.window.filter(|g| !shot && g[2] >= 1.0 && g[3] >= 1.0).map(|g| Vec2::new(g[2], g[3])))
         .unwrap_or(DEFAULT_SIZE)
         .max(MIN_SIZE);
     let saved_pos = prefs
@@ -372,6 +373,24 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// A desktop notification for a newly found release.
+/// The window geometry to remember, [x, y, w, h]: None keeps what was saved. An off-screen
+/// position (a hidden start) is not remembered, nor an empty size: a window hidden to the tray
+/// can report 0 x 0, which would then open at the minimum size instead of the person's own.
+fn geometry(outer: Option<egui::Rect>, inner: Option<egui::Rect>, saved: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    let (o, i) = (outer?, inner?);
+    if o.min.x <= -10000.0 || o.min.y <= -10000.0 {
+        return None;
+    }
+    let (w, h) = if i.width() >= 1.0 && i.height() >= 1.0 {
+        (i.width(), i.height())
+    } else {
+        // Keep the saved size, or none yet: the default then.
+        let g = saved.filter(|g| g[2] >= 1.0 && g[3] >= 1.0)?;
+        (g[2], g[3])
+    };
+    Some([o.min.x, o.min.y, w, h])
+}
+
 fn notify_update(version: &str) {
     let title = format!("{APP_NAME} update");
     let msg = format!("Version {version} is available. Open the dashboard to download it.");
@@ -558,16 +577,15 @@ impl App {
         if minimized == Some(true) {
             return;
         }
-        if let (Some(o), Some(i)) = (outer, inner) {
-            if o.min.x > -10000.0 && o.min.y > -10000.0 {
-                self.prefs.window = Some([o.min.x, o.min.y, i.width(), i.height()]);
-            }
+        if let Some(g) = geometry(outer, inner, self.prefs.window) {
+            self.prefs.window = Some(g);
         }
         self.prefs.last_tab = self.tab.key().into();
     }
 
     fn save_prefs(&self) {
-        if self.shot.is_none() {
+        // Never from a test: it would overwrite the person's own ui.json.
+        if self.shot.is_none() && !cfg!(test) {
             self.prefs.save();
         }
     }
@@ -1337,6 +1355,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_line_options() {
+        let args: Vec<String> = "--demo --phase 67 --tab overclock --theme oled --size 660x820 --scale 1.5 \
+                                 --confirm pause --check-layout --screenshot out.png --bogus"
+            .split_whitespace()
+            .map(Into::into)
+            .collect();
+        let o = Opts::parse(&args);
+        assert!(o.demo && o.check_layout && !o.show && !o.offline);
+        assert_eq!(o.phase, Some(67.0));
+        assert_eq!((o.tab.as_deref(), o.theme.as_deref()), (Some("overclock"), Some("oled")));
+        assert_eq!((o.size, o.scale), (Some((660.0, 820.0)), Some(1.5)));
+        assert_eq!((o.confirm.as_deref(), o.screenshot.as_deref()), (Some("pause"), Some("out.png")));
+        let o = Opts::parse(&["--size".into(), "800".into(), "--phase".into(), "soon".into()]);
+        assert_eq!((o.size, o.phase), (None, None), "a malformed value is ignored, not a crash");
+        let o = Opts::parse(&["--window".into(), "--action".into(), "log".into(), "--show".into()]);
+        assert!(o.window && o.show);
+        assert_eq!(o.action.as_deref(), Some("log"));
+    }
+
+    #[test]
+    fn the_window_remembers_a_real_size_and_position_only() {
+        let rect = |x: f32, y: f32, w: f32, h: f32| Some(egui::Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h)));
+        let saved = Some([10.0, 20.0, 900.0, 840.0]);
+        assert_eq!(
+            geometry(rect(100.0, 50.0, 820.0, 860.0), rect(108.0, 80.0, 800.0, 820.0), saved),
+            Some([100.0, 50.0, 800.0, 820.0])
+        );
+        // Hidden to the tray, the window reports 0 x 0: the size stays what it was.
+        assert_eq!(
+            geometry(rect(748.9, 208.0, 0.0, 0.0), rect(748.9, 208.0, 0.0, 0.0), saved),
+            Some([748.9, 208.0, 900.0, 840.0])
+        );
+        assert_eq!(
+            geometry(rect(748.9, 208.0, 0.0, 0.0), rect(748.9, 208.0, 0.0, 0.0), None),
+            None,
+            "no size yet: the default"
+        );
+        assert_eq!(
+            geometry(rect(1.0, 1.0, 0.0, 0.0), rect(1.0, 1.0, 0.0, 0.0), Some([748.9, 208.0, 0.0, 0.0])),
+            None,
+            "a 0 x 0 saved by an older version is not carried on"
+        );
+        assert_eq!(
+            geometry(rect(-32000.0, -32000.0, 800.0, 820.0), rect(0.0, 0.0, 800.0, 820.0), saved),
+            None,
+            "off-screen"
+        );
+        assert_eq!(geometry(None, rect(0.0, 0.0, 800.0, 820.0), saved), None);
+    }
+
+    #[test]
     fn always_on_top_is_hidden_only_on_a_wayland_window() {
         assert!(runs_on_wayland(Some("wayland-0"), None));
         assert!(!runs_on_wayland(Some("wayland-0"), Some("x11")), "XWayland honours it");
@@ -1440,6 +1509,51 @@ mod render_tests {
             r.frames(2, DEFAULT_SIZE);
             assert!(r.app.confirm.is_some(), "{confirm}: still open, nobody answered");
         }
+    }
+
+    #[test]
+    fn tray_actions_open_the_window_where_they_ask() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.app.shown = false;
+        r.app.actions.lock().unwrap().push(tray::TrayAction::OpenLogTab);
+        r.frames(1, DEFAULT_SIZE);
+        assert!(r.app.shown, "every tray action shows the window");
+        assert_eq!(r.app.tab, Tab::Log);
+        r.app.actions.lock().unwrap().push(tray::TrayAction::ConfirmPause);
+        r.frames(1, DEFAULT_SIZE);
+        assert!(matches!(r.app.confirm, Some(Confirm::Pause)), "pausing from the tray asks first");
+        r.app.confirm = None;
+        r.app.actions.lock().unwrap().push(tray::TrayAction::ConfirmExit);
+        r.frames(1, DEFAULT_SIZE);
+        assert!(matches!(r.app.confirm, Some(Confirm::Exit)), "so does exiting");
+    }
+
+    fn finish(r: &mut Rig, job: Job, result: Result<Response, String>) {
+        r.link.shared.lock().unwrap().done.push((job, result));
+        r.frames(1, DEFAULT_SIZE);
+    }
+
+    #[test]
+    fn finished_jobs_show_their_outcome() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        finish(&mut r, Job::Calibrate, Ok(Response::Ok));
+        assert!(r.app.flash.as_ref().unwrap().0.starts_with("Calibrating"));
+        finish(&mut r, Job::SetPaused(true), Err("Access is denied".into()));
+        assert_eq!(r.app.flash.as_ref().unwrap().0, "Access is denied");
+
+        r.app.scanning = true;
+        let report = ScanReport { found: true, message: "saved".into(), lines: vec![] };
+        finish(&mut r, Job::ScanSensor, Ok(Response::Scan { report }));
+        assert!(!r.app.scanning);
+        assert!(matches!(&r.app.confirm, Some(Confirm::ScanResult(rep)) if rep.found));
+        r.app.confirm = None;
+        r.app.scanning = true;
+        finish(&mut r, Job::ScanSensor, Err("timed out".into()));
+        assert!(!r.app.scanning, "the button comes back even when the scan failed");
+        assert_eq!(r.app.flash.as_ref().unwrap().0, "timed out");
+
+        finish(&mut r, Job::Exit, Ok(Response::Ok));
+        assert!(r.app.quitting && r.link.guard_stopped.load(Ordering::Relaxed), "Exit stopped the guard: quit too");
     }
 
     #[test]

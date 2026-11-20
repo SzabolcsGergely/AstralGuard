@@ -7,6 +7,17 @@ here.
 
 ## [Unreleased]
 
+### Added
+
+- An **OLED black** theme (Settings → Window → Theme): pure black background and cards,
+  outlined in grey, so an OLED panel keeps its pixels off.
+
+### Fixed
+
+- The dashboard could forget its window size and open at the minimum size: a window hidden to
+  the tray reports a size of 0 × 0, and that was saved. An empty size is no longer saved, and
+  one saved by an earlier version opens at the default size.
+
 ### Changed
 
 - The dashboard now asks before any change that makes protection weaker than your current
