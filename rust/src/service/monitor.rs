@@ -590,26 +590,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                 sleep(POLL_INTERVAL_SEC);
             }
             Ok(TickOutcome::Gone(e)) => {
-                let msg = format!("Sensor source lost: {e}");
-                logger::warn(&msg);
-                shared.event(EventKind::Warning, 1004, &msg);
-                shared.notify(APP_NAME, "Sensor source lost. Waiting to reconnect...");
-                if t1.over_start.is_some() {
-                    logger::warn("Sustained over-threshold timer reset by sensor disconnect.");
-                }
-                if response.engaged {
-                    // Deliberately stays limited: losing the ability to measure is not
-                    // evidence the current stopped being dangerous. It releases normally
-                    // once readings come back and stay clean.
-                    logger::warn(
-                        "GPU stays limited while the sensor is gone; it will be released once clean readings return.",
-                    );
-                }
-                shared.update(|l| {
-                    l.status = Status::Error;
-                    l.last_message = "Sensor source lost".into();
-                    l.card.clear();
-                });
+                sensor_lost(shared, &e, t1.over_start.is_some(), response.engaged);
                 sensor = None;
                 last_sample = None;
                 missing_notified = false;
@@ -628,17 +609,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                 break;
             }
             Err(panic) => {
-                let what = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "unknown panic".into());
-                logger::error(format!("Loop error: {what}"));
-                shared.event(EventKind::Error, 9001, &format!("Loop error: {what}"));
-                shared.update(|l| {
-                    l.status = Status::Error;
-                    l.last_message = format!("Error: {what}");
-                });
+                loop_error(shared, &panic_text(panic.as_ref()));
                 sleep(1.0);
             }
         }
@@ -661,6 +632,46 @@ pub fn run(shared: &Arc<Shared>) -> bool {
 }
 
 /// Sleep up to `seconds`; returns early to stop, or when a sensor scan saved an adapter.
+/// The pins stopped reading. The limit is not touched: losing the ability to measure is
+/// not evidence the current stopped being dangerous. It releases normally once readings
+/// come back and stay clean.
+fn sensor_lost(shared: &Shared, e: &str, timing_over: bool, limited: bool) {
+    let msg = format!("Sensor source lost: {e}");
+    logger::warn(&msg);
+    shared.event(EventKind::Warning, 1004, &msg);
+    shared.notify(APP_NAME, "Sensor source lost. Waiting to reconnect...");
+    if timing_over {
+        logger::warn("Sustained over-threshold timer reset by sensor disconnect.");
+    }
+    if limited {
+        logger::warn("GPU stays limited while the sensor is gone; it will be released once clean readings return.");
+    }
+    shared.update(|l| {
+        l.status = Status::Error;
+        l.last_message = "Sensor source lost".into();
+        l.card.clear();
+    });
+}
+
+/// A panic's message, whichever way it was raised.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+/// A tick panicked: the loop carries on, and the dashboard says why it shows no status.
+fn loop_error(shared: &Shared, what: &str) {
+    logger::error(format!("Loop error: {what}"));
+    shared.event(EventKind::Error, 9001, &format!("Loop error: {what}"));
+    shared.update(|l| {
+        l.status = Status::Error;
+        l.last_message = format!("Error: {what}");
+    });
+}
+
 fn wait_or_stop(shared: &Shared, seconds: f64) {
     let end = crate::now() + seconds;
     while crate::now() < end && !shared.stop.load(Ordering::Relaxed) {
@@ -1404,6 +1415,63 @@ mod tests {
         oc.timer.due = 0.0;
         overclock_step(&f.shared, &mut oc, false);
         assert_eq!(f.gpu.calls(), vec!["set_power_limit_w(520)".to_string()]);
+    }
+
+    #[test]
+    fn a_lost_sensor_leaves_the_limit_alone_and_says_unknown() {
+        use crate::protocol::Settings;
+        let shared = Shared::new(Settings::default(), None, true);
+        let mut response = limited_ladder(&shared);
+        shared.update(|l| {
+            l.status = Status::Mitigated;
+            l.card = "ROG Astral RTX 5090 OC".into();
+        });
+        sensor_lost(&shared, "I2C read failed", true, response.engaged);
+        assert!(response.engaged, "still limited: no reading is not a safe reading");
+        let live = shared.snapshot();
+        assert_eq!((live.status, live.status.text()), (Status::Error, "Unknown"));
+        assert_eq!(live.last_message, "Sensor source lost");
+        assert!(live.card.is_empty(), "the dashboard shows no card until it reconnects");
+        // Clean readings after the reconnect release it the normal way.
+        let s = shared.settings();
+        let t = Tick { now: 10.0, max_val: 1.0, max_label: "Pin1", tier1_expired: false, tier1_reason: "" };
+        response.evaluate(&t, &s);
+        let t = Tick { now: 200.0, ..t };
+        response.evaluate(&t, &s);
+        assert!(!response.engaged);
+    }
+
+    #[test]
+    fn a_panicking_tick_is_reported_with_its_message() {
+        use crate::protocol::Settings;
+        let shared = Shared::new(Settings::default(), None, true);
+        let caught = |f: fn()| panic_text(catch_unwind(f).unwrap_err().as_ref());
+        assert_eq!(caught(|| panic!("static text")), "static text");
+        assert_eq!(caught(|| panic!("formatted {}", 7)), "formatted 7");
+        assert_eq!(caught(|| std::panic::panic_any(42u8)), "unknown panic");
+        loop_error(&shared, "index out of bounds");
+        let live = shared.snapshot();
+        assert_eq!((live.status, live.last_message.as_str()), (Status::Error, "Error: index out of bounds"));
+    }
+
+    #[test]
+    fn waiting_ends_early_for_a_stop_or_a_scan() {
+        use crate::protocol::Settings;
+        let shared = Shared::new(Settings::default(), None, true);
+        let t = std::time::Instant::now();
+        wait_or_stop(&shared, 0.3);
+        assert!(t.elapsed() >= Duration::from_millis(280), "the full wait otherwise");
+
+        shared.reconnect_now.store(true, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        wait_or_stop(&shared, 30.0);
+        assert!(t.elapsed() < Duration::from_secs(5), "a Scan's find reconnects at once");
+        assert!(!shared.reconnect_now.load(Ordering::Relaxed), "and the request is used up");
+
+        shared.stop.store(true, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        wait_or_stop(&shared, 30.0);
+        assert!(t.elapsed() < Duration::from_secs(5), "stopping is not held up");
     }
 }
 
