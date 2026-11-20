@@ -1444,6 +1444,34 @@ mod request_tests {
     }
 
     #[test]
+    fn the_charts_and_notices_keep_only_their_newest() {
+        let shared = Shared::new(Settings::default(), None, true);
+        for i in 0..PIN_HISTORY_SAMPLES + 5 {
+            shared.record_pins(i as f64, vec![i as f64; 6]);
+        }
+        for i in 0..IMU_HISTORY_SAMPLES + 5 {
+            shared.record_imu(i as f64, [i as f64, 0.0, 1.0]);
+        }
+        for i in 0..NOTICES_KEPT + 5 {
+            shared.notify("t", &format!("n{i}"));
+        }
+        let live = shared.snapshot();
+        assert_eq!(live.history.len(), PIN_HISTORY_SAMPLES);
+        assert_eq!(live.history.first().unwrap().0, 5.0, "the oldest dropped");
+        assert_eq!(live.history.last().unwrap().0, (PIN_HISTORY_SAMPLES + 4) as f64);
+        assert_eq!(live.imu_history.len(), IMU_HISTORY_SAMPLES);
+        assert_eq!(live.imu_history.first().unwrap().0, 5.0);
+        assert_eq!(live.sag_xyz, Some([(IMU_HISTORY_SAMPLES + 4) as f64, 0.0, 1.0]), "the latest reading");
+        let n = notices(&shared);
+        assert_eq!(n.len(), NOTICES_KEPT);
+        assert_eq!((n[0].as_str(), n.last().unwrap().as_str()), ("n5", format!("n{}", NOTICES_KEPT + 4).as_str()));
+        // Sequence numbers keep counting past the dropped ones: a dashboard asking "since"
+        // never sees an old notice again.
+        let Response::Events { notices } = shared.handle(Request::Events { since: 0 }) else { panic!() };
+        assert_eq!(notices.last().unwrap().seq, (NOTICES_KEPT + 5) as u64);
+    }
+
+    #[test]
     fn fast_imu_polling_is_capped_and_can_be_turned_off() {
         let shared = quiet();
         shared.handle(Request::ImuFast { seconds: 1.0e6 });
