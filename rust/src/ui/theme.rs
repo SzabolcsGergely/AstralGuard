@@ -49,6 +49,11 @@ pub const DARK: Theme = dark_preset(0x111317, 0x1A1D23, 0x2A2E36, 0xE6E9EE, 0x4D
 pub const GRAPHITE: Theme = dark_preset(0x161616, 0x202020, 0x313131, 0xE8E8E8, 0x9AA6B8);
 pub const MIDNIGHT: Theme = dark_preset(0x0A0F1C, 0x111A2C, 0x1F2B45, 0xE2E8F5, 0x5B9DFF);
 pub const VIOLET: Theme = dark_preset(0x120F1A, 0x1B1726, 0x2D2642, 0xECE8F5, 0xA07CFF);
+/// Pure black, cards included: on an OLED panel black pixels are off, so this is the one
+/// that saves power and never glows. The cards are told apart by their border alone.
+pub const OLED: Theme = dark_preset(0x000000, 0x000000, 0x2E2E2E, 0xE6E9EE, 0x4D94FF);
+// Dark title bar and widgets, and a border you can see: it is all that marks a card.
+const _: () = assert!(OLED.dark && OLED.border.r() >= 0x20);
 pub const LIGHT: Theme = Theme {
     dark: false,
     background: hex(0xF2F3F5),
@@ -64,9 +69,10 @@ pub const LIGHT: Theme = Theme {
 };
 
 /// (key stored in ui.json, label in the picker)
-pub const PRESETS: [(&str, &str); 6] = [
+pub const PRESETS: [(&str, &str); 7] = [
     ("system", "System"),
     ("dark", "Dark"),
+    ("oled", "OLED black"),
     ("graphite", "Graphite"),
     ("midnight", "Midnight"),
     ("violet", "Violet"),
@@ -75,6 +81,7 @@ pub const PRESETS: [(&str, &str); 6] = [
 
 pub fn preset(key: &str) -> Theme {
     match key {
+        "oled" => OLED,
         "graphite" => GRAPHITE,
         "midnight" => MIDNIGHT,
         "violet" => VIOLET,
@@ -290,6 +297,22 @@ pub fn apply(ctx: &egui::Context, t: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_theme_in_the_picker_has_its_own_preset() {
+        for (key, _) in PRESETS {
+            if key == "system" || key == "dark" {
+                continue;
+            }
+            assert_ne!(preset(key), DARK, "{key} falls back to Dark");
+        }
+        assert_eq!(preset("unknown"), DARK, "an old or unknown key gets Dark");
+    }
+
+    #[test]
+    fn oled_is_black_cards_included() {
+        assert_eq!((OLED.background, OLED.surface), (Color32::BLACK, Color32::BLACK));
+    }
 
     /// Every non-ASCII character the program shows (outside comments) has a glyph in the text
     /// fonts as installed here, so none draws as an empty box. On Linux that is egui's own fonts
