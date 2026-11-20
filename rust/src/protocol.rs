@@ -545,3 +545,67 @@ pub fn fmt_tilt(deg: f64, card_length_mm: f64) -> String {
 pub fn sag_mm(deg: f64, card_length_mm: f64) -> f64 {
     card_length_mm * deg.to_radians().sin()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [Status; 7] =
+        [Status::Ok, Status::Missing, Status::Over, Status::Mitigated, Status::Paused, Status::Error, Status::Shutdown];
+
+    #[test]
+    fn status_words_are_the_documented_ones() {
+        // CLAUDE.md: Safe / Warning / Protecting / Danger / Unprotected / Unknown, everywhere.
+        let words: Vec<_> = ALL.iter().map(|s| s.text()).collect();
+        assert_eq!(words, ["Safe", "Unknown", "Warning", "Protecting", "Unprotected", "Unknown", "Danger"]);
+        assert_eq!(Status::default(), Status::Missing, "nothing read yet is Unknown, never Safe");
+    }
+
+    #[test]
+    fn every_status_has_its_own_detail_and_colour() {
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(a.detail(), b.detail(), "{a:?} / {b:?}");
+                assert_ne!(a.color(), b.color(), "{a:?} / {b:?}");
+            }
+        }
+        assert_eq!(Status::Shutdown.color(), [230, 0, 0], "danger is red");
+        assert_eq!(Status::Ok.color(), [0, 200, 0], "safe is green");
+    }
+
+    #[test]
+    fn mode_keys_are_the_config_values_and_parse_back() {
+        for m in [ResponseMode::Tiered, ResponseMode::ShutdownOnly] {
+            assert_eq!(ResponseMode::parse(m.key()), Some(m));
+            assert_eq!(serde_json::to_string(&m).unwrap(), format!("\"{}\"", m.key()), "the JSON name too");
+        }
+        assert_eq!(ResponseMode::parse("  Shutdown_Only "), Some(ResponseMode::ShutdownOnly), "hand-edited config.ini");
+        assert_eq!(ResponseMode::parse("shutdown"), None);
+        assert_eq!(ResponseMode::default(), ResponseMode::Tiered);
+
+        for r in [ImbalanceResponse::Warn, ImbalanceResponse::Act] {
+            assert_eq!(ImbalanceResponse::parse(r.key()), Some(r));
+            assert_eq!(serde_json::to_string(&r).unwrap(), format!("\"{}\"", r.key()));
+        }
+        assert_eq!(ImbalanceResponse::parse(" ACT"), Some(ImbalanceResponse::Act));
+        assert_eq!(ImbalanceResponse::parse("shutdown"), None);
+        assert_eq!(ImbalanceResponse::default(), ImbalanceResponse::Warn, "imbalance warns unless asked to act");
+    }
+
+    #[test]
+    fn the_socket_is_where_the_packages_expect_it() {
+        if cfg!(windows) {
+            assert_eq!(socket_name(), "astralguard.sock");
+        } else {
+            // The systemd unit's RuntimeDirectory=astralguard.
+            assert_eq!(socket_name(), "/run/astralguard/astralguard.sock");
+        }
+    }
+
+    #[test]
+    fn tilt_and_sag() {
+        assert!(sag_mm(0.0, 357.6).abs() < 1e-9);
+        assert!((sag_mm(1.0, 357.6) - 6.24).abs() < 0.01, "{}", sag_mm(1.0, 357.6));
+        assert!(sag_mm(-1.0, 357.6) < 0.0, "the sign says which way");
+    }
+}
