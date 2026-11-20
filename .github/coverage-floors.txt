@@ -29,7 +29,7 @@ src/clock.rs 98               # (100.0) dates for the sag history
 src/logger.rs 84              # (86.7) the line format and rotation
 src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
 src/ui/settings.rs 76         # (78.8) the form -> change -> confirm path, and the Protection / Settings tabs drawn
-src/ui/update.rs 40           # (42.1) reading GitHub's answer; the rest is the network call and its thread
+src/ui/update.rs 68           # (70.1) GitHub's answer, when to check, what to announce; the rest is the network call
 src/ui/tray.rs 89             # (91.1) the tooltip (shutdown-only never hidden), the dot, the Linux menu; the Windows tray is not measured
 src/ui/theme.rs 86            # (88.4) text contrast on every theme; the rest loads fonts
 src/ui/prefs.rs 75            # (77.9) ui.json: older files and broken ones load

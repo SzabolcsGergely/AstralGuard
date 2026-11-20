@@ -270,3 +270,145 @@ mod notices {
         }
     }
 }
+
+/// Safety rule 3 from the dashboard's side: it keeps working, and keeps retrying, while the
+/// service is away, and every command's answer comes back to the job that asked.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Service {
+        up: bool,
+        /// Every request, in order, by its JSON "op".
+        seen: Vec<String>,
+    }
+
+    struct Fake(Arc<Mutex<Service>>);
+
+    impl Backend for Fake {
+        fn request(&mut self, req: &Request) -> Result<Response, String> {
+            let mut s = self.0.lock().unwrap();
+            let op = serde_json::to_value(req).unwrap()["op"].as_str().unwrap_or_default().to_string();
+            s.seen.push(op);
+            if !s.up {
+                return Err("The service is not running".into());
+            }
+            Ok(match req {
+                Request::Live => Response::Live { live: Box::new(Live { max_val: 7.5, ..Live::default() }) },
+                Request::CalibrateSag => Response::Error { message: "no IMU".into() },
+                _ => Response::Ok,
+            })
+        }
+    }
+
+    fn start_fake(up: bool) -> (Arc<Link>, Arc<Mutex<Service>>, thread::JoinHandle<()>) {
+        let service = Arc::new(Mutex::new(Service { up, ..Service::default() }));
+        let link = Link::new();
+        // Polls once a second: a poll right after a command is then easy to tell apart.
+        link.window_visible.store(false, Ordering::Relaxed);
+        link.notices.store(false, Ordering::Relaxed);
+        let worker = start(link.clone(), Box::new(Fake(service.clone())));
+        (link, service, worker)
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stop(link: &Link, worker: thread::JoinHandle<()>) {
+        link.quit.store(true, Ordering::Relaxed);
+        link.send(Job::LogTail); // wake it
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn the_dashboard_keeps_its_last_snapshot_and_retries_while_the_service_is_away() {
+        let (link, service, worker) = start_fake(true);
+        wait_for("the first snapshot", || link.live().1);
+        assert_eq!(link.live().0.unwrap().max_val, 7.5);
+
+        service.lock().unwrap().up = false;
+        wait_for("the outage to show", || !link.live().1);
+        let (live, connected) = link.live();
+        assert!(!connected);
+        assert_eq!(live.unwrap().max_val, 7.5, "the tray keeps the last reading to show");
+        assert_eq!(link.shared.lock().unwrap().error, "The service is not running");
+
+        let polls = service.lock().unwrap().seen.len();
+        wait_for("a retry", || service.lock().unwrap().seen.len() > polls);
+        service.lock().unwrap().up = true;
+        wait_for("the reconnect", || link.live().1);
+        assert!(link.shared.lock().unwrap().error.is_empty());
+        stop(&link, worker);
+    }
+
+    #[test]
+    fn every_answer_comes_back_to_the_job_that_asked() {
+        let (link, _service, worker) = start_fake(true);
+        link.send(Job::ScanSensor);
+        link.send(Job::Calibrate);
+        wait_for("both answers", || link.shared.lock().unwrap().done.len() == 2);
+        let done = link.take_done();
+        assert!(matches!(&done[0], (Job::ScanSensor, Ok(Response::Ok))));
+        // The service's Error answer reaches the dashboard as a failed job.
+        assert!(matches!(&done[1], (Job::Calibrate, Err(m)) if m == "no IMU"));
+        assert!(link.take_done().is_empty(), "taken once");
+        stop(&link, worker);
+    }
+
+    #[test]
+    fn a_command_that_changes_the_service_is_followed_by_a_poll() {
+        let (link, service, worker) = start_fake(true);
+        wait_for("the first snapshot", || link.live().1);
+        let ops_after = |n: usize| service.lock().unwrap().seen[n..].to_vec();
+
+        let n = service.lock().unwrap().seen.len();
+        link.send(Job::SetPaused(true));
+        thread::sleep(Duration::from_millis(400)); // well inside the 1 s poll
+        assert_eq!(ops_after(n), ["set_paused", "live"], "the pause shows at once");
+
+        let n = service.lock().unwrap().seen.len();
+        link.send(Job::LogTail);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(ops_after(n), ["log_tail"], "reading the log changes nothing");
+        stop(&link, worker);
+    }
+
+    #[test]
+    fn jobs_ask_for_the_right_thing() {
+        let patch = SettingsPatch::default();
+        let ops: Vec<(Job, &str)> = vec![
+            (Job::SetPaused(true), "set_paused"),
+            (Job::Check(patch.clone()), "check"),
+            (Job::Apply(patch.clone()), "apply"),
+            (Job::ResetDefaults, "reset_defaults"),
+            (Job::Calibrate, "calibrate_sag"),
+            (Job::ImuFast(30.0), "imu_fast"),
+            (Job::Exit, "exit"),
+            (Job::AutostartGet, "autostart"),
+            (Job::AutostartSet(true), "set_autostart"),
+            (Job::LogTail, "log_tail"),
+            (Job::FlightDumps, "flight_dumps"),
+            (Job::ReadFlight("x.csv".into()), "read_flight"),
+            (Job::ScanSensor, "scan_sensor"),
+            (Job::ApplyOverclock(patch), "apply_overclock"),
+            (Job::OverclockStatus, "overclock_status"),
+            (Job::OverclockLive, "overclock_live"),
+        ];
+        for (job, op) in &ops {
+            assert_eq!(serde_json::to_value(job.request()).unwrap()["op"], *op, "{job:?}");
+        }
+        let mutating: Vec<_> = ops.iter().filter(|(j, _)| j.mutates()).map(|(_, op)| *op).collect();
+        assert_eq!(
+            mutating,
+            ["set_paused", "apply", "reset_defaults", "calibrate_sag", "imu_fast", "scan_sensor", "apply_overclock"]
+        );
+        let Request::LogTail { max_bytes } = Job::LogTail.request() else { panic!() };
+        assert_eq!(max_bytes, 65536);
+    }
+}
