@@ -179,7 +179,9 @@ cargo test
     HTML report is the `coverage` artifact. The decision code (the ladder, imbalance, sag,
     the overclock's math, apply / restore and checks, config parsing) has per-file floors in
     `.github/coverage-floors.txt`; raise one when coverage rises, never lower one to let a
-    change through. Hardware, FFI and GUI code is reported only: it cannot run in CI.
+    change through. The dashboard's drawing code runs too, headless against the demo service
+    (`ui::render_tests`), and has floors that keep those tests running. Hardware and FFI code
+    is reported only: it cannot run in CI.
   - Everything with `--locked` (`Cargo.lock` must be committed and current), on a pinned
     toolchain (`RUST_TOOLCHAIN` in ci.yml and packages.yml); jobs and test steps have
     timeouts, so a deadlocked test fails instead of hanging.

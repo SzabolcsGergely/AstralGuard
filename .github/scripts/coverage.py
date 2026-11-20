@@ -3,8 +3,8 @@
     python3 .github/scripts/coverage.py coverage.json .github/coverage-floors.txt
 
 Writes a table to $GITHUB_STEP_SUMMARY (or stdout). Only the files in the floors file are
-enforced: the code that makes decisions. Hardware, FFI and GUI code cannot run in CI and is
-reported only. A floor is raised when coverage rises, never lowered to let a change through.
+enforced: the code that makes decisions, and the dashboard drawn headless. Hardware and FFI
+code cannot run in CI and is reported only. A floor is raised when coverage rises, never lowered to let a change through.
 """
 
 import json

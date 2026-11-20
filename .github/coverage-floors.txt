@@ -1,6 +1,7 @@
 # Line coverage floors (percent) for the code that makes decisions, checked by CI's coverage
 # job (.github/scripts/coverage.py). Raise a floor when coverage rises; never lower one to let
-# a change through. Hardware, FFI and GUI code is reported but has no floor.
+# a change through. Hardware and FFI code is reported but has no floor. The dashboard is
+# drawn headless against the demo service (ui::render_tests); its floors keep that running.
 #
 # Each floor sits about 2 points under what CI measured (in brackets, 2026-11-20), so
 # moving a few lines in a refactor passes and dropping a test does not. Take the number from
@@ -8,7 +9,7 @@
 # to a point higher. A floor set from a measurement outside CI (marked "local") sits about
 # 5 under it: local runs have read about 2.5 points above CI's. Raise it once CI's number is known.
 src/mitigation.rs 67          # (69.0) limit, restore, crash recovery, card choice; the rest is the NVML binding
-src/service/monitor.rs 72     # (74.2) the rest is the run() loop: threads and real time
+src/service/monitor.rs 76     # (78.5) the rest is the run() loop: threads and real time
 src/service/response.rs 93    # (95.9)
 src/service/imbalance.rs 88   # (90.3)
 src/service/flight.rs 91      # (93.8)
@@ -27,8 +28,17 @@ src/config.rs 93              # (95.6)
 src/clock.rs 98               # (100.0) dates for the sag history
 src/logger.rs 84              # (86.7) the line format and rotation
 src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
-src/ui/settings.rs 35         # (37.5) the form -> change -> confirm path; the rest draws it
+src/ui/settings.rs 76         # (78.8) the form -> change -> confirm path, and the Protection / Settings tabs drawn
 src/ui/update.rs 40           # (42.1) reading GitHub's answer; the rest is the network call and its thread
 src/ui/tray.rs 62             # (64.9) the tooltip (shutdown-only never hidden) and the status dot; the rest is the OS tray
-src/ui/theme.rs 84            # (86.7) text contrast on every theme; the rest loads fonts
+src/ui/theme.rs 86            # (88.4) text contrast on every theme; the rest loads fonts
 src/ui/prefs.rs 75            # (77.9) ui.json: older files and broken ones load
+src/ui/mod.rs 55              # (57.4) the window and every tab's frame; the rest is the native window and screenshots
+src/ui/live.rs 88             # (90.0) Overview
+src/ui/overclock.rs 84        # (86.5) Overclock
+src/ui/imu.rs 92              # (94.1) Sag
+src/ui/log.rs 88              # (90.3) Log
+src/ui/thermal.rs 95          # (97.4) the charts
+src/ui/widgets.rs 96          # (98.5)
+src/ui/backend.rs 73          # (75.7) the dashboard's link to the service
+src/ui/demo.rs 71             # (73.7) the simulated service the screenshots and render tests use
