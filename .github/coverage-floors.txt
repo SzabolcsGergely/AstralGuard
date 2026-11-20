@@ -3,26 +3,27 @@
 # a change through. Hardware, FFI and GUI code is reported but has no floor.
 #
 # Each floor sits about 2 points under what CI measured (in brackets, 2026-11-20), so
-# moving a few lines in a refactor passes and dropping a test does not. A floor set from a
-# measurement outside CI (marked "local") sits about 5 under it: local runs have read about
-# 2.5 points above CI's. Raise it once CI's number is known.
-src/mitigation.rs 67          # (69.8) limit, restore, crash recovery, card choice; the rest is the NVML binding
-src/service/monitor.rs 72     # (74.4) the rest is the run() loop: threads and real time
-src/service/response.rs 94    # (96.1)
-src/service/imbalance.rs 88   # (90.8)
-src/service/flight.rs 91      # (93.3)
-src/service/mod.rs 87         # (89.2) the dashboard's requests: pause, check, apply
-src/service/sag.rs 93         # (95.2) daily history and the creep warning included
+# moving a few lines in a refactor passes and dropping a test does not. Take the number from
+# this job's table (the JSON report): the HTML report counts lines differently and reads up
+# to a point higher. A floor set from a measurement outside CI (marked "local") sits about
+# 5 under it: local runs have read about 2.5 points above CI's. Raise it once CI's number is known.
+src/mitigation.rs 67          # (69.0) limit, restore, crash recovery, card choice; the rest is the NVML binding
+src/service/monitor.rs 72     # (74.2) the rest is the run() loop: threads and real time
+src/service/response.rs 93    # (95.9)
+src/service/imbalance.rs 88   # (90.3)
+src/service/flight.rs 91      # (93.8)
+src/service/mod.rs 86         # (88.8) the dashboard's requests: pause, check, apply
+src/service/sag.rs 93         # (95.0) daily history and the creep warning included
 src/sensor/mod.rs 87          # (89.2)
-src/sensor/detect.rs 86       # (87.9) the sensor scan: safety rule 1's decisions
+src/sensor/detect.rs 86       # (88.3) the sensor scan: safety rule 1's decisions
 src/overclock/curve.rs 96     # (98.2)
 src/overclock/load.rs 98      # (100.0)
-src/overclock/mod.rs 94       # (96.0)
-src/overclock/clkctl.rs 87    # (88.9) the write gate of safety rule 10 included
-src/ipc.rs 83                 # (85.4) the socket: round trip, bad requests, 0660
-src/config.rs 94              # (96.0)
+src/overclock/mod.rs 91       # (93.5)
+src/overclock/clkctl.rs 86    # (88.0) the write gate of safety rule 10 included
+src/ipc.rs 81                 # (83.0) the socket: round trip, bad requests, 0660
+src/config.rs 93              # (95.6)
 src/clock.rs 98               # (100.0) dates for the sag history
-src/logger.rs 87              # (89.5) the line format and rotation
-src/watchdog.rs 46            # (48.6) the restart policy; the rest spawns processes
-src/ui/settings.rs 37         # (39.2) the form -> change -> confirm path; the rest draws it
-src/ui/update.rs 42           # (44.8) reading GitHub's answer; the rest is the network call and its thread
+src/logger.rs 84              # (86.7) the line format and rotation
+src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
+src/ui/settings.rs 35         # (37.5) the form -> change -> confirm path; the rest draws it
+src/ui/update.rs 40           # (42.1) reading GitHub's answer; the rest is the network call and its thread
