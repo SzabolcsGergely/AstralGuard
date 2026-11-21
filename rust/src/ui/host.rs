@@ -103,38 +103,54 @@ pub fn run(show: bool) -> i32 {
     if show || prefs.show_on_start {
         window = spawn_window(TrayAction::Open);
     }
-    let mut code = 0;
+    let mut failed = false;
     while !link.quit.load(Ordering::Relaxed) {
-        if let Some(w) = window.as_mut() {
-            if let Ok(Some(status)) = w.child.try_wait() {
-                window = None;
-                if status.code() == Some(EXIT_GUARD_STOPPED) {
-                    break;
-                }
-            }
-        }
         let pending = std::mem::take(&mut *actions.lock().unwrap());
-        for a in pending {
-            // A running window gets the click; if its stdin is gone it is on its way out.
-            let delivered = window
-                .as_mut()
-                .and_then(|w| w.stdin.as_mut())
-                .is_some_and(|s| writeln!(s, "{}", action_key(a)).and_then(|_| s.flush()).is_ok());
-            if !delivered {
-                if let Some(mut old) = window.take() {
-                    let _ = old.child.wait();
-                }
-                window = spawn_window(a);
-                if window.is_none() {
-                    code = 1;
-                }
-            }
+        if !step(&mut window, pending, &mut spawn_window, &mut failed) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     link.quit.store(true, Ordering::Relaxed);
     tray.join();
-    code
+    i32::from(failed)
+}
+
+/// One pass of the tray process: forget a window that has closed, then hand each click to
+/// the running window, or to a new one when there is none or its pipe is broken. False once
+/// the window stopped the guard: the tray goes with it. `failed` is set when a window could
+/// not be started.
+fn step(
+    window: &mut Option<Window>,
+    pending: Vec<TrayAction>,
+    spawn: &mut dyn FnMut(TrayAction) -> Option<Window>,
+    failed: &mut bool,
+) -> bool {
+    if let Some(w) = window.as_mut() {
+        if let Ok(Some(status)) = w.child.try_wait() {
+            *window = None;
+            if status.code() == Some(EXIT_GUARD_STOPPED) {
+                return false;
+            }
+        }
+    }
+    for a in pending {
+        // A running window gets the click; if its stdin is gone it is on its way out.
+        let delivered = window
+            .as_mut()
+            .and_then(|w| w.stdin.as_mut())
+            .is_some_and(|s| writeln!(s, "{}", action_key(a)).and_then(|_| s.flush()).is_ok());
+        if !delivered {
+            if let Some(mut old) = window.take() {
+                let _ = old.child.wait();
+            }
+            *window = spawn(a);
+            if window.is_none() {
+                *failed = true;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -154,5 +170,93 @@ mod tests {
             assert_eq!(parse_action(&format!("{}\n", action_key(a))), Some(a));
         }
         assert_eq!(parse_action("reboot"), None);
+    }
+
+    /// A stand-in window: a shell running `script`, its stdin piped from the tray.
+    fn window(script: &str) -> Window {
+        let mut child = Command::new("sh").args(["-c", script]).stdin(Stdio::piped()).spawn().unwrap();
+        let stdin = child.stdin.take();
+        Window { child, stdin }
+    }
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ag-host-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn clicks_go_to_the_open_window() {
+        let out = temp("clicks");
+        let mut w = Some(window(&format!("cat > '{}'", out.display())));
+        let mut no_spawn = |_: TrayAction| -> Option<Window> { panic!("the window is open") };
+        let mut failed = false;
+        assert!(step(&mut w, vec![TrayAction::ConfirmPause, TrayAction::OpenLogTab], &mut no_spawn, &mut failed));
+        let mut w = w.unwrap();
+        w.stdin = None; // the window reads to the end
+        w.child.wait().unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "pause\nlog\n");
+        assert!(!failed);
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn a_closed_window_is_opened_again_with_the_click() {
+        let mut w = Some(window("exit 0"));
+        w.as_mut().unwrap().child.wait().unwrap(); // closed by the person
+        let mut started = Vec::new();
+        let mut spawn = |a: TrayAction| {
+            started.push(a);
+            Some(window("cat > /dev/null"))
+        };
+        let mut failed = false;
+        assert!(step(&mut w, vec![], &mut spawn, &mut failed));
+        assert!(w.is_none(), "forgotten once it closed");
+        assert!(step(&mut w, vec![TrayAction::OpenLogTab], &mut spawn, &mut failed));
+        assert_eq!(started, [TrayAction::OpenLogTab], "the new window opens on the Log tab");
+        let mut w = w.unwrap();
+        w.stdin = None;
+        w.child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_broken_pipe_gets_a_new_window() {
+        let mut broken = window("cat > /dev/null");
+        broken.stdin = None;
+        let mut w = Some(broken);
+        let mut started = Vec::new();
+        let mut spawn = |a: TrayAction| {
+            started.push(a);
+            Some(window("cat > /dev/null"))
+        };
+        let mut failed = false;
+        assert!(step(&mut w, vec![TrayAction::Open], &mut spawn, &mut failed));
+        assert_eq!(started, [TrayAction::Open]);
+        let mut w = w.unwrap();
+        w.stdin = None;
+        w.child.wait().unwrap();
+    }
+
+    #[test]
+    fn a_window_that_stopped_the_guard_takes_the_tray_with_it() {
+        let mut w = Some(window(&format!("exit {EXIT_GUARD_STOPPED}")));
+        w.as_mut().unwrap().child.wait().unwrap();
+        let mut no_spawn = |_: TrayAction| -> Option<Window> { panic!("nothing to open") };
+        let mut failed = false;
+        assert!(!step(&mut w, vec![TrayAction::Open], &mut no_spawn, &mut failed));
+        assert!(!failed);
+    }
+
+    #[test]
+    fn a_window_that_cannot_start_is_a_failure_and_the_next_click_tries_again() {
+        let mut w = None;
+        let mut tries = 0;
+        let mut spawn = |_: TrayAction| -> Option<Window> {
+            tries += 1;
+            None
+        };
+        let mut failed = false;
+        assert!(step(&mut w, vec![TrayAction::Open], &mut spawn, &mut failed));
+        assert!(failed && w.is_none());
+        assert!(step(&mut w, vec![TrayAction::Open], &mut spawn, &mut failed));
+        assert_eq!(tries, 2);
     }
 }
