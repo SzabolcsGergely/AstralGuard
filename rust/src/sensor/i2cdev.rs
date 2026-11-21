@@ -382,4 +382,49 @@ mod tests {
         assert_eq!(choose(&card(), Some(14), Some(&s)).unwrap().num, 14);
         assert!(choose(&card(), Some(2), None).is_err());
     }
+
+    /// An ordinary file standing in for /dev/i2c-N. The kernel refuses every I2C ioctl on
+    /// it (ENOTTY), so these tests reach no device and no bus: only the error handling runs.
+    fn not_a_bus(name: &str) -> (I2cDev, PathBuf) {
+        let path = std::env::temp_dir().join(format!("ag-i2cdev-{}-{name}", std::process::id()));
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+        (I2cDev { file, addressed: false }, path)
+    }
+
+    #[test]
+    fn a_read_bigger_than_one_smbus_block_is_refused_before_any_ioctl() {
+        let (mut dev, path) = not_a_bus("big");
+        let err = dev.read(0x00, &mut [0u8; I2C_SMBUS_BLOCK_MAX + 1]).unwrap_err();
+        assert_eq!(err, "33 bytes is more than one SMBus block");
+        assert!(!dev.addressed, "not even addressed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_device_that_refuses_the_address_is_an_error_and_does_not_answer() {
+        let (mut dev, path) = not_a_bus("address");
+        let err = dev.read(0x00, &mut [0u8; 12]).unwrap_err();
+        assert!(err.starts_with("I2C_SLAVE 0x2B failed: "), "{err}");
+        assert!(!dev.addressed, "tried again next time");
+        assert!(!dev.answers(), "the scan's probe says no");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_failed_block_read_is_an_error_and_leaves_the_buffer_alone() {
+        let (mut dev, path) = not_a_bus("read");
+        dev.addressed = true;
+        let mut buf = [0xAAu8; 12];
+        let err = dev.read(0x00, &mut buf).unwrap_err();
+        assert!(err.starts_with("I2C_SMBUS block read failed: "), "{err}");
+        assert_eq!(buf, [0xAA; 12], "no stale or partial data handed on");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_missing_bus_says_what_to_do() {
+        let Err(err) = I2cDev::open(u32::MAX) else { panic!("/dev/i2c-{} exists", u32::MAX) };
+        assert!(err.starts_with(&format!("cannot open /dev/i2c-{}", u32::MAX)), "{err}");
+        assert!(err.ends_with("run as root and load i2c-dev"), "{err}");
+    }
 }
