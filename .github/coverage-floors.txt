@@ -17,6 +17,7 @@ src/service/mod.rs 87         # (89.4) the dashboard's requests: pause, check, a
 src/service/crosscheck.rs 95  # (97.3) the HWiNFO comparison and its SM2 parser; observational only
 src/service/sag.rs 93         # (95.0) daily history and the creep warning included
 src/sensor/mod.rs 87          # (89.2)
+src/sensor/i2cdev.rs 85       # (87.6) Linux: which adapter, and the error handling on no device (rule 1)
 src/sensor/detect.rs 86       # (88.3) the sensor scan: safety rule 1's decisions
 src/overclock/curve.rs 96     # (98.2)
 src/overclock/load.rs 98      # (100.0)
@@ -27,7 +28,7 @@ src/protocol.rs 96            # (98.7) the status words, the config / JSON keys
 src/config.rs 93              # (95.6)
 src/clock.rs 98               # (100.0) dates for the sag history
 src/logger.rs 84              # (86.7) the line format and rotation
-src/watchdog.rs 45            # (47.3) the restart policy; the rest spawns processes
+src/watchdog.rs 86            # (88.6) the restart policy and its loop, against real child processes
 src/ui/settings.rs 76         # (78.8) the form -> change -> confirm path, and the Protection / Settings tabs drawn
 src/ui/update.rs 68           # (70.1) GitHub's answer, when to check, what to announce; the rest is the network call
 src/ui/tray.rs 89             # (91.1) the tooltip (shutdown-only never hidden), the dot, the Linux menu; the Windows tray is not measured
