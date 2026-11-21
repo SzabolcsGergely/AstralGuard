@@ -131,42 +131,54 @@ pub fn run(args: &[String]) -> i32 {
     let mut service = Supervised::new("service");
     let mut ui = with_ui.then(|| Supervised::new("ui"));
 
-    loop {
-        for sup in std::iter::once(&mut service).chain(ui.as_mut()) {
-            if sup.child.is_none() && sup.restart_at.is_some_and(|t| Instant::now() >= t) {
-                start(sup, &job);
-            }
-        }
-
-        if let Some(code) = poll(&mut service) {
-            if after_exit(service.mode, code) == AfterExit::StopEverything {
-                logger::info(format!(
-                    "Service exited cleanly after {:.1} min; watchdog stopping.",
-                    service.started.elapsed().as_secs_f64() / 60.0
-                ));
-                if let Some(ui) = ui.as_mut().and_then(|u| u.child.as_mut()) {
-                    let _ = ui.kill();
-                }
-                return 0;
-            }
-            schedule_restart(&mut service, code);
-        }
-        if let Some(sup) = ui.as_mut() {
-            if let Some(code) = poll(sup) {
-                if after_exit(sup.mode, code) == AfterExit::StayClosed {
-                    logger::info("UI closed; the service keeps running.");
-                    sup.restart_at = None;
-                } else {
-                    schedule_restart(sup, code);
-                }
-            }
-        }
+    while supervise(&mut service, ui.as_mut(), &mut |sup| start_with(sup, &job, command(&exe(), sup))) {
         std::thread::sleep(Duration::from_millis(200));
     }
+    0
 }
 
-fn start(sup: &mut Supervised, job: &job::Job) {
-    let mut cmd = Command::new(exe());
+/// One pass: start what is due, then act on whatever exited. False once the service
+/// stopped on purpose: the UI is killed and the watchdog ends too.
+fn supervise(
+    service: &mut Supervised,
+    mut ui: Option<&mut Supervised>,
+    start: &mut dyn FnMut(&mut Supervised),
+) -> bool {
+    for sup in std::iter::once(&mut *service).chain(ui.as_deref_mut()) {
+        if sup.child.is_none() && sup.restart_at.is_some_and(|t| Instant::now() >= t) {
+            start(sup);
+        }
+    }
+
+    if let Some(code) = poll(service) {
+        if after_exit(service.mode, code) == AfterExit::StopEverything {
+            logger::info(format!(
+                "Service exited cleanly after {:.1} min; watchdog stopping.",
+                service.started.elapsed().as_secs_f64() / 60.0
+            ));
+            if let Some(ui) = ui.and_then(|u| u.child.as_mut()) {
+                let _ = ui.kill();
+            }
+            return false;
+        }
+        schedule_restart(service, code);
+    }
+    if let Some(sup) = ui {
+        if let Some(code) = poll(sup) {
+            if after_exit(sup.mode, code) == AfterExit::StayClosed {
+                logger::info("UI closed; the service keeps running.");
+                sup.restart_at = None;
+            } else {
+                schedule_restart(sup, code);
+            }
+        }
+    }
+    true
+}
+
+/// `program <mode>`, told it runs under the watchdog and, after a crash, why it was restarted.
+fn command(program: &std::path::Path, sup: &Supervised) -> Command {
+    let mut cmd = Command::new(program);
     cmd.arg(sup.mode).env("GUARD_WATCHDOG", "1");
     match &sup.restart_reason {
         Some(r) => {
@@ -176,6 +188,11 @@ fn start(sup: &mut Supervised, job: &job::Job) {
             cmd.env_remove("GUARD_WATCHDOG_RESTART");
         }
     }
+    cmd
+}
+
+/// Start `cmd` as `sup`'s child, in the kill-on-close job; a failed start is retried like a crash.
+fn start_with(sup: &mut Supervised, job: &job::Job, mut cmd: Command) {
     job::prepare(&mut cmd);
     sup.started = Instant::now();
     sup.restart_at = None;
@@ -353,5 +370,142 @@ mod tests {
         assert_eq!(describe_exit(Some(0xC000_00FDu32 as i32)), "exit code 0xC00000FD (stack overflow)");
         assert_eq!(describe_exit(Some(-1)), "exit code 0xFFFFFFFF", "could not start: no name");
         assert_eq!(describe_exit(Some(3)), "exit code 0x00000003");
+    }
+
+    fn shell(script: &str) -> Command {
+        let mut c = if cfg!(windows) { Command::new("cmd") } else { Command::new("sh") };
+        c.args(if cfg!(windows) { ["/C", script] } else { ["-c", script] });
+        c
+    }
+
+    /// A child that keeps running until it is killed (or half a minute passes).
+    fn running() -> Command {
+        // Started directly, not through a shell: killing a shell would leave its child behind.
+        let mut c = if cfg!(windows) { Command::new("ping") } else { Command::new("sleep") };
+        c.args(if cfg!(windows) { &["-n", "30", "127.0.0.1"][..] } else { &["30"][..] })
+            .stdout(std::process::Stdio::null());
+        c
+    }
+
+    fn exits(code: i32) -> Command {
+        shell(&format!("exit {code}"))
+    }
+
+    /// Wait for `sup`'s child to finish; its exit code.
+    fn finished(sup: &mut Supervised) -> Option<i32> {
+        sup.child.as_mut().unwrap().wait().unwrap().code()
+    }
+
+    #[test]
+    fn the_child_is_told_its_mode_and_why_it_was_restarted() {
+        let env = |c: &Command, k: &str| {
+            c.get_envs().find(|(key, _)| *key == k).map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let mut sup = Supervised::new("service");
+        let c = command(std::path::Path::new("astralguard"), &sup);
+        assert_eq!(c.get_args().collect::<Vec<_>>(), ["service"]);
+        assert_eq!(env(&c, "GUARD_WATCHDOG"), Some(Some("1".into())));
+        assert_eq!(env(&c, "GUARD_WATCHDOG_RESTART"), Some(None), "a first start: not inherited from anywhere");
+        sup.restart_reason = Some("exit code 0x00000065 (panic) after 0.2 h".into());
+        let c = command(std::path::Path::new("astralguard"), &sup);
+        assert_eq!(env(&c, "GUARD_WATCHDOG_RESTART"), Some(Some("exit code 0x00000065 (panic) after 0.2 h".into())));
+    }
+
+    #[test]
+    fn a_started_child_is_watched_until_it_exits() {
+        let job = job::create();
+        let mut sup = Supervised::new("ui");
+        start_with(&mut sup, &job, exits(3));
+        assert!(sup.child.is_some() && sup.restart_at.is_none());
+        let until = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            if let Some(code) = poll(&mut sup) {
+                break code;
+            }
+            assert!(Instant::now() < until, "the child never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(code, Some(3));
+        assert!(sup.child.is_none(), "reaped");
+        assert_eq!(poll(&mut sup), None, "nothing left to poll");
+    }
+
+    #[test]
+    fn a_child_that_cannot_start_is_retried_like_a_crash() {
+        let job = job::create();
+        let mut sup = Supervised::new("service");
+        start_with(&mut sup, &job, Command::new("astralguard-no-such-program"));
+        assert!(sup.child.is_none());
+        assert_eq!(delay(&sup), 5);
+        assert!(sup.restart_reason.as_deref().unwrap().starts_with("exit code 0xFFFFFFFF"));
+    }
+
+    #[test]
+    fn due_children_are_started_and_others_wait() {
+        let mut service = Supervised::new("service");
+        let mut ui = Supervised::new("ui");
+        ui.restart_at = Some(Instant::now() + Duration::from_secs(60));
+        let started = std::cell::RefCell::new(Vec::new());
+        let mut start = |sup: &mut Supervised| {
+            started.borrow_mut().push(sup.mode);
+            sup.restart_at = None;
+            sup.child = Some(running().spawn().unwrap());
+        };
+        assert!(supervise(&mut service, Some(&mut ui), &mut start));
+        assert_eq!(*started.borrow(), ["service"], "the UI's restart is not due yet");
+        assert!(supervise(&mut service, Some(&mut ui), &mut start));
+        assert_eq!(*started.borrow(), ["service"], "a running child is not started twice");
+        service.child.as_mut().unwrap().kill().unwrap();
+        service.child.as_mut().unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn a_clean_service_exit_ends_the_watchdog_and_the_dashboard() {
+        let mut service = Supervised::new("service");
+        service.child = Some(exits(0).spawn().unwrap());
+        finished(&mut service);
+        let mut ui = Supervised::new("ui");
+        ui.child = Some(running().spawn().unwrap());
+        let mut no_start = |sup: &mut Supervised| panic!("{} started", sup.mode);
+        assert!(!supervise(&mut service, Some(&mut ui), &mut no_start));
+        let t = Instant::now();
+        assert_ne!(finished(&mut ui), Some(0), "killed");
+        assert!(t.elapsed() < Duration::from_secs(10), "and not left running");
+    }
+
+    #[test]
+    fn a_crashed_service_is_restarted_and_the_dashboard_left_alone() {
+        let mut service = Supervised::new("service");
+        service.child = Some(exits(7).spawn().unwrap());
+        finished(&mut service);
+        let mut ui = Supervised::new("ui");
+        ui.child = Some(running().spawn().unwrap());
+        let mut no_start = |sup: &mut Supervised| panic!("{} started", sup.mode);
+        assert!(supervise(&mut service, Some(&mut ui), &mut no_start));
+        assert_eq!(delay(&service), 5);
+        assert!(service.restart_reason.as_deref().unwrap().starts_with("exit code 0x00000007"));
+        assert_eq!(ui.child.as_mut().unwrap().try_wait().unwrap(), None, "the dashboard keeps running");
+        ui.child.as_mut().unwrap().kill().unwrap();
+        ui.child.as_mut().unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn a_closed_dashboard_stays_closed_and_a_crashed_one_comes_back() {
+        let mut service = Supervised::new("service");
+        service.restart_at = None; // not this test's business
+        let mut no_start = |sup: &mut Supervised| panic!("{} started", sup.mode);
+
+        let mut ui = Supervised::new("ui");
+        ui.child = Some(exits(0).spawn().unwrap());
+        finished(&mut ui);
+        assert!(supervise(&mut service, Some(&mut ui), &mut no_start));
+        assert!(ui.restart_at.is_none() && ui.child.is_none(), "closed by its user: stays closed");
+        assert!(supervise(&mut service, Some(&mut ui), &mut no_start), "and is not started again");
+
+        ui.child = Some(exits(101).spawn().unwrap());
+        finished(&mut ui);
+        assert!(supervise(&mut service, Some(&mut ui), &mut no_start));
+        assert_eq!(delay(&ui), 5, "a crashed dashboard is restarted");
+        assert!(supervise(&mut service, None, &mut no_start), "--no-ui: only the service");
     }
 }
