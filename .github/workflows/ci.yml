@@ -189,7 +189,9 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends i2c-tools
       - name: The simulated chip
-        run: echo "ASTRALGUARD_I2C_STUB=$(bash ../.github/scripts/i2c-stub.sh)" >> "$GITHUB_ENV"
+        run: |
+          bus=$(bash ../.github/scripts/i2c-stub.sh)
+          echo "ASTRALGUARD_I2C_STUB=$bus" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -320,7 +322,8 @@ jobs:
       - name: The simulated I2C chip (i2c-stub, see linux-i2c)
         run: |
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends i2c-tools
-          echo "ASTRALGUARD_I2C_STUB=$(bash ../.github/scripts/i2c-stub.sh)" >> "$GITHUB_ENV"
+          bus=$(bash ../.github/scripts/i2c-stub.sh)
+          echo "ASTRALGUARD_I2C_STUB=$bus" >> "$GITHUB_ENV"
       - name: Measure
         timeout-minutes: 15
         run: |

@@ -12,10 +12,15 @@ if ! sudo modprobe i2c-stub chip_addr=0x2b 2>/dev/null; then
     sudo modprobe i2c-stub chip_addr=0x2b
 fi
 bus=""
-for a in /sys/class/i2c-adapter/i2c-*; do
-    if [ "$(cat "$a/name")" = "SMBus stub driver" ]; then bus=${a##*/i2c-}; fi
+for a in /sys/bus/i2c/devices/i2c-*; do
+    [ -e "$a/name" ] || continue
+    case "$(cat "$a/name")" in *"stub"*) bus=${a##*/i2c-} ;; esac
 done
-[ -n "$bus" ] || { echo "::error::i2c-stub loaded but no 'SMBus stub driver' adapter" >&2; exit 1; }
+if [ -z "$bus" ]; then
+    echo "::error::i2c-stub loaded but no stub adapter; the adapters:" >&2
+    i2cdetect -l >&2 || true
+    exit 1
+fi
 
 put() { sudo i2cset -y "$bus" 0x2b "$(printf '0x%02x' "$1")" "$(printf '0x%02x' "$2")" b; }
 # Pins from 0x80, in reverse order (pin 6 first): big-endian millivolts, then milliamps.
