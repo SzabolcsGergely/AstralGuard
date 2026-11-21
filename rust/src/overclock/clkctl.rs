@@ -444,13 +444,15 @@ mod tests {
         /// A SET also scribbles over the flags word of the next entry (a moved layout).
         scribble: bool,
         sets: usize,
+        /// Every offset a SET carried, in order.
+        written: Vec<i32>,
     }
 
     const DOMAINS: [u32; 9] = [0x1, 0x2, 0x10, 0x4, 0x100000, 0x80000, 0x200000, 0x40, 0x8];
 
     impl FakeRm {
         fn new() -> Self {
-            FakeRm { offsets: [0; 9], misroute: None, scribble: false, sets: 0 }
+            FakeRm { offsets: [0; 9], misroute: None, scribble: false, sets: 0, written: Vec::new() }
         }
     }
 
@@ -486,6 +488,7 @@ mod tests {
                     let mask = rd(p, CTL_MASK_AT).unwrap();
                     let k = mask.trailing_zeros() as usize;
                     let v = rd_i32(p, CTL_ENTRIES_AT + k * CTL_STRIDE + CTL_OFFSET_AT).unwrap();
+                    self.written.push(v);
                     let k = match self.misroute {
                         Some((from, to)) if from == k => to,
                         _ => k,
@@ -674,5 +677,92 @@ mod tests {
             "{nonzero:?}"
         );
         assert_eq!(rd_i32(&p, at + CTL_OFFSET_AT), Some(-20_000));
+    }
+
+    /// FakeRm whose `nth` call (from 1) of command `cmd` fails, as a driver call can mid-check.
+    struct FailOnce {
+        rm: FakeRm,
+        cmd: u32,
+        nth: usize,
+        seen: usize,
+    }
+
+    impl FailOnce {
+        fn new(cmd: u32, nth: usize) -> Self {
+            FailOnce { rm: FakeRm::new(), cmd, nth, seen: 0 }
+        }
+    }
+
+    impl Rm for FailOnce {
+        fn control(&mut self, cmd: u32, p: &mut [u8]) -> Result<(), String> {
+            if cmd == self.cmd {
+                self.seen += 1;
+                if self.seen == self.nth {
+                    return Err("the driver did not answer".into());
+                }
+            }
+            self.rm.control(cmd, p)
+        }
+    }
+
+    fn error(c: Check) -> String {
+        match c {
+            Check::Error(e) => e,
+            other => panic!("expected a retryable error, got {other:?}"),
+        }
+    }
+
+    fn broken(c: Check) -> String {
+        match c {
+            Check::Broken(e) => e,
+            other => panic!("expected the driver to be failed for good, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_check_that_cannot_read_the_block_first_writes_nothing_and_may_run_again() {
+        assert!(error(write_check(&mut DeadRm)).contains("fell off the bus"));
+        let mut rm = FailOnce::new(CMD_GET_CONTROL, 1);
+        error(write_check(&mut rm));
+        assert_eq!(rm.rm.sets, 0, "no write without the block it would be compared against");
+    }
+
+    #[test]
+    fn a_failed_test_write_is_retryable_when_the_block_is_unchanged() {
+        let mut rm = FailOnce::new(CMD_SET_CONTROL, 1);
+        assert_eq!(error(write_check(&mut rm)), "test write failed (the driver did not answer)");
+        assert_eq!(rm.rm.offsets, [0; 9]);
+    }
+
+    #[test]
+    fn a_failed_read_back_still_undoes_the_test_write() {
+        let mut rm = FailOnce::new(CMD_GET_CONTROL, 2);
+        assert_eq!(error(write_check(&mut rm)), "test read-back failed (the driver did not answer)");
+        assert_eq!(rm.rm.sets, 2, "the +15 MHz and its undo");
+        assert_eq!(rm.rm.offsets, [0; 9], "XBAR is back where it was");
+    }
+
+    #[test]
+    fn a_failed_undo_fails_the_driver_and_says_the_control_may_be_altered() {
+        let mut rm = FailOnce::new(CMD_SET_CONTROL, 2);
+        let why = broken(write_check(&mut rm));
+        assert!(why.starts_with("could not undo the test write (the driver did not answer); "), "{why}");
+        assert!(why.contains("THE CLOCK CONTROL MAY BE ALTERED"), "{why}");
+        assert_eq!(rm.rm.offsets[1], PROBE_KHZ, "the test offset really is still there");
+    }
+
+    #[test]
+    fn a_block_that_cannot_be_read_after_the_check_fails_the_driver() {
+        let mut rm = FailOnce::new(CMD_GET_CONTROL, 3);
+        let why = broken(write_check(&mut rm));
+        assert!(why.contains("XBAR MAY STILL CARRY the test offset"), "{why}");
+    }
+
+    #[test]
+    fn at_the_top_of_its_range_the_test_write_goes_down_instead() {
+        let mut rm = FakeRm::new();
+        rm.offsets[1] = 1_000_000;
+        assert_eq!(write_check(&mut rm), Check::Pass);
+        assert_eq!(rm.written, [1_000_000 - PROBE_KHZ, 1_000_000], "15 MHz down, then back");
     }
 }
