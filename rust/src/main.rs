@@ -15,11 +15,27 @@ mod sensor;
 mod service;
 #[cfg(feature = "ui")]
 mod ui;
+#[cfg(test)]
+mod virtual_clock;
 mod watchdog;
 
 /// Unix time in seconds, the unit every timer in the guard uses.
 pub fn now() -> f64 {
+    #[cfg(test)]
+    if let Some(t) = virtual_clock::now() {
+        return t;
+    }
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// Wait `sec` seconds. The protection loop's waits go through here (and the clock through
+/// `now`), so a test can run the real loop on a clock of its own.
+pub fn sleep(sec: f64) {
+    #[cfg(test)]
+    if virtual_clock::advance(sec) {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(sec.max(0.0)));
 }
 
 fn main() {

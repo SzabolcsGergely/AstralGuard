@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 use std::fs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::Shared;
 use crate::config::{self, SagBaseline};
@@ -432,7 +431,7 @@ impl SagMonitor {
             Some(sensor) if fast && !skip && self.active && s.sag_enabled && now >= self.unavailable_until => sensor,
             _ => {
                 self.shared.update(|l| l.sag_fast = fast);
-                std::thread::sleep(Duration::from_secs_f64(seconds));
+                crate::sleep(seconds);
                 return;
             }
         };
@@ -448,7 +447,7 @@ impl SagMonitor {
                 self.shared.record_imu(crate::now(), v);
             }
             let wait = FAST_INTERVAL_SEC.min(end - crate::now()).max(0.0);
-            std::thread::sleep(Duration::from_secs_f64(wait));
+            crate::sleep(wait);
         }
     }
 

@@ -194,6 +194,14 @@ cargo test
 - The ladder is tested end to end against a fake limiter (`service/response.rs`):
   `evaluate()` returns a shutdown reason instead of shutting down. Any change to the
   response logic comes with a test there.
+- The whole monitor loop runs in the tests too (`service/monitor.rs`, `e2e_tests`):
+  `run_on` takes a `Machine` (the sensor connect, the limiter, the power-off, the data
+  paths; `Real` in the service) and the tests give it a scripted card, a recording limiter
+  and a recorded power-off, on a virtual clock (`crate::now` / `crate::sleep`,
+  `virtual_clock.rs`), so minutes of a session play in milliseconds. A change to how the
+  guard behaves over time (a trip, a release, a lost sensor, pause, resume) gets a scenario
+  there. Every file a scenario writes goes to its own temp folder: never let one reach
+  `config::data_dir()`, which in a test can be an installed guard's.
 
 Formatting: `rustfmt.toml` (max width 120). Comments explain *why*, not what; keep the
 existing tone of the module doc comments.

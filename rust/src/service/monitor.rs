@@ -5,14 +5,13 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::crosscheck::CrossCheck;
 use super::flight::FlightRecorder;
 use super::imbalance::ImbalanceMonitor;
-use super::response::{Tick, TieredResponse, CLEAR_HYSTERESIS_AMPS};
+use super::response::{LimiterFactory, Tick, TieredResponse, CLEAR_HYSTERESIS_AMPS};
 use super::sag::SagMonitor;
 use super::Shared;
 use super::{oc_ticked, OcAccess};
@@ -38,7 +37,64 @@ const OC_OPEN_RETRY_SEC: f64 = 30.0;
 const LOAD_POLL_SEC: f64 = 1.0;
 
 fn sleep(sec: f64) {
-    std::thread::sleep(Duration::from_secs_f64(sec));
+    crate::sleep(sec);
+}
+
+/// What the loop needs from the machine it guards: `Real` in the service. The end-to-end
+/// tests put a scripted card, a recording limiter and a recorded power-off here, with every
+/// file in a folder of their own, and run the real loop on a virtual clock.
+pub(crate) trait Machine {
+    /// Before the loop: the Event Viewer source, and undoing a GPU limit a crashed run left.
+    fn at_start(&mut self, shared: &Shared);
+    /// Find the card and prove its chip answers.
+    fn connect(&mut self) -> Result<PinSensor, String>;
+    /// A card is there but its pins give nothing: worth a sensor scan.
+    fn scan_possible(&mut self) -> bool;
+    /// The OS and GPU driver versions, for the dashboard's header.
+    fn system(&mut self) -> (String, String);
+    /// The GPU slowdown, for the ladder.
+    fn limiter(&mut self) -> LimiterFactory;
+    /// Where the emergency-shutdown note for the next start lives.
+    fn note_path(&self) -> std::path::PathBuf;
+    fn flight(&self) -> FlightRecorder;
+    /// The OS's power-off, by absolute path (safety rule 4).
+    fn power_off(&mut self) -> Result<(), String>;
+}
+
+pub(crate) struct Real;
+
+impl Machine for Real {
+    fn at_start(&mut self, shared: &Shared) {
+        if let Err(e) = platform::register_event_source() {
+            logger::warn(format!("Could not register the Event Viewer source (needs admin once): {e}"));
+        }
+        startup_recovery(shared);
+    }
+    fn connect(&mut self) -> Result<PinSensor, String> {
+        PinSensor::connect()
+    }
+    fn scan_possible(&mut self) -> bool {
+        crate::sensor::scan_possible()
+    }
+    fn system(&mut self) -> (String, String) {
+        (platform::os_version(), platform::gpu_driver())
+    }
+    fn limiter(&mut self) -> LimiterFactory {
+        Box::new(|subsystem| {
+            let mut m = GpuMitigator::default();
+            m.connect(subsystem);
+            Box::new(m)
+        })
+    }
+    fn note_path(&self) -> std::path::PathBuf {
+        config::data_dir().join("last_shutdown.json")
+    }
+    fn flight(&self) -> FlightRecorder {
+        FlightRecorder::new()
+    }
+    fn power_off(&mut self) -> Result<(), String> {
+        platform::shutdown_system()
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -53,16 +109,8 @@ struct ShutdownNote {
     version: String,
 }
 
-fn shutdown_note_path() -> std::path::PathBuf {
-    config::data_dir().join("last_shutdown.json")
-}
-
 /// Leave a note for the next start: a shutdown while the user is away is otherwise a
 /// mystery, Windows gets the blame, and the bad cable goes straight back under load.
-fn note_shutdown_reason(reason: &str) {
-    write_shutdown_note(&shutdown_note_path(), reason);
-}
-
 fn write_shutdown_note(path: &std::path::Path, reason: &str) {
     let note = ShutdownNote {
         time: crate::now(),
@@ -83,8 +131,8 @@ fn write_shutdown_note(path: &std::path::Path, reason: &str) {
 
 /// One-shot at startup: if the guard ended the last session, say so loudly. A corrupt
 /// note still announces, because it still means the guard shut this machine down.
-fn announce_last_shutdown(shared: &Shared) {
-    let Some(msg) = take_shutdown_note(&shutdown_note_path()) else { return };
+fn announce_last_shutdown(shared: &Shared, note: &std::path::Path) {
+    let Some(msg) = take_shutdown_note(note) else { return };
     logger::warn(&msg);
     shared.event(EventKind::Warning, 5091, &msg);
     shared.notify(&format!("{APP_NAME} - read this"), &msg);
@@ -109,12 +157,12 @@ fn take_shutdown_note(path: &std::path::Path) -> Option<String> {
     Some(msg)
 }
 
-fn shutdown_system(shared: &Shared, reason: &str) {
+fn shutdown_system(shared: &Shared, reason: &str, machine: &mut dyn Machine) {
     logger::critical(format!("SHUTDOWN TRIGGERED: {reason}"));
-    note_shutdown_reason(reason);
+    write_shutdown_note(&machine.note_path(), reason);
     shared.notify(&format!("{APP_NAME} - Shutdown"), reason);
     shared.event(EventKind::Error, 5090, reason);
-    if let Err(e) = platform::shutdown_system() {
+    if let Err(e) = machine.power_off() {
         logger::critical(format!("Shutdown command failed: {e}"));
     }
 }
@@ -400,11 +448,13 @@ fn paused_tick(
 /// Runs until the guard is told to stop or shuts the machine down. True when it fired a
 /// shutdown.
 pub fn run(shared: &Arc<Shared>) -> bool {
-    if let Err(e) = platform::register_event_source() {
-        logger::warn(format!("Could not register the Event Viewer source (needs admin once): {e}"));
-    }
-    startup_recovery(shared);
-    announce_last_shutdown(shared);
+    run_on(shared, &mut Real)
+}
+
+/// `run` on a given machine: the real one, or the end-to-end tests' bench.
+pub(crate) fn run_on(shared: &Arc<Shared>, machine: &mut dyn Machine) -> bool {
+    machine.at_start(shared);
+    announce_last_shutdown(shared, &machine.note_path());
 
     let s = shared.settings();
     logger::info(format!("Starting {APP_NAME} v{APP_VERSION} (service)..."));
@@ -436,19 +486,10 @@ pub fn run(shared: &Arc<Shared>) -> bool {
         logger::info("Running without the watchdog: a crash will not be restarted.");
     }
 
-    let factory_shared = Arc::clone(shared);
-    let mut response = TieredResponse::new(
-        Arc::clone(shared),
-        Box::new(move |subsystem| {
-            let mut m = GpuMitigator::default();
-            m.connect(subsystem);
-            let _ = &factory_shared;
-            Box::new(m)
-        }),
-    );
+    let mut response = TieredResponse::new(Arc::clone(shared), machine.limiter());
     let mut sensor: Option<PinSensor> = None;
     let mut crosscheck = CrossCheck::new();
-    let mut flight = FlightRecorder::new();
+    let mut flight = machine.flight();
     let baseline = *shared.baseline.lock().unwrap_or_else(|e| e.into_inner());
     let mut sag = SagMonitor::new(Arc::clone(shared), baseline);
     let mut imbalance = ImbalanceMonitor::new(Arc::clone(shared));
@@ -493,7 +534,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
             // a scan that starts right after sees a connected sensor and refuses.
             let bus = shared.bus.try_lock();
             let attempt = match &bus {
-                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => Some(PinSensor::connect()),
+                Ok(_) | Err(std::sync::TryLockError::Poisoned(_)) => Some(machine.connect()),
                 Err(std::sync::TryLockError::WouldBlock) => None,
             };
             match attempt {
@@ -513,7 +554,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                     response.subsystem = Some(new.info.subsystem);
                     let (model, sub) = (new.info.model.to_string(), new.info.subsystem);
                     // Read again on every connect: a driver update or reset reconnects.
-                    let (os, driver) = (platform::os_version(), platform::gpu_driver());
+                    let (os, driver) = machine.system();
                     shared.update(|l| {
                         l.card = model;
                         l.card_subsystem = Some(sub);
@@ -535,7 +576,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                     // Released before an automatic scan, which takes it.
                     drop(bus);
                     // A card that is there but unreadable is worth a scan; no card is not.
-                    let scan = crate::sensor::scan_possible();
+                    let scan = machine.scan_possible();
                     shared.update(|l| {
                         l.sensor_scan_suggested = scan;
                         l.sensor_problem = detail.clone();
@@ -605,7 +646,7 @@ pub fn run(shared: &Arc<Shared>) -> bool {
                 shutting_down = true;
                 // From the marker, like the engage dump: no driver call on the way down.
                 flight.dump(&flight_event("shutdown", &shared.overclock_managed()));
-                shutdown_system(shared, &reason);
+                shutdown_system(shared, &reason, machine);
                 break;
             }
             Err(panic) => {
@@ -1457,6 +1498,7 @@ mod tests {
     #[test]
     fn waiting_ends_early_for_a_stop_or_a_scan() {
         use crate::protocol::Settings;
+        use std::time::Duration;
         let shared = Shared::new(Settings::default(), None, true);
         let t = std::time::Instant::now();
         wait_or_stop(&shared, 0.3);
@@ -1756,5 +1798,396 @@ mod sample_tests {
             g.run(0.0, s.imbalance_sustained_seconds + 1.0);
             assert_eq!(g.engaged() > 0, limits, "{mode:?}");
         }
+    }
+}
+
+/// End to end: the real monitor loop (`run_on`) on a bench machine, a scripted card and a
+/// virtual clock. Every scenario starts the loop as the service does and plays minutes of a
+/// session in milliseconds: the pins the chip reports, the ladder's decisions, what the GPU
+/// limiter is asked, and whether the machine is powered off. The power-off is recorded, never
+/// run; every file goes to a folder of the test's own, never the installed guard's.
+#[cfg(test)]
+mod e2e_tests {
+    use super::*;
+    use crate::protocol::{Request, Response, Settings};
+    use crate::sensor::fake::{Card, Reading};
+    use crate::service::response::Limiter;
+    use crate::service::tests::{fake_service, test_marker, FakeService};
+    use std::cell::{Cell, RefCell};
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    /// The virtual clock's start; scenario times are seconds after it.
+    const T0: f64 = 1_800_000_000.0;
+    /// A card at a normal gaming load, all pins well under the 9.5 A threshold.
+    const LOAD: [f64; 6] = [8.0, 8.1, 7.9, 8.0, 8.2, 7.8];
+
+    /// What the GPU limiter was asked, with the scenario time: "engage", "release", "close",
+    /// "abandon".
+    type Calls = Arc<Mutex<Vec<(f64, &'static str)>>>;
+
+    struct Limits {
+        calls: Calls,
+    }
+
+    impl Limits {
+        fn log(&self, what: &'static str) {
+            self.calls.lock().unwrap().push((crate::now() - T0, what));
+        }
+    }
+
+    impl Limiter for Limits {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn unavailable_reason(&self) -> String {
+            String::new()
+        }
+        fn engage(&mut self, _reason: &str) -> bool {
+            self.log("engage");
+            true
+        }
+        fn release(&mut self) -> bool {
+            self.log("release");
+            true
+        }
+        fn close(&mut self) {
+            self.log("close");
+        }
+        fn abandon(&mut self) {
+            self.log("abandon");
+        }
+    }
+
+    /// The machine the loop guards in these tests.
+    struct Bench {
+        card: Card,
+        plugged: Arc<AtomicBool>,
+        calls: Calls,
+        power_offs: Arc<Mutex<Vec<f64>>>,
+        dir: PathBuf,
+    }
+
+    impl Machine for Bench {
+        fn at_start(&mut self, _shared: &Shared) {}
+        fn connect(&mut self) -> Result<PinSensor, String> {
+            if self.plugged.load(Ordering::SeqCst) {
+                Ok(self.card.sensor())
+            } else {
+                Err("no card found".into())
+            }
+        }
+        fn scan_possible(&mut self) -> bool {
+            false
+        }
+        fn system(&mut self) -> (String, String) {
+            ("Test OS".into(), "Test driver".into())
+        }
+        fn limiter(&mut self) -> LimiterFactory {
+            let calls = Arc::clone(&self.calls);
+            Box::new(move |_| Box::new(Limits { calls: Arc::clone(&calls) }))
+        }
+        fn note_path(&self) -> PathBuf {
+            self.dir.join("last_shutdown.json")
+        }
+        fn flight(&self) -> FlightRecorder {
+            FlightRecorder::in_dir(self.dir.join("logs"))
+        }
+        fn power_off(&mut self) -> Result<(), String> {
+            self.power_offs.lock().unwrap().push(crate::now() - T0);
+            Ok(())
+        }
+    }
+
+    /// What a scenario sees and changes as its time passes.
+    struct World {
+        card: Card,
+        plugged: Arc<AtomicBool>,
+        shared: Arc<Shared>,
+    }
+
+    impl World {
+        /// The GPU as the loop last published it.
+        fn limited(&self) -> bool {
+            self.shared.live_field(|l| l.engaged)
+        }
+        /// The load, with pin 4 at `amps`.
+        fn pin4(&self, amps: f64) {
+            let mut a = LOAD;
+            a[3] = amps;
+            self.card.amps(a);
+        }
+        fn pause(&self, on: bool) {
+            self.shared.paused.store(on, Ordering::SeqCst);
+        }
+        /// The machine slept for `seconds` (the clock jumps; nothing ran meanwhile).
+        fn sleep_machine(&self, seconds: f64) {
+            crate::sleep(seconds);
+        }
+    }
+
+    /// A finished scenario.
+    struct Played {
+        svc: FakeService,
+        /// What `run_on` returned: it fired a shutdown.
+        shut_down: bool,
+        calls: Vec<(f64, &'static str)>,
+        power_offs: Vec<f64>,
+        dir: PathBuf,
+        /// The scenario time the loop ended at.
+        end: f64,
+    }
+
+    impl Played {
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.iter().map(|c| c.1).collect()
+        }
+        fn first(&self, what: &str) -> f64 {
+            self.calls.iter().find(|c| c.1 == what).unwrap_or_else(|| panic!("no {what}: {:?}", self.calls)).0
+        }
+        fn note(&self) -> Option<String> {
+            fs::read_to_string(self.dir.join("last_shutdown.json")).ok()
+        }
+        fn notices(&self) -> Vec<String> {
+            let Response::Events { notices } = self.svc.shared.handle(Request::Events { since: 0 }) else { panic!() };
+            notices.into_iter().map(|n| n.message).collect()
+        }
+        fn flight_dumps(&self) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(self.dir.join("logs"))
+                .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for Played {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run the loop from scenario time 0 to `until` (or until it shuts the machine down),
+    /// calling `script` at every moment the loop waits. `before` prepares the data folder.
+    fn play_with(
+        name: &str,
+        settings: Settings,
+        until: f64,
+        before: impl FnOnce(&Path),
+        mut script: impl FnMut(f64, &World) + 'static,
+    ) -> Played {
+        let svc = fake_service(test_marker(&format!("e2e-{name}")), settings);
+        let dir = std::env::temp_dir().join(format!("ag-e2e-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // logs/ exists in the service: the logger made it at start.
+        fs::create_dir_all(dir.join("logs")).unwrap();
+        before(&dir);
+
+        let card = Card::new(LOAD);
+        let plugged = Arc::new(AtomicBool::new(true));
+        let calls: Calls = Arc::default();
+        let power_offs = Arc::new(Mutex::new(Vec::new()));
+        let mut bench = Bench {
+            card: card.clone(),
+            plugged: Arc::clone(&plugged),
+            calls: Arc::clone(&calls),
+            power_offs: Arc::clone(&power_offs),
+            dir: dir.clone(),
+        };
+        let world = World { card, plugged, shared: Arc::clone(&svc.shared) };
+        let end = Rc::new(Cell::new(0.0));
+        let seen = Rc::clone(&end);
+        let tick = move |t: f64| {
+            let s = t - T0;
+            seen.set(s);
+            if s >= until {
+                world.shared.stop.store(true, Ordering::SeqCst);
+            } else {
+                script(s, &world);
+            }
+        };
+        let shared = Arc::clone(&svc.shared);
+        let shut_down = crate::virtual_clock::run(T0, tick, || run_on(&shared, &mut bench));
+        let calls = calls.lock().unwrap().clone();
+        let power_offs = power_offs.lock().unwrap().clone();
+        Played { svc, shut_down, calls, power_offs, dir, end: end.get() }
+    }
+
+    fn play(name: &str, settings: Settings, until: f64, script: impl FnMut(f64, &World) + 'static) -> Played {
+        play_with(name, settings, until, |_| {}, script)
+    }
+
+    /// A limit that works: while limited the current falls to 6 A, otherwise pin 4 draws `amps`.
+    fn drawing(w: &World, amps: f64) {
+        w.pin4(if w.limited() { 6.0 } else { amps });
+    }
+
+    #[test]
+    fn a_normal_session_never_acts() {
+        let p = play("normal", Settings::default(), 600.0, |s, w| w.pin4(8.0 + (s / 20.0).sin()));
+        assert!(!p.shut_down && p.power_offs.is_empty());
+        assert_eq!(p.calls(), ["close"], "the GPU was never limited, and is put back at stop anyway");
+        let live = p.svc.shared.snapshot();
+        assert_eq!(live.status, Status::Ok);
+        assert_eq!(live.card, "ROG Astral RTX 5090 OC");
+        assert!(live.history.len() > 500, "the dashboard's chart filled: {}", live.history.len());
+        assert!(p.note().is_none() && p.flight_dumps().is_empty());
+        assert!((p.end - 600.0).abs() < 1.0, "played to the end: {}", p.end);
+    }
+
+    #[test]
+    fn sustained_overcurrent_is_limited_and_released_once_clean() {
+        // 11 A on pin 4 from 20 s while the game runs (until 40 s); the limit brings it down.
+        let p = play("tier1", Settings::default(), 400.0, |s, w| {
+            drawing(w, if (20.0..40.0).contains(&s) { 11.0 } else { 8.0 })
+        });
+        assert_eq!(p.calls(), ["engage", "release", "close"]);
+        let engaged = p.first("engage");
+        assert!((34.5..=36.0).contains(&engaged), "after the 15 s sustained: {engaged}");
+        let released = p.first("release");
+        assert!(released - engaged >= 120.0, "held at least the 2 minutes: {}", released - engaged);
+        assert!(released - engaged < 125.0, "and released once clean: {}", released - engaged);
+        assert!(p.power_offs.is_empty() && !p.shut_down);
+        assert!(
+            p.flight_dumps().iter().any(|n| n.ends_with("_engaged.csv")),
+            "the last minute dumped: {:?}",
+            p.flight_dumps()
+        );
+        assert!(!p.svc.shared.live_field(|l| l.engaged));
+    }
+
+    #[test]
+    fn a_fault_that_comes_back_after_the_release_shuts_down() {
+        let p = play("retrigger", Settings::default(), 900.0, |s, w| drawing(w, if s >= 20.0 { 11.0 } else { 8.0 }));
+        assert!(p.shut_down);
+        assert_eq!(p.calls(), ["engage", "release", "engage", "abandon"], "limited on the way down, and left so");
+        assert_eq!(p.power_offs.len(), 1);
+        let note = p.note().expect("the note for the next start");
+        assert!(note.contains("re-triggered"), "{note}");
+        assert!(p.end < 900.0, "the loop ended at the shutdown: {}", p.end);
+    }
+
+    #[test]
+    fn a_limit_that_does_not_bring_the_current_down_shuts_down() {
+        let p = play("grace", Settings::default(), 300.0, |s, w| w.pin4(if s >= 20.0 { 11.0 } else { 8.0 }));
+        assert!(p.shut_down);
+        assert_eq!(p.calls(), ["engage", "abandon"]);
+        let after = p.power_offs[0] - p.first("engage");
+        assert!((10.0..=12.0).contains(&after), "after the 10 s grace: {after}");
+    }
+
+    #[test]
+    fn a_catastrophic_spike_shuts_down_within_a_second() {
+        let p = play("tier3", Settings::default(), 300.0, |s, w| w.pin4(if s >= 30.0 { 17.0 } else { 8.0 }));
+        assert!(p.shut_down);
+        let took = p.power_offs[0] - 30.0;
+        assert!(took <= 1.5, "two samples at 0.5 s: {took}");
+        assert_eq!(p.calls(), ["engage", "abandon"], "limited on the way down");
+        assert!(p.note().unwrap().contains("Tier 3"));
+        assert!(p.flight_dumps().iter().any(|n| n.ends_with("_shutdown.csv")), "{:?}", p.flight_dumps());
+        assert_eq!(p.svc.shared.live_field(|l| l.status), Status::Shutdown);
+    }
+
+    #[test]
+    fn shutdown_only_never_touches_the_gpu() {
+        let s = Settings { response_mode: crate::protocol::ResponseMode::ShutdownOnly, ..Settings::default() };
+        let p = play("shutdown-only", s, 300.0, |s, w| w.pin4(if s >= 20.0 { 11.0 } else { 8.0 }));
+        assert!(p.shut_down);
+        assert!(p.calls.is_empty(), "never opened, never limited: {:?}", p.calls);
+        let at = p.power_offs[0];
+        assert!((34.5..=36.0).contains(&at), "after the 15 s sustained: {at}");
+    }
+
+    #[test]
+    fn a_lost_sensor_keeps_the_gpu_limited_until_clean_readings_return() {
+        let during = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&during);
+        let p = play("lost", Settings::default(), 400.0, move |s, w| {
+            if (60.0..120.0).contains(&s) {
+                // The chip stops answering, then the card is gone from the bus.
+                w.card.set(Reading::Fails("I2C read failed".into()));
+                w.plugged.store(false, Ordering::SeqCst);
+                if s > 90.0 {
+                    seen.borrow_mut().push((w.limited(), w.shared.live_field(|l| (l.status, l.card.clone()))));
+                }
+            } else {
+                w.plugged.store(true, Ordering::SeqCst);
+                drawing(w, if (20.0..40.0).contains(&s) { 11.0 } else { 8.0 });
+            }
+        });
+        assert!(!p.shut_down);
+        let during = during.borrow();
+        assert!(!during.is_empty());
+        assert!(during.iter().all(|(limited, (status, card))| *limited && *status == Status::Error && card.is_empty()));
+        assert_eq!(p.calls(), ["engage", "release", "close"]);
+        assert!(p.first("release") > 120.0, "not released while blind: {}", p.first("release"));
+    }
+
+    #[test]
+    fn pausing_gives_the_gpu_back_and_resuming_starts_watching_from_scratch() {
+        let paused_status = Rc::new(Cell::new(None));
+        let seen = Rc::clone(&paused_status);
+        let p = play("pause", Settings::default(), 300.0, move |s, w| {
+            w.pause((60.0..200.0).contains(&s));
+            if (100.0..101.0).contains(&s) {
+                seen.set(Some(w.shared.live_field(|l| l.status)));
+            }
+            drawing(w, if s >= 20.0 { 11.0 } else { 8.0 });
+        });
+        assert_eq!(paused_status.get(), Some(Status::Paused));
+        assert!(!p.shut_down && p.power_offs.is_empty(), "nothing acts while paused, 11 A or not");
+        assert_eq!(p.calls(), ["engage", "release", "engage", "close"]);
+        let released = p.calls[1].0;
+        assert!((60.0..61.0).contains(&released), "given back when paused: {released}");
+        let again = p.calls[2].0;
+        assert!((214.5..=216.0).contains(&again), "a fresh 15 s after resuming, and a limit, not a shutdown: {again}");
+    }
+
+    #[test]
+    fn a_sleep_does_not_count_as_overcurrent() {
+        let p = play("suspend", Settings::default(), 200.0, |s, w| {
+            if (30.0..30.5).contains(&s) {
+                w.sleep_machine(60.0); // 10 s into the sustained timer
+            }
+            drawing(w, if s >= 20.0 { 11.0 } else { 8.0 });
+        });
+        let engaged = p.first("engage");
+        assert!(engaged >= 105.0, "the timer started over after the gap: {engaged}");
+    }
+
+    #[test]
+    fn the_last_emergency_shutdown_is_told_at_the_next_start() {
+        let p = play_with(
+            "note",
+            Settings::default(),
+            10.0,
+            |dir| write_shutdown_note(&dir.join("last_shutdown.json"), "Tier 3 (catastrophic): Pin2=17.10A."),
+            |_, _| {},
+        );
+        assert!(
+            p.notices().iter().any(|n| n.contains("emergency stop") && n.contains("Pin2=17.10A")),
+            "{:?}",
+            p.notices()
+        );
+        assert!(p.note().is_none(), "told once");
+    }
+
+    #[test]
+    fn the_overclock_is_applied_after_the_start_delay_and_kept_while_paused() {
+        let s =
+            Settings { oc_power_enabled: true, oc_power_w: 520.0, oc_apply_delay_seconds: 30.0, ..Settings::default() };
+        let applied_at = Rc::new(Cell::new(None));
+        let seen = Rc::clone(&applied_at);
+        let p = play("overclock", s, 120.0, move |s, w| {
+            w.pause(s >= 10.0); // pausing protection keeps the overclock
+            if seen.get().is_none() && w.shared.overclock_managed().contains(&"power".to_string()) {
+                seen.set(Some(s));
+            }
+        });
+        assert!(p.svc.gpu.calls().contains(&"set_power_limit_w(520)".to_string()), "{:?}", p.svc.gpu.calls());
+        let at = applied_at.get().expect("applied");
+        assert!((30.0..32.0).contains(&at), "after the 30 s delay: {at}");
     }
 }
