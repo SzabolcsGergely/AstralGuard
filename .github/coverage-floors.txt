@@ -42,3 +42,4 @@ src/ui/thermal.rs 95          # (97.4) the charts
 src/ui/widgets.rs 96          # (98.5)
 src/ui/backend.rs 89          # (91.2) the dashboard's link to the service: retries, answers, polls (rule 3)
 src/ui/demo.rs 71             # (73.7) the simulated service the screenshots and render tests use
+src/ui/host.rs 71             # (73.8) Linux: the tray process hands clicks to its window; the rest starts processes
