@@ -172,6 +172,35 @@ jobs:
         timeout-minutes: 10
         run: cargo test --locked
 
+  linux-i2c:
+    name: Linux I2C (kernel i2c-stub)
+    # The real I2C_SMBUS ioctls (sensor/i2cdev.rs) against the kernel's simulated SMBus chip at
+    # 0x2B, filled with known values by .github/scripts/i2c-stub.sh. Service-only build: no GPU,
+    # no window.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - name: i2c-tools
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends i2c-tools
+      - name: The simulated chip
+        run: echo "ASTRALGUARD_I2C_STUB=$(bash ../.github/scripts/i2c-stub.sh)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: i2c-stub
+      - name: Test against it
+        timeout-minutes: 10
+        run: cargo test --locked --no-default-features i2c_stub -- --nocapture
+
   safety:
     name: Safety rules and dependencies
     runs-on: ubuntu-latest
@@ -288,6 +317,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      - name: The simulated I2C chip (i2c-stub, see linux-i2c)
+        run: |
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends i2c-tools
+          echo "ASTRALGUARD_I2C_STUB=$(bash ../.github/scripts/i2c-stub.sh)" >> "$GITHUB_ENV"
       - name: Measure
         timeout-minutes: 15
         run: |

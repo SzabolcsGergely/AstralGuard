@@ -158,6 +158,11 @@ cargo test
     or TLS crate in the service-only build and no network code outside `src/ui/` (2),
     shutdown by absolute path (4), the V/F write only from `overclock/` (9), and only the
     checked commands on the XBAR / SYS channel (10). Changing a check goes with changing its rule.
+  - **Linux I2C** (`linux-i2c`, and in the coverage job): the kernel's simulated SMBus chip
+    (`i2c-stub`) at 0x2B, filled with known values by `.github/scripts/i2c-stub.sh`, so the
+    real I2C_SMBUS ioctls in `sensor/i2cdev.rs` run (its `i2c_stub_*` tests, which skip without
+    `ASTRALGUARD_I2C_STUB`). Its `i2cset` writes go only to that simulated chip on a CI machine
+    with no GPU; the program still never writes (rule 1).
   - **Package dependencies** (`.github/scripts/runtime-libs.sh`, in `packages.yml`): after
     installing the `.deb` (Debian 12, Ubuntu 22.04 / 24.04 / latest) and the Arch package
     (a clean `archlinux:base`, not the build image), every library named in the binary must

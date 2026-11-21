@@ -427,4 +427,62 @@ mod tests {
         assert!(err.starts_with(&format!("cannot open /dev/i2c-{}", u32::MAX)), "{err}");
         assert!(err.ends_with("run as root and load i2c-dev"), "{err}");
     }
+
+    /// The kernel's simulated SMBus chip (the i2c-stub module) at 0x2B: CI's "Linux I2C" job
+    /// loads it, fills its registers (.github/scripts/i2c-stub.sh) and names its bus in
+    /// ASTRALGUARD_I2C_STUB, so the real I2C_SMBUS ioctls run against a kernel driver. Without
+    /// it these tests have nothing to talk to and skip.
+    fn stub() -> Option<I2cDev> {
+        let Ok(n) = std::env::var("ASTRALGUARD_I2C_STUB") else {
+            eprintln!("skipped: no i2c-stub bus in ASTRALGUARD_I2C_STUB");
+            return None;
+        };
+        Some(
+            I2cDev::open(n.trim().parse().expect("ASTRALGUARD_I2C_STUB is a bus number"))
+                .expect("the stub's bus opens"),
+        )
+    }
+
+    fn stub_sensor(dev: I2cDev) -> super::super::PinSensor {
+        let info = CardInfo { gpu_name: "i2c-stub".into(), subsystem: 0, model: "i2c-stub" };
+        super::super::PinSensor { bus: Box::new(dev), info, failures: 0 }
+    }
+
+    #[test]
+    fn i2c_stub_acknowledges_the_receive_byte() {
+        let Some(mut dev) = stub() else { return };
+        assert!(dev.answers(), "the scan's probe finds the chip");
+        assert!(dev.addressed);
+    }
+
+    #[test]
+    fn i2c_stub_pins_read_back_through_the_smbus_block_read() {
+        let Some(dev) = stub() else { return };
+        let mut sensor = stub_sensor(dev);
+        let pins = sensor.read_pins().expect("a plausible sample");
+        assert_eq!(pins.len(), 6);
+        for (i, pin) in pins.iter().enumerate() {
+            let p = (i + 1) as f64;
+            assert_eq!(pin.name, format!("Pin{}", i + 1));
+            // i2c-stub.sh: pin p holds 12000 + 10 p mV and 1000 p + 500 mA.
+            assert!((pin.volts - (12.0 + 0.01 * p)).abs() < 1e-9, "{}: {} V", pin.name, pin.volts);
+            assert!((pin.amps - (p + 0.5)).abs() < 1e-9, "{}: {} A", pin.name, pin.amps);
+        }
+    }
+
+    #[test]
+    fn i2c_stub_tilt_reads_one_g_lying_flat() {
+        let Some(dev) = stub() else { return };
+        let v = stub_sensor(dev).read_gsensor().expect("a plausible tilt");
+        assert_eq!(v, [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn i2c_stub_a_whole_smbus_block_reads_in_one_transaction() {
+        let Some(mut dev) = stub() else { return };
+        let mut buf = [0u8; I2C_SMBUS_BLOCK_MAX];
+        dev.read(super::super::PIN_REG, &mut buf).unwrap();
+        // Pin 6 first (reverse order): 12.060 V = 0x2F1C, 6.500 A = 0x1964.
+        assert_eq!(buf[..4], [0x2F, 0x1C, 0x19, 0x64]);
+    }
 }
