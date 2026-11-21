@@ -94,6 +94,7 @@ impl Tab {
     }
 }
 
+#[cfg_attr(test, derive(Clone, Debug))]
 enum Confirm {
     Pause,
     Exit,
@@ -1312,7 +1313,13 @@ impl App {
         if modal.should_close() && result.is_none() {
             result = Some(false);
         }
-        let Some(yes) = result else { return };
+        if let Some(yes) = result {
+            self.answer(ctx, yes);
+        }
+    }
+
+    /// The person answered the open confirmation: only a yes does anything.
+    fn answer(&mut self, ctx: &egui::Context, yes: bool) {
         let confirm = self.confirm.take();
         if !yes {
             return;
@@ -1429,11 +1436,13 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
+    use crate::protocol::Request;
 
     struct Rig {
         app: App,
         ctx: egui::Context,
         link: Arc<Link>,
+        sent: Arc<Mutex<Vec<Request>>>,
     }
 
     impl Drop for Rig {
@@ -1442,9 +1451,24 @@ mod render_tests {
         }
     }
 
+    /// The demo service, with every request the dashboard sent written down.
+    struct Recorder {
+        demo: demo::Demo,
+        sent: Arc<Mutex<Vec<Request>>>,
+    }
+
+    impl Backend for Recorder {
+        fn request(&mut self, req: &Request) -> Result<Response, String> {
+            self.sent.lock().unwrap().push(req.clone());
+            self.demo.request(req)
+        }
+    }
+
     fn rig(phase: f64, offline: bool, tab: Tab, theme: &str, confirm: Option<&str>) -> Rig {
         let link = Link::new();
-        backend::start(link.clone(), Box::new(demo::Demo::new(phase, offline, false)));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let demo = demo::Demo::new(phase, offline, false);
+        backend::start(link.clone(), Box::new(Recorder { demo, sent: sent.clone() }));
         let until = Instant::now() + Duration::from_secs(10);
         while !offline && link.live().0.is_none() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
@@ -1453,7 +1477,7 @@ mod render_tests {
         let prefs = Prefs { last_tab: tab.key().into(), theme: theme.into(), ..Prefs::default() };
         let opts = Opts { demo: true, confirm: confirm.map(Into::into), ..Opts::default() };
         let app = App::new(&ctx, link.clone(), Arc::default(), Arc::new(AtomicIsize::new(0)), prefs, opts, true, None);
-        Rig { app, ctx, link }
+        Rig { app, ctx, link, sent }
     }
 
     impl Rig {
@@ -1526,6 +1550,187 @@ mod render_tests {
         r.app.actions.lock().unwrap().push(tray::TrayAction::ConfirmExit);
         r.frames(1, DEFAULT_SIZE);
         assert!(matches!(r.app.confirm, Some(Confirm::Exit)), "so does exiting");
+    }
+
+    impl Rig {
+        /// One frame in which the window system reports `info` (a close click, a minimize).
+        fn frame_with(&mut self, info: egui::ViewportInfo) {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, DEFAULT_SIZE)),
+                ..Default::default()
+            };
+            input.viewports.insert(egui::ViewportId::ROOT, info);
+            let app = &mut self.app;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                app.tick(&ctx);
+                app.draw(ui);
+                app.modals(&ctx);
+            });
+            out.textures_delta.clear();
+        }
+
+        fn close_click(&mut self) {
+            self.frame_with(egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() });
+        }
+    }
+
+    #[test]
+    fn closing_the_window_hides_it_and_the_guard_keeps_running() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.frames(1, DEFAULT_SIZE);
+        assert!(r.app.shown);
+        r.close_click();
+        assert!(!r.app.shown, "hidden to the tray");
+        assert!(!r.app.quitting && r.app.confirm.is_none());
+        assert!(!r.link.guard_stopped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn closing_with_exit_chosen_asks_before_the_guard_stops() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.app.prefs.close_action = "exit".into();
+        r.close_click();
+        assert!(matches!(r.app.confirm, Some(Confirm::Exit)), "stopping protection is never one click");
+        assert!(!r.app.quitting && r.app.shown);
+    }
+
+    #[test]
+    fn the_window_process_quits_on_close_and_leaves_the_guard_to_its_tray() {
+        // Linux: the window is its own process (ui --window); the tray host stays.
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.app.close_quits = true;
+        r.close_click();
+        assert!(r.app.quitting, "this window process ends");
+        assert!(!r.link.guard_stopped.load(Ordering::Relaxed), "the guard does not");
+    }
+
+    #[test]
+    fn minimizing_goes_to_the_tray_only_when_chosen() {
+        let minimized = || egui::ViewportInfo { minimized: Some(true), ..Default::default() };
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.frame_with(minimized());
+        assert!(r.app.shown, "an ordinary minimize");
+        r.app.prefs.minimize_to_tray = true;
+        r.frame_with(minimized());
+        assert!(!r.app.shown, "to the tray");
+        assert!(!r.app.quitting);
+    }
+
+    #[test]
+    fn a_weaker_setting_opens_the_reduced_protection_confirmation() {
+        let mut r = rig(35.0, false, Tab::Protection, "dark", None);
+        r.frames(1, DEFAULT_SIZE);
+        let patch = SettingsPatch { threshold_amps: Some(12.0), ..Default::default() };
+        let warnings = vec!["Raising the threshold reduces protection".to_string()];
+        finish(&mut r, Job::Check(patch.clone()), Ok(Response::Check { errors: vec![], warnings }));
+        match &r.app.confirm {
+            Some(Confirm::Warnings(ws, p)) => {
+                assert_eq!(**p, patch, "the confirmation carries exactly the checked change");
+                assert!(ws[0].starts_with("Raising the threshold"));
+            }
+            _ => panic!("the dashboard must ask before a weaker setting is applied"),
+        }
+    }
+
+    impl Rig {
+        /// The requests (by op name) that act on the guard, sent after `answer`, waiting for
+        /// the backend thread to pass them on; the polling is left out.
+        fn sent_after(&mut self, answer: impl FnOnce(&mut App, &egui::Context)) -> Vec<String> {
+            self.sent.lock().unwrap().clear();
+            let ctx = self.ctx.clone();
+            answer(&mut self.app, &ctx);
+            std::thread::sleep(Duration::from_millis(300));
+            let ops = |r: &Request| serde_json::to_value(r).unwrap()["op"].as_str().unwrap().to_string();
+            let sent: Vec<String> = self.sent.lock().unwrap().iter().map(ops).collect();
+            let acts = ["set_paused", "calibrate_sag", "reset_defaults", "check", "apply", "exit", "scan_sensor"];
+            sent.into_iter().filter(|op| acts.contains(&op.as_str())).collect()
+        }
+    }
+
+    #[test]
+    fn a_confirmation_does_its_thing_only_on_yes() {
+        let mut r = rig(35.0, false, Tab::Protection, "dark", None);
+        r.frames(2, DEFAULT_SIZE);
+        let patch = SettingsPatch { threshold_amps: Some(12.0), ..Default::default() };
+        let cases: [(Confirm, &[&str]); 5] = [
+            (Confirm::Pause, &["set_paused"]),
+            (Confirm::Calibrate, &["calibrate_sag"]),
+            (Confirm::Reset, &["reset_defaults"]),
+            (Confirm::Warnings(vec!["weaker".into()], Box::new(patch)), &["apply"]),
+            (Confirm::Exit, &["exit"]),
+        ];
+        for (confirm, expect) in cases {
+            let name = format!("{confirm:?}");
+            r.app.confirm = Some(confirm.clone());
+            let no = r.sent_after(|app, ctx| app.answer(ctx, false));
+            assert!(no.is_empty(), "{name}: Cancel sent {no:?}");
+            assert!(r.app.confirm.is_none(), "{name}: closed");
+            r.app.confirm = Some(confirm);
+            let yes = r.sent_after(|app, ctx| app.answer(ctx, true));
+            assert_eq!(yes, expect, "{name}");
+        }
+        assert!(r.app.exit_pending, "Exit waits for the service to stop before the window goes");
+        assert!(!r.app.quitting);
+    }
+
+    #[test]
+    fn a_confirmed_pause_asks_for_pause_not_resume() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", None);
+        r.frames(1, DEFAULT_SIZE);
+        r.app.confirm = Some(Confirm::Pause);
+        r.sent_after(|app, ctx| app.answer(ctx, true));
+        let paused: Vec<bool> = r
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|q| match q {
+                Request::SetPaused { paused } => Some(*paused),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paused, [true]);
+    }
+
+    #[test]
+    fn exit_without_the_service_just_closes_the_window() {
+        let mut r = rig(35.0, true, Tab::Live, "dark", None);
+        r.frames(1, DEFAULT_SIZE);
+        assert!(!r.app.connected);
+        r.app.confirm = Some(Confirm::Exit);
+        let sent = r.sent_after(|app, ctx| app.answer(ctx, true));
+        assert!(!sent.contains(&"exit".to_string()), "{sent:?}");
+        assert!(r.app.quitting);
+    }
+
+    #[test]
+    fn escape_cancels_a_confirmation() {
+        let mut r = rig(35.0, false, Tab::Live, "dark", Some("pause"));
+        r.frames(1, DEFAULT_SIZE);
+        r.sent.lock().unwrap().clear();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, DEFAULT_SIZE)),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        let app = &mut r.app;
+        let mut out = r.ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            app.tick(&ctx);
+            app.draw(ui);
+            app.modals(&ctx);
+        });
+        out.textures_delta.clear();
+        assert!(r.app.confirm.is_none(), "closed");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!r.sent.lock().unwrap().iter().any(|q| matches!(q, Request::SetPaused { .. })), "and not paused");
     }
 
     fn finish(r: &mut Rig, job: Job, result: Result<Response, String>) {
