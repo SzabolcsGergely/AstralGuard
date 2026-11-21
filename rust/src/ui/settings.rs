@@ -56,7 +56,7 @@ const NUMS: [Num; 13] = [
     num!(sag_card_length_mm, "Card length", "mm · 0 = spec"),
 ];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MsgKind {
     Ok,
     Err,
@@ -710,5 +710,148 @@ mod tests {
         assert!(bad.is_none(), "an error is never applied, warnings or not");
         assert!(matches!(&v.msg, Some((m, MsgKind::Err, _)) if m.contains("must rise")));
         assert!(v.busy.is_none());
+    }
+
+    /// What the dashboard asks after the service checked `patch` against `current`.
+    fn checked(v: &mut SettingsView, current: &Settings, patch: &SettingsPatch) -> Option<Ask> {
+        let (errors, warnings) = crate::config::check(current, patch);
+        v.on_done(&Job::Check(patch.clone()), &Ok(Response::Check { errors, warnings }))
+    }
+
+    #[test]
+    fn every_switch_reaches_the_change_and_turning_a_check_off_asks_first() {
+        let current = Settings { imbalance_response: ImbalanceResponse::Act, ..Settings::default() };
+        let mut v = form(&current);
+        v.imbalance_enabled = false;
+        v.imbalance_response = ImbalanceResponse::Warn;
+        v.response_mode = ResponseMode::ShutdownOnly;
+        v.sensor_auto_scan = true;
+        let (patch, errors) = v.diff();
+        assert!(errors.is_empty());
+        assert_eq!(
+            patch,
+            SettingsPatch {
+                imbalance_enabled: Some(false),
+                imbalance_response: Some(ImbalanceResponse::Warn),
+                response_mode: Some(ResponseMode::ShutdownOnly),
+                sensor_auto_scan: Some(true),
+                ..Default::default()
+            }
+        );
+        match checked(&mut v, &current, &patch) {
+            Some(Ask::ConfirmWarnings(ws, p)) => {
+                assert_eq!(p, patch);
+                assert_eq!(ws.len(), 2, "imbalance off, and Act to Warn: {ws:?}");
+                assert!(ws.iter().any(|w| w.contains("imbalance check off")), "{ws:?}");
+                assert!(ws.iter().any(|w| w.contains("Warn only")), "{ws:?}");
+            }
+            _ => panic!("turning protection down must ask"),
+        }
+    }
+
+    #[test]
+    fn switching_to_shutdown_only_or_turning_the_scan_on_applies_at_once() {
+        // Neither makes protection weaker: shutdown-only acts harder, the scan only adds.
+        let current = Settings::default();
+        let mut v = form(&current);
+        v.response_mode = ResponseMode::ShutdownOnly;
+        v.sensor_auto_scan = true;
+        let (patch, _) = v.diff();
+        assert!(matches!(checked(&mut v, &current, &patch), Some(Ask::Job(Job::Apply(p))) if p == patch));
+    }
+
+    #[test]
+    fn turning_sag_off_asks_and_turning_it_back_on_does_not() {
+        let current = Settings::default();
+        let mut v = form(&current);
+        v.sag_enabled = false;
+        let (off, _) = v.diff();
+        assert!(matches!(checked(&mut v, &current, &off), Some(Ask::ConfirmWarnings(..))));
+        let without = Settings { sag_enabled: false, ..Settings::default() };
+        let mut v = form(&without);
+        let (on, _) = v.diff();
+        assert!(matches!(checked(&mut v, &without, &on), Some(Ask::Job(Job::Apply(_)))));
+    }
+
+    fn message(v: &SettingsView) -> (String, MsgKind) {
+        let (m, k, _) = v.msg.clone().expect("a message");
+        (m, k)
+    }
+
+    #[test]
+    fn an_apply_says_how_many_settings_changed_or_what_failed() {
+        let mut v = form(&Settings::default());
+        v.apply_confirmed();
+        assert_eq!(v.busy, Some("Applying…"), "busy while the confirmed change goes out");
+        let one = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        assert!(v.on_done(&Job::Apply(one), &Ok(Response::Applied { failures: vec![] })).is_none());
+        assert_eq!(message(&v), ("1 setting applied".into(), MsgKind::Ok));
+        assert!(v.busy.is_none() && v.reload);
+
+        let two = SettingsPatch { threshold_amps: Some(9.0), sag_enabled: Some(false), ..Default::default() };
+        v.on_done(&Job::Apply(two.clone()), &Ok(Response::Applied { failures: vec![] }));
+        assert_eq!(message(&v).0, "2 settings applied");
+
+        v.on_done(&Job::Apply(two), &Ok(Response::Applied { failures: vec!["config.ini is read-only".into()] }));
+        assert_eq!(message(&v), ("Applied, but: config.ini is read-only".into(), MsgKind::Err));
+        assert!(v.reload, "the form shows what the service really has");
+    }
+
+    #[test]
+    fn a_lost_service_or_a_wrong_answer_ends_the_wait_with_an_error() {
+        let patch = SettingsPatch { threshold_amps: Some(9.0), ..Default::default() };
+        for job in [Job::Check(patch.clone()), Job::Apply(patch.clone()), Job::ResetDefaults, Job::Calibrate] {
+            let mut v = form(&Settings::default());
+            v.busy = Some("Checking…");
+            assert!(v.on_done(&job, &Err("the guard service is not running".into())).is_none());
+            assert!(v.busy.is_none(), "never stuck on a spinner");
+            assert_eq!(message(&v), ("the guard service is not running".into(), MsgKind::Err));
+        }
+        for job in [Job::Check(patch.clone()), Job::Apply(patch)] {
+            let mut v = form(&Settings::default());
+            v.busy = Some("Applying…");
+            assert!(v.on_done(&job, &Ok(Response::Ok)).is_none(), "nothing applied on a strange answer");
+            assert!(v.busy.is_none());
+            assert!(message(&v).0.starts_with("Unexpected answer: "));
+        }
+    }
+
+    #[test]
+    fn reset_reloads_the_form_and_calibrate_says_how_long() {
+        let mut v = form(&Settings::default());
+        v.texts[idx("threshold")] = "8".into();
+        v.on_done(&Job::ResetDefaults, &Ok(Response::Ok));
+        assert_eq!(message(&v), ("Defaults restored".into(), MsgKind::Ok));
+        v.sync(Some(&Settings::default()));
+        assert!(!v.dirty(), "the edit gives way to the defaults");
+
+        v.on_done(&Job::Calibrate, &Ok(Response::Ok));
+        assert_eq!(message(&v), ("Calibrating · takes about 10 s".into(), MsgKind::Info));
+    }
+
+    #[test]
+    fn autostart_is_read_back_after_every_change() {
+        let mut v = SettingsView::default();
+        v.on_done(&Job::AutostartGet, &Ok(Response::Autostart { state: Some(true) }));
+        assert!(v.autostart == Autostart::Known(Some(true)));
+
+        let next = v.on_done(&Job::AutostartSet(false), &Ok(Response::Bool { value: true }));
+        assert!(matches!(next, Some(Ask::Job(Job::AutostartGet))), "what the system did, not what was asked");
+        assert!(v.autostart == Autostart::Busy && v.msg.is_none());
+
+        let next = v.on_done(&Job::AutostartSet(true), &Ok(Response::Bool { value: false }));
+        assert!(matches!(next, Some(Ask::Job(Job::AutostartGet))));
+        assert_eq!(message(&v).0, "Could not change autostart: needs administrator rights");
+
+        v.on_done(&Job::AutostartGet, &Err("timed out".into()));
+        assert!(v.autostart == Autostart::Known(None), "shown as unavailable");
+        assert_eq!(message(&v), ("timed out".into(), MsgKind::Err));
+    }
+
+    #[test]
+    fn other_tabs_jobs_are_not_this_tabs_business() {
+        let mut v = form(&Settings::default());
+        assert!(v.on_done(&Job::LogTail, &Ok(Response::Ok)).is_none());
+        assert!(v.msg.is_none() && v.busy.is_none());
     }
 }

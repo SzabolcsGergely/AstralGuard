@@ -930,6 +930,22 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_needs_root_and_only_one_runs_at_a_time() {
+        // Never a real scan: whichever way this test runs, a refusal comes before the bus.
+        let shared = Shared::new(Settings::default(), None, true);
+        let expected = if platform::is_elevated() {
+            shared.scanning.store(true, Ordering::SeqCst);
+            "A scan is already running."
+        } else {
+            "The guard is not running as root, so it cannot scan or save the result."
+        };
+        let Response::Scan { report } = shared.handle(Request::ScanSensor) else { panic!("not a scan answer") };
+        assert_eq!(report.message, expected);
+        assert!(!report.found && report.lines.is_empty());
+        assert!(!shared.reconnect_now.load(Ordering::Relaxed), "nothing found, nothing to reconnect");
+    }
+
+    #[test]
     fn reset_defaults_leaves_the_overclock_alone() {
         let shared =
             Shared::new(Settings { oc_power_enabled: true, oc_power_w: 480.0, ..Default::default() }, None, true);

@@ -229,6 +229,66 @@ mod tests {
         assert_eq!(text(client.request(&Request::LogTail { max_bytes: 1 })), "1", "picked up without a restart");
     }
 
+    /// A service that misbehaves on its first connection: `first` gets the request line and
+    /// the stream, then the connection is dropped. Later connections are served properly.
+    fn flaky(socket: &str, first: impl FnOnce(&str, &mut Stream) + Send + 'static) {
+        #[cfg(unix)]
+        prepare_socket_dir(socket);
+        let listener = ListenerOptions::new().name(name(socket).unwrap()).create_sync().unwrap();
+        thread::spawn(move || {
+            let mut first = Some(first);
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { continue };
+                let mut conn = BufReader::new(conn);
+                let mut line = String::new();
+                if let Some(f) = first.take() {
+                    let _ = conn.read_line(&mut line);
+                    f(&line, conn.get_mut());
+                    continue; // dropped here: the service went away mid-request
+                }
+                while matches!(conn.read_line(&mut line), Ok(n) if n > 0) {
+                    let req: Request = serde_json::from_str(line.trim()).unwrap();
+                    let out = serde_json::to_string(&echo(req)).unwrap()
+                        + "
+";
+                    if conn.get_mut().write_all(out.as_bytes()).is_err() {
+                        break;
+                    }
+                    line.clear();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_service_that_goes_away_mid_request_is_an_error_and_the_next_request_reconnects() {
+        // Safety rule 3: the dashboard keeps working, and keeps retrying, while the service is down.
+        let socket = test_socket();
+        flaky(&socket, |_, _| {});
+        let mut client = Client::at(&socket);
+        let e = client.request(&Request::LogTail { max_bytes: 9 }).unwrap_err();
+        assert!(!e.is_empty());
+        assert!(client.conn.is_none(), "the dead connection is dropped");
+        assert_eq!(text(client.request(&Request::LogTail { max_bytes: 9 })), "9", "a fresh connection");
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_response_is_an_error_not_a_guess() {
+        let socket = test_socket();
+        flaky(&socket, |line, conn| {
+            assert!(line.contains("log_tail"), "{line}");
+            let _ = conn.write_all(
+                b"{\"kind\":\"something_new\"}
+",
+            );
+        });
+        let mut client = Client::at(&socket);
+        let e = client.request(&Request::LogTail { max_bytes: 4 }).unwrap_err();
+        assert!(e.contains("something_new") || e.contains("unknown variant"), "{e}");
+        assert!(client.conn.is_none());
+        assert_eq!(text(client.request(&Request::LogTail { max_bytes: 4 })), "4");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_socket_is_for_root_and_the_group_only_and_replaces_a_stale_one() {
