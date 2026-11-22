@@ -7,6 +7,8 @@ here.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-22
+
 ### Added
 
 - An **OLED black** theme (Settings → Window → Theme): pure black background and cards,
@@ -98,6 +100,7 @@ The first release.
   the dashboard, or by itself when you turn that on).
   Tested on CachyOS with KDE Plasma on Wayland and the NVIDIA open kernel module.
 
-[Unreleased]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/SzabolcsGergely/AstralGuard/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/SzabolcsGergely/AstralGuard/releases/tag/v1.0.0
