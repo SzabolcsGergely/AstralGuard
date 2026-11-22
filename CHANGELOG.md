@@ -17,6 +17,10 @@ here.
 - The dashboard could forget its window size and open at the minimum size: a window hidden to
   the tray reports a size of 0 × 0, and that was saved. An empty size is no longer saved, and
   one saved by an earlier version opens at the default size.
+- Linux: stopping or restarting the service, and every reboot, ended it on the spot instead of
+  letting it finish. A GPU limit in place at that moment stayed on until the guard started
+  again, and the day's sag history row was not saved. The service now stops cleanly on
+  `systemctl stop`, a restart, a reboot or Ctrl-C.
 
 ### Changed
 

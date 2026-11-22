@@ -872,6 +872,8 @@ fn log_tail_of(path: &std::path::Path, max_bytes: u64) -> String {
 /// `astralguard service`. Returns the exit code: 0 for a deliberate stop (exit, shutdown,
 /// already running), which tells the watchdog not to restart it.
 pub fn run(_args: &[String]) -> i32 {
+    // Before any thread starts, or a thread that doesn't block SIGTERM would die of it.
+    platform::block_stop_signals();
     let log_dir = config::log_dir();
     logger::init(&log_dir.join("astralguard.log"), logger::Level::Info);
     crate::crash::install(&log_dir);
@@ -897,6 +899,16 @@ pub fn run(_args: &[String]) -> i32 {
     let (settings, baseline) = config::load(&config::config_path());
     let shared = Shared::new(settings, baseline, false);
 
+    // SIGTERM (systemctl stop / restart, a reboot) is the dashboard's Exit: the loop ends on
+    // its own path, putting a GPU limit back and saving the day's sag history.
+    let signal_shared = Arc::clone(&shared);
+    if let Err(e) = platform::on_stop_signal(move |name| {
+        logger::info(format!("{name} received; stopping."));
+        signal_shared.stop.store(true, Ordering::Relaxed);
+    }) {
+        logger::warn(format!("Stop signals not handled ({e}); a service stop skips the clean exit."));
+    }
+
     let handler_shared = Arc::clone(&shared);
     if let Err(e) = crate::ipc::serve(move |req| handler_shared.handle(req)) {
         logger::error(format!("Dashboard socket unavailable ({e}); protection runs without it."));
@@ -905,8 +917,12 @@ pub fn run(_args: &[String]) -> i32 {
     let shutting_down = monitor::run(&shared);
     if shutting_down {
         // Keep the process alive while the OS powers off; exiting early would make the
-        // watchdog restart a guard into a dying session.
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        // watchdog restart a guard into a dying session. The OS's own stop (SIGTERM from
+        // systemd) ends the wait, so the power-off isn't held up by a minute.
+        let until = crate::now() + 60.0;
+        while crate::now() < until && !shared.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     }
     0
 }

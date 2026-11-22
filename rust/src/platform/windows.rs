@@ -456,6 +456,14 @@ pub fn gpu_driver() -> String {
         .unwrap_or_default()
 }
 
+/// Linux's SIGTERM / SIGINT handling has no counterpart here: the watchdog's job object and
+/// the logon task end the service on Windows.
+pub fn block_stop_signals() {}
+
+pub fn on_stop_signal(_f: impl FnOnce(&'static str) + Send + 'static) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

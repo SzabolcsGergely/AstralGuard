@@ -101,3 +101,78 @@ pub fn gpu_driver() -> String {
         .map(|(version, flavour)| format!("NVIDIA {version} {flavour}"))
         .unwrap_or_default()
 }
+
+// ------------------------------------------------------------- stop signals
+//
+// systemd stops the service with SIGTERM: `systemctl stop` and `restart`, and every reboot.
+// Without this the process died on the spot and skipped the loop's own exit, so a GPU limit
+// stayed on until the next start and the day's sag history row was lost. SIGTERM and SIGINT
+// (Ctrl-C in a terminal) are blocked in every thread and taken by one thread with sigwait:
+// nothing runs inside a signal handler.
+
+fn stop_signal_set() -> libc::sigset_t {
+    // SAFETY: sigemptyset / sigaddset only fill in the set they are given.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        set
+    }
+}
+
+/// Block SIGTERM and SIGINT in this thread and every thread started from it afterwards.
+/// Call it first, before any thread exists: a thread that does not block them dies of them.
+pub fn block_stop_signals() {
+    let set = stop_signal_set();
+    // SAFETY: changes only this thread's signal mask.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+}
+
+/// Call `f` with the signal's name on the first SIGTERM or SIGINT, from a thread of its own.
+pub fn on_stop_signal(f: impl FnOnce(&'static str) + Send + 'static) -> std::io::Result<()> {
+    stop_signal_thread(f).map(drop)
+}
+
+fn stop_signal_thread(f: impl FnOnce(&'static str) + Send + 'static) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("stop-signals".into()).spawn(move || {
+        block_stop_signals(); // already inherited when called as intended; never wait unblocked
+        let set = stop_signal_set();
+        let mut sig = 0;
+        // SAFETY: waits for one of the blocked signals in `set`.
+        if unsafe { libc::sigwait(&set, &mut sig) } == 0 {
+            f(if sig == libc::SIGTERM { "SIGTERM" } else { "SIGINT" });
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::thread::JoinHandleExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The signal goes to the waiting thread only (pthread_kill), which was born with it
+    /// blocked, so no other thread of the test binary can die of it.
+    fn delivered(sig: libc::c_int) -> &'static str {
+        block_stop_signals(); // this test's thread, inherited by the waiter
+        let (tx, rx) = mpsc::channel();
+        let waiter = stop_signal_thread(move |name| tx.send(name).unwrap()).unwrap();
+        // SAFETY: the target thread is alive until it has received the signal.
+        assert_eq!(unsafe { libc::pthread_kill(waiter.as_pthread_t(), sig) }, 0);
+        let name = rx.recv_timeout(Duration::from_secs(5)).expect("the signal was not taken");
+        waiter.join().unwrap();
+        name
+    }
+
+    #[test]
+    fn systemds_stop_signal_is_handed_on_not_fatal() {
+        assert_eq!(delivered(libc::SIGTERM), "SIGTERM");
+    }
+
+    #[test]
+    fn ctrl_c_in_a_terminal_is_handed_on_too() {
+        assert_eq!(delivered(libc::SIGINT), "SIGINT");
+    }
+}
